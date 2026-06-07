@@ -13,15 +13,20 @@ load_dotenv()
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 HEADERS = {
-    "User-Agent": "GQFinXray/1.0 contact@gqfinxray.com",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Encoding": "gzip, deflate"
 }
 
 # ── News sources ──────────────────────────────────────────────────────────────
 NEWS_SOURCES = [
     {
-        "name": "CNBC",
+        "name": "CNBC Markets",
         "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
+        "source_key": "CNBC"
+    },
+    {
+        "name": "CNBC Earnings",
+        "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069",
         "source_key": "CNBC"
     },
     {
@@ -34,48 +39,61 @@ NEWS_SOURCES = [
         "url": "https://feeds.marketwatch.com/marketwatch/topstories",
         "source_key": "MARKETWATCH"
     },
-    
+    {
+        "name": "Reuters Business",
+        "url": "https://news.google.com/rss/search?q=reuters+business&ceid=US:en&hl=en-US&gl=US",
+        "source_key": "REUTERS"
+    },
+    {
+        "name": "Reuters Markets",
+        "url": "https://news.google.com/rss/search?q=reuters+markets+stocks&ceid=US:en&hl=en-US&gl=US",
+        "source_key": "REUTERS"
+    },
+    {
+        "name": "Reuters Stocks",
+        "url": "https://news.google.com/rss/search?q=site:reuters.com+stocks&ceid=US:en&hl=en-US&gl=US",
+        "source_key": "REUTERS"
+    },
 ]
 
-# US stock tickers to watch for in news articles
-# This list will grow as users add tickers via the bot
 WATCH_TICKERS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
     "NFLX", "AMD", "INTC", "CRM", "ORCL", "IBM", "UBER", "LYFT",
     "JPM", "BAC", "GS", "MS", "WFC", "C", "V", "MA", "PYPL",
-    "JNJ", "PFE", "MRNA", "ABBV", "UNH", "CVS",
-    "XOM", "CVX", "COP", "SLB",
-    "WMT", "TGT", "COST", "AMZN", "HD", "LOW",
-    "BA", "LMT", "RTX", "NOC", "GE",
-    "NFLX", "DIS", "CMCSA", "T", "VZ",
-    "SPY", "QQQ", "IWM", "GLD", "SLV"
+    "JNJ", "PFE", "MRNA", "ABBV", "UNH", "CVS", "LLY",
+    "XOM", "CVX", "COP", "SLB", "OXY",
+    "WMT", "TGT", "COST", "HD", "LOW", "MCD", "SBUX", "NKE",
+    "BA", "LMT", "RTX", "NOC", "GE", "GD",
+    "DIS", "CMCSA", "T", "VZ", "NFLX",
+    "F", "GM", "RIVN", "LCID",
+    "DAL", "UAL", "AAL", "LUV",
+    "SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "VTI",
+    "CRWD", "PLTR", "SNOW", "NET", "DDOG", "ZS", "OKTA",
+    "RDCM", "APGE", "NRSCF", "BLZE", "FIVN", "ROST"
 ]
 
 def get_watched_tickers_from_db():
-    """Get all tickers users are subscribed to from the database."""
     try:
         result = supabase.table("watchlists") \
             .select("ticker") \
             .execute()
         tickers = list(set([r["ticker"] for r in result.data if r.get("ticker")]))
-        return tickers if tickers else WATCH_TICKERS
+        combined = list(set(tickers + WATCH_TICKERS))
+        return combined if combined else WATCH_TICKERS
     except Exception as e:
         print(f"[ERROR] Failed to get tickers from DB: {e}")
         return WATCH_TICKERS
 
 def extract_tickers_from_text(text, watched_tickers):
-    """Find any watched tickers mentioned in the article text."""
     found = []
     text_upper = text.upper()
     for ticker in watched_tickers:
-        # Match ticker as whole word — avoids matching IT inside TWITTER etc
         pattern = r'\b' + re.escape(ticker) + r'\b'
         if re.search(pattern, text_upper):
             found.append(ticker)
     return found
 
 def news_exists(url):
-    """Check if we already stored this news article."""
     try:
         result = supabase.table("raw_filings") \
             .select("id") \
@@ -87,7 +105,6 @@ def news_exists(url):
         return False
 
 def store_news(source_key, ticker, title, summary, url, published_at):
-    """Store news article in raw_filings table."""
     try:
         supabase.table("raw_filings").insert({
             "source": source_key,
@@ -108,7 +125,6 @@ def store_news(source_key, ticker, title, summary, url, published_at):
         print(f"[ERROR] Failed to store news: {e}")
 
 def parse_rss_date(date_str):
-    """Parse RSS date formats into ISO format."""
     if not date_str:
         return datetime.now().isoformat()
     formats = [
@@ -125,7 +141,6 @@ def parse_rss_date(date_str):
     return datetime.now().isoformat()
 
 def poll_news_source(source):
-    """Poll a single news RSS source."""
     name = source["name"]
     url = source["url"]
     source_key = source["source_key"]
@@ -138,7 +153,6 @@ def poll_news_source(source):
 
         root = ET.fromstring(r.content)
 
-        # Handle both RSS and Atom formats
         items = root.findall(".//item")
         if not items:
             ns = {"atom": "http://www.w3.org/2005/Atom"}
@@ -152,13 +166,17 @@ def poll_news_source(source):
         new_count = 0
 
         for item in items:
-            # Extract title
             title_elem = item.find("title")
             title = title_elem.text if title_elem is not None else ""
             if not title:
                 continue
 
-            # Extract URL
+            # Clean Google News title format — "Headline - Source"
+            if " - Reuters" in title:
+                title = title.replace(" - Reuters", "").strip()
+            elif " - " in title and source_key == "REUTERS":
+                title = title.rsplit(" - ", 1)[0].strip()
+
             link_elem = item.find("link")
             article_url = ""
             if link_elem is not None:
@@ -166,33 +184,26 @@ def poll_news_source(source):
             if not article_url:
                 continue
 
-            # Skip if already stored
             if news_exists(article_url):
                 continue
 
-            # Extract description/summary
             desc_elem = item.find("description")
             if desc_elem is None:
                 desc_elem = item.find("summary")
             summary = desc_elem.text if desc_elem is not None else ""
 
-            # Clean HTML tags from summary
             if summary:
                 summary = re.sub(r'<[^>]+>', '', summary).strip()
 
-            # Extract publish date
             date_elem = item.find("pubDate")
             if date_elem is None:
                 date_elem = item.find("updated")
             published_at = parse_rss_date(date_elem.text if date_elem is not None else "")
 
-            # Find tickers mentioned in title + summary
             full_text = f"{title} {summary}"
             found_tickers = extract_tickers_from_text(full_text, watched_tickers)
 
             if not found_tickers:
-                # No watched tickers mentioned — store as general market news
-                # with MARKET as ticker so it still gets processed
                 store_news(
                     source_key=source_key,
                     ticker="MARKET",
@@ -202,7 +213,6 @@ def poll_news_source(source):
                     published_at=published_at
                 )
             else:
-                # Store one record per ticker mentioned
                 for ticker in found_tickers:
                     store_news(
                         source_key=source_key,
@@ -223,7 +233,6 @@ def poll_news_source(source):
         return 0
 
 def poll_all_news():
-    """Poll all news sources."""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling news sources...")
     total = 0
     for source in NEWS_SOURCES:
