@@ -6,7 +6,9 @@ import schedule
 import requests
 from dotenv import load_dotenv
 from supabase import create_client
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from telegram import Update
 from datetime import datetime
 
 load_dotenv()
@@ -48,28 +50,47 @@ def format_alert(alert):
     source = alert.get("source", "SEC_EDGAR")
     filing_type = alert.get("filing_type", "")
     extra = alert.get("extra") or {}
+    filing_url = alert.get("filing_url", "")
 
     impact_emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
     source_labels = {
         "SEC_EDGAR": "SEC EDGAR",
         "CNBC": "CNBC",
         "BLOOMBERG": "Bloomberg",
-        "MARKETWATCH": "MarketWatch"
+        "MARKETWATCH": "MarketWatch",
+        "REUTERS": "Reuters"
     }
 
     emoji = impact_emoji.get(impact, "🟢")
     source_name = source_labels.get(source, source)
     time_str = datetime.now().strftime("%I:%M %p EST")
 
-    # Fetch live price (skip MARKET and UNKNOWN tickers)
+    # Live price
     price_line = ""
     if ticker and ticker not in ("MARKET", "UNKNOWN"):
         price_data = get_stock_price(ticker)
         if price_data:
             price_line = f"\n📈 *Stock:* {ticker} {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
 
+    # Source link
+    source_link = ""
+    if filing_url:
+        if source == "SEC_EDGAR":
+            source_link = f"\n🔗 [View SEC Filing]({filing_url})"
+        elif source == "CNBC":
+            source_link = f"\n🔗 [Read on CNBC]({filing_url})"
+        elif source == "BLOOMBERG":
+            source_link = f"\n🔗 [Read on Bloomberg]({filing_url})"
+        elif source == "MARKETWATCH":
+            source_link = f"\n🔗 [Read on MarketWatch]({filing_url})"
+        elif source == "REUTERS":
+            source_link = f"\n🔗 [Read on Reuters]({filing_url})"
+        else:
+            source_link = f"\n🔗 [Read Full Article]({filing_url})"
+
     footer = (
-        f"\n_You are receiving this notification based on your request to "
+        f"{source_link}\n\n"
+        f"_You are receiving this notification based on your request to "
         f"monitor this stock's news, updates and transactions._\n"
         f"_Disclaimer: gquants.com/disclaimer_\n\n"
         f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
@@ -89,7 +110,7 @@ def format_alert(alert):
             f"{footer}"
         )
 
-    # S-1 IPO filing
+    # S-1 IPO
     if filing_type == "S-1":
         return (
             f"🚀 *IPO FILING — ${ticker}*"
@@ -99,7 +120,7 @@ def format_alert(alert):
             f"{footer}"
         )
 
-    # News articles
+    # News
     if filing_type == "NEWS":
         ticker_display = f"${ticker}" if ticker != "MARKET" else "Market News"
         return (
@@ -125,6 +146,43 @@ def format_alert(alert):
         f"{footer}"
     )
 
+def get_feedback_keyboard(alert_id: str):
+    keyboard = [[
+        InlineKeyboardButton("✅ Useful", callback_data=f"useful_{alert_id}"),
+        InlineKeyboardButton("❌ Not Useful", callback_data=f"notuseful_{alert_id}")
+    ]]
+    return InlineKeyboardMarkup(keyboard)
+
+# ── Send alert with optional image ───────────────────────────────────────────
+async def send_telegram_message(bot, chat_id, alert):
+    msg = format_alert(alert)
+    extra = alert.get("extra") or {}
+    image_url = extra.get("image_url", "")
+    alert_id = str(alert.get("id", ""))
+    keyboard = get_feedback_keyboard(alert_id)
+
+    if image_url:
+        caption = msg[:1024]
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=image_url,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+            return True
+        except Exception:
+            pass
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=msg,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    return True
+
 # ── Error alerting ────────────────────────────────────────────────────────────
 async def send_error_alert(message: str):
     try:
@@ -136,6 +194,34 @@ async def send_error_alert(message: str):
         )
     except:
         pass
+
+# ── Feedback callback handler ─────────────────────────────────────────────────
+async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = str(query.from_user.id)
+
+    if data.startswith("useful_"):
+        alert_id = data.replace("useful_", "")
+        feedback = "useful"
+    elif data.startswith("notuseful_"):
+        alert_id = data.replace("notuseful_", "")
+        feedback = "not_useful"
+    else:
+        return
+
+    try:
+        supabase.table("feedback").insert({
+            "alert_id": alert_id,
+            "telegram_chat_id": chat_id,
+            "feedback": feedback,
+            "created_at": datetime.now().isoformat()
+        }).execute()
+        await query.edit_message_reply_markup(reply_markup=None)
+        print(f"[FEEDBACK] {feedback} — alert {alert_id} from {chat_id}")
+    except Exception as e:
+        print(f"[ERROR] Feedback logging failed: {e}")
 
 # ── Deliver pending alerts ────────────────────────────────────────────────────
 async def deliver_pending_alerts():
@@ -158,7 +244,6 @@ async def deliver_pending_alerts():
             ticker = alert.get("ticker", "UNKNOWN")
             impact = alert.get("impact", "LOW")
 
-            # Skip completely invalid alerts
             if ticker == "UNKNOWN":
                 supabase.table("alerts") \
                     .update({"delivered": True}) \
@@ -166,16 +251,11 @@ async def deliver_pending_alerts():
                     .execute()
                 continue
 
-            # MARKET ticker — skip user routing, post HIGH/MEDIUM to channel only
+            # MARKET ticker — HIGH/MEDIUM to channel only
             if ticker == "MARKET":
                 if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
                     try:
-                        msg = format_alert(alert)
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHANNEL_ID,
-                            text=msg,
-                            parse_mode="Markdown"
-                        )
+                        await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
                         print(f"[CHANNEL] {impact} market alert posted")
                     except Exception as e:
                         print(f"[ERROR] Channel post failed: {e}")
@@ -185,7 +265,7 @@ async def deliver_pending_alerts():
                     .execute()
                 continue
 
-            # Find users subscribed to this ticker
+            # Find subscribed users
             watchlist_result = supabase.table("watchlists") \
                 .select("user_id") \
                 .eq("ticker", ticker) \
@@ -220,13 +300,8 @@ async def deliver_pending_alerts():
                     min_impact = pref_result.data[0].get("min_impact", "LOW")
 
                 if impact_order.get(impact, 1) >= impact_order.get(min_impact, 1):
-                    msg = format_alert(alert)
                     try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=msg,
-                            parse_mode="Markdown"
-                        )
+                        await send_telegram_message(bot, chat_id, alert)
                         delivered_to.append(chat_id)
                         supabase.table("delivery_logs").insert({
                             "alert_id": alert["id"],
@@ -238,23 +313,11 @@ async def deliver_pending_alerts():
                         }).execute()
                     except Exception as e:
                         print(f"[ERROR] Failed to deliver to {chat_id}: {e}")
-                        supabase.table("delivery_logs").insert({
-                            "alert_id": alert["id"],
-                            "user_id": user_id,
-                            "channel": "telegram",
-                            "status": "failed",
-                            "attempts": 1
-                        }).execute()
 
             # Post HIGH and MEDIUM to channel
             if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
                 try:
-                    msg = format_alert(alert)
-                    await bot.send_message(
-                        chat_id=TELEGRAM_CHANNEL_ID,
-                        text=msg,
-                        parse_mode="Markdown"
-                    )
+                    await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
                     print(f"[CHANNEL] {impact} alert posted — ${ticker}")
                 except Exception as e:
                     print(f"[ERROR] Channel post failed: {e}")
@@ -309,7 +372,7 @@ def fetch_macro_data():
     return "\n".join(lines) if lines else "Macro data unavailable"
 
 def fetch_top_movers():
-    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AMD", "JPM", "BAC"]
+    tickers = ["AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "GOOGL", "JPM", "NFLX", "AMD"]
     results = []
     for ticker in tickers:
         try:
@@ -317,18 +380,23 @@ def fetch_top_movers():
             r = requests.get(url, timeout=10)
             data = r.json()
             if "close" in data:
+                chg = float(data.get("percent_change", 0))
                 results.append({
                     "ticker": ticker,
-                    "change": float(data.get("percent_change", 0)),
+                    "change": chg,
                     "price": float(data["close"])
                 })
         except:
             pass
     if not results:
         return "Movers data unavailable", "Movers data unavailable"
+
     results.sort(key=lambda x: x["change"], reverse=True)
-    gainers = "\n".join([f"🟢 *{r['ticker']}:* +{r['change']:.2f}%" for r in results[:3]])
-    losers = "\n".join([f"🔴 *{r['ticker']}:* {r['change']:.2f}%" for r in results[-3:]])
+    actual_gainers = [r for r in results if r["change"] > 0]
+    actual_losers = [r for r in results if r["change"] < 0]
+
+    gainers = "\n".join([f"🟢 *{r['ticker']}:* +{r['change']:.2f}%" for r in actual_gainers[:3]]) if actual_gainers else "_No gainers_"
+    losers = "\n".join([f"🔴 *{r['ticker']}:* {r['change']:.2f}%" for r in actual_losers[-3:]]) if actual_losers else "_No losers_"
     return gainers, losers
 
 async def send_market_report(title: str, body: str):
@@ -350,55 +418,31 @@ async def send_market_report(title: str, body: str):
 def send_premarket_report():
     indices = fetch_index_data()
     macro = fetch_macro_data()
-    body = (
-        f"*US Futures & Pre-Market Snapshot*\n\n"
-        f"{indices}\n\n"
-        f"*Macro*\n{macro}"
-    )
+    body = f"*US Futures & Pre-Market Snapshot*\n\n{indices}\n\n*Macro*\n{macro}"
     asyncio.run(send_market_report("🌅 Pre-Market Report", body))
 
 def send_market_open_report():
     indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = (
-        f"*Markets are now open.*\n\n"
-        f"*Indices at Open*\n{indices}\n\n"
-        f"*Early Gainers*\n{gainers}\n\n"
-        f"*Early Losers*\n{losers}"
-    )
+    body = f"*Markets are now open.*\n\n*Indices at Open*\n{indices}\n\n*Early Gainers*\n{gainers}\n\n*Early Losers*\n{losers}"
     asyncio.run(send_market_report("🔔 Market Open", body))
 
 def send_midday_report():
     indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = (
-        f"*Midday Market Check*\n\n"
-        f"*Indices*\n{indices}\n\n"
-        f"*Top Gainers*\n{gainers}\n\n"
-        f"*Top Losers*\n{losers}"
-    )
+    body = f"*Midday Market Check*\n\n*Indices*\n{indices}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}"
     asyncio.run(send_market_report("⏱ Midday Pulse", body))
 
 def send_market_close_report():
     indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
     macro = fetch_macro_data()
-    body = (
-        f"*Markets have closed.*\n\n"
-        f"*Final Index Levels*\n{indices}\n\n"
-        f"*Top Gainers*\n{gainers}\n\n"
-        f"*Top Losers*\n{losers}\n\n"
-        f"*Macro*\n{macro}"
-    )
+    body = f"*Markets have closed.*\n\n*Final Index Levels*\n{indices}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}\n\n*Macro*\n{macro}"
     asyncio.run(send_market_report("📉 Market Close Report", body))
 
 def send_afterhours_report():
     gainers, losers = fetch_top_movers()
-    body = (
-        f"*After-Hours Notable Movers*\n\n"
-        f"*Gainers*\n{gainers}\n\n"
-        f"*Losers*\n{losers}"
-    )
+    body = f"*After-Hours Notable Movers*\n\n*Gainers*\n{gainers}\n\n*Losers*\n{losers}"
     asyncio.run(send_market_report("🌙 After-Hours Movers", body))
 
 # ── Scheduler thread ──────────────────────────────────────────────────────────
@@ -431,7 +475,7 @@ def run_pipeline():
         except Exception as e:
             print(f"[PIPELINE ERROR] {e}")
             asyncio.run(send_error_alert(f"Pipeline error: {str(e)}"))
-        time.sleep(60)
+        time.sleep(30)
 
 # ── Delivery loop ─────────────────────────────────────────────────────────────
 async def delivery_loop():
@@ -448,11 +492,23 @@ async def main():
 ║  SEC EDGAR + News + AI + Telegram        ║
 ╚══════════════════════════════════════════╝
     """)
+
+    # Start feedback handler
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^useful_|^notuseful_"))
+
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     pipeline_thread = threading.Thread(target=run_pipeline, daemon=True)
     pipeline_thread.start()
-    await delivery_loop()
+
+    # Run both delivery loop and telegram app simultaneously
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        await delivery_loop()
+        await app.updater.stop()
+        await app.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -17,16 +17,10 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate"
 }
 
-# ── News sources ──────────────────────────────────────────────────────────────
 NEWS_SOURCES = [
     {
         "name": "CNBC Markets",
         "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
-        "source_key": "CNBC"
-    },
-    {
-        "name": "CNBC Earnings",
-        "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069",
         "source_key": "CNBC"
     },
     {
@@ -40,43 +34,33 @@ NEWS_SOURCES = [
         "source_key": "MARKETWATCH"
     },
     {
-        "name": "Reuters Business",
-        "url": "https://news.google.com/rss/search?q=reuters+business&ceid=US:en&hl=en-US&gl=US",
-        "source_key": "REUTERS"
-    },
-    {
-        "name": "Reuters Markets",
-        "url": "https://news.google.com/rss/search?q=reuters+markets+stocks&ceid=US:en&hl=en-US&gl=US",
-        "source_key": "REUTERS"
-    },
-    {
-        "name": "Reuters Stocks",
-        "url": "https://news.google.com/rss/search?q=site:reuters.com+stocks&ceid=US:en&hl=en-US&gl=US",
+        "name": "Reuters",
+        "url": "https://news.google.com/rss/search?q=reuters+business+markets&ceid=US:en&hl=en-US&gl=US",
         "source_key": "REUTERS"
     },
 ]
 
 WATCH_TICKERS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
-    "NFLX", "AMD", "INTC", "CRM", "ORCL", "IBM", "UBER", "LYFT",
-    "JPM", "BAC", "GS", "MS", "WFC", "C", "V", "MA", "PYPL",
-    "JNJ", "PFE", "MRNA", "ABBV", "UNH", "CVS", "LLY",
-    "XOM", "CVX", "COP", "SLB", "OXY",
-    "WMT", "TGT", "COST", "HD", "LOW", "MCD", "SBUX", "NKE",
-    "BA", "LMT", "RTX", "NOC", "GE", "GD",
-    "DIS", "CMCSA", "T", "VZ", "NFLX",
-    "F", "GM", "RIVN", "LCID",
-    "DAL", "UAL", "AAL", "LUV",
-    "SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "VTI",
-    "CRWD", "PLTR", "SNOW", "NET", "DDOG", "ZS", "OKTA",
-    "RDCM", "APGE", "NRSCF", "BLZE", "FIVN", "ROST"
+    "AAPL", "NVDA", "TSLA", "MSFT", "META",
+    "AMZN", "GOOGL", "JPM", "NFLX", "AMD"
+]
+
+MARKET_KEYWORDS = [
+    "wall street", "s&p 500", "nasdaq", "dow jones", "stock market",
+    "federal reserve", "fed rate", "interest rate", "inflation",
+    "earnings season", "bull market", "bear market", "market rally",
+    "market selloff", "market close", "market open", "equity markets",
+    "global markets", "us markets", "us stocks", "us equities",
+    "rate hike", "rate cut", "jerome powell", "fomc", "treasury yields",
+    "bond yields", "risk appetite", "safe haven", "market volatility",
+    "ipo", "initial public offering", "spac", "record high", "record low",
+    "dow hits", "s&p hits", "nasdaq hits", "wall st", "nyse", "trading day",
+    "morning bid", "week ahead", "market check", "market wrap"
 ]
 
 def get_watched_tickers_from_db():
     try:
-        result = supabase.table("watchlists") \
-            .select("ticker") \
-            .execute()
+        result = supabase.table("watchlists").select("ticker").execute()
         tickers = list(set([r["ticker"] for r in result.data if r.get("ticker")]))
         combined = list(set(tickers + WATCH_TICKERS))
         return combined if combined else WATCH_TICKERS
@@ -93,6 +77,58 @@ def extract_tickers_from_text(text, watched_tickers):
             found.append(ticker)
     return found
 
+def tag_market_article(title, summary):
+    text = f"{title} {summary}".lower()
+    for keyword in MARKET_KEYWORDS:
+        if keyword in text:
+            return ["SPY", "QQQ", "DIA"]
+    return []
+
+def extract_image_url(item, description_text):
+    raw = ET.tostring(item, encoding='unicode')
+    content_match = re.search(r'<(?:ns\d+|media):content[^>]+url=["\']([^"\']+)["\']', raw)
+    if content_match:
+        url = content_match.group(1)
+        if url.startswith("http"):
+            return url
+    thumb_match = re.search(r'<(?:ns\d+|media):thumbnail[^>]+url=["\']([^"\']+)["\']', raw)
+    if thumb_match:
+        url = thumb_match.group(1)
+        if url.startswith("http"):
+            return url
+    namespaces = {
+        "media": "http://search.yahoo.com/mrss/",
+        "content": "http://purl.org/rss/1.0/modules/content/"
+    }
+    for ns_key, ns_url in namespaces.items():
+        media_content = item.find(f"{{{ns_url}}}content")
+        if media_content is not None:
+            url = media_content.attrib.get("url", "")
+            if url and url.startswith("http"):
+                return url
+        media_thumb = item.find(f"{{{ns_url}}}thumbnail")
+        if media_thumb is not None:
+            url = media_thumb.attrib.get("url", "")
+            if url and url.startswith("http"):
+                return url
+    enclosure = item.find("enclosure")
+    if enclosure is not None:
+        url = enclosure.attrib.get("url", "")
+        mime = enclosure.attrib.get("type", "")
+        if url and "image" in mime:
+            return url
+    if description_text:
+        img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description_text, re.IGNORECASE)
+        if img_match:
+            url = img_match.group(1)
+            if url.startswith("http"):
+                return url
+    if description_text:
+        url_match = re.search(r'https?://[^\s"\'<>]+\.(?:jpg|jpeg|png|webp|gif)', description_text, re.IGNORECASE)
+        if url_match:
+            return url_match.group(0)
+    return ""
+
 def news_exists(url):
     try:
         result = supabase.table("raw_filings") \
@@ -104,7 +140,7 @@ def news_exists(url):
         print(f"[ERROR] DB check failed: {e}")
         return False
 
-def store_news(source_key, ticker, title, summary, url, published_at):
+def store_news(source_key, ticker, title, summary, url, published_at, image_url=""):
     try:
         supabase.table("raw_filings").insert({
             "source": source_key,
@@ -117,7 +153,8 @@ def store_news(source_key, ticker, title, summary, url, published_at):
             "status": "PENDING",
             "extra": {
                 "title": title,
-                "source_name": source_key
+                "source_name": source_key,
+                "image_url": image_url
             }
         }).execute()
         print(f"[STORED] NEWS — {source_key} | {ticker} | {title[:60]}... → PENDING")
@@ -140,30 +177,24 @@ def parse_rss_date(date_str):
             continue
     return datetime.now().isoformat()
 
-def poll_news_source(source):
+def fetch_source_items(source):
     name = source["name"]
     url = source["url"]
     source_key = source["source_key"]
+    items_to_store = []
 
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
-            print(f"[ERROR] {name} returned {r.status_code}")
-            return 0
+            return items_to_store
 
         root = ET.fromstring(r.content)
-
         items = root.findall(".//item")
         if not items:
             ns = {"atom": "http://www.w3.org/2005/Atom"}
             items = root.findall("atom:entry", ns)
 
-        if not items:
-            print(f"[{name}] No items found in feed")
-            return 0
-
         watched_tickers = get_watched_tickers_from_db()
-        new_count = 0
 
         for item in items:
             title_elem = item.find("title")
@@ -171,7 +202,6 @@ def poll_news_source(source):
             if not title:
                 continue
 
-            # Clean Google News title format — "Headline - Source"
             if " - Reuters" in title:
                 title = title.replace(" - Reuters", "").strip()
             elif " - " in title and source_key == "REUTERS":
@@ -190,10 +220,10 @@ def poll_news_source(source):
             desc_elem = item.find("description")
             if desc_elem is None:
                 desc_elem = item.find("summary")
-            summary = desc_elem.text if desc_elem is not None else ""
+            raw_description = desc_elem.text if desc_elem is not None else ""
+            summary = re.sub(r'<[^>]+>', '', raw_description).strip() if raw_description else ""
 
-            if summary:
-                summary = re.sub(r'<[^>]+>', '', summary).strip()
+            image_url = extract_image_url(item, raw_description)
 
             date_elem = item.find("pubDate")
             if date_elem is None:
@@ -203,47 +233,85 @@ def poll_news_source(source):
             full_text = f"{title} {summary}"
             found_tickers = extract_tickers_from_text(full_text, watched_tickers)
 
-            if not found_tickers:
-                store_news(
-                    source_key=source_key,
-                    ticker="MARKET",
-                    title=title,
-                    summary=summary,
-                    url=article_url,
-                    published_at=published_at
-                )
-            else:
+            if found_tickers:
                 for ticker in found_tickers:
-                    store_news(
-                        source_key=source_key,
-                        ticker=ticker,
-                        title=title,
-                        summary=summary,
-                        url=article_url,
-                        published_at=published_at
-                    )
-
-            new_count += 1
-            time.sleep(0.1)
-
-        return new_count
+                    items_to_store.append({
+                        "source_key": source_key,
+                        "ticker": ticker,
+                        "title": title,
+                        "summary": summary,
+                        "url": article_url,
+                        "published_at": published_at,
+                        "image_url": image_url
+                    })
+            else:
+                market_tickers = tag_market_article(title, summary)
+                if market_tickers:
+                    for ticker in market_tickers:
+                        items_to_store.append({
+                            "source_key": source_key,
+                            "ticker": ticker,
+                            "title": title,
+                            "summary": summary,
+                            "url": article_url,
+                            "published_at": published_at,
+                            "image_url": image_url
+                        })
+                else:
+                    items_to_store.append({
+                        "source_key": source_key,
+                        "ticker": "MARKET",
+                        "title": title,
+                        "summary": summary,
+                        "url": article_url,
+                        "published_at": published_at,
+                        "image_url": image_url
+                    })
 
     except Exception as e:
-        print(f"[ERROR] Failed to poll {name}: {e}")
-        return 0
+        print(f"[ERROR] Failed to fetch {name}: {e}")
+
+    return items_to_store
 
 def poll_all_news():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling news sources...")
-    total = 0
+
+    all_source_items = []
+    source_counts = {}
+
     for source in NEWS_SOURCES:
-        count = poll_news_source(source)
-        if count > 0:
-            print(f"[{source['name']}] {count} new articles stored")
-        total += count
-    if total == 0:
+        items = fetch_source_items(source)
+        if items:
+            all_source_items.append(items)
+            source_counts[source["source_key"]] = source_counts.get(source["source_key"], 0) + len(items)
+
+    if not all_source_items:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] No new news articles.")
-    else:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Total: {total} new articles stored.")
+        return
+
+    total = 0
+    max_len = max(len(s) for s in all_source_items)
+
+    for i in range(max_len):
+        for source_items in all_source_items:
+            if i < len(source_items):
+                item = source_items[i]
+                store_news(
+                    source_key=item["source_key"],
+                    ticker=item["ticker"],
+                    title=item["title"],
+                    summary=item["summary"],
+                    url=item["url"],
+                    published_at=item["published_at"],
+                    image_url=item["image_url"]
+                )
+                total += 1
+                time.sleep(0.05)
+
+    for source_key, count in source_counts.items():
+        print(f"[{source_key}] {count} new articles")
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Total: {total} new articles stored — interleaved.")
 
 def run_news_poller():
     poll_all_news()

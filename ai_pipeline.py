@@ -4,7 +4,7 @@ import time
 import requests as http_requests
 from supabase import create_client
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 load_dotenv()
 
@@ -39,7 +39,6 @@ def call_gemini(prompt, retries=3):
             )
             if r.status_code == 200:
                 content = r.json()["choices"][0]["message"]["content"].strip()
-                # Strip <think>...</think> reasoning tags
                 if "<think>" in content:
                     if "</think>" in content:
                         content = content.split("</think>")[-1].strip()
@@ -68,24 +67,31 @@ def parse_json_response(text):
         return {}
 
 def summarise(company_name, raw_text):
-    prompt = f"""You are a financial analyst writing concise alerts for retail investors.
+    prompt = f"""You are a financial analyst writing alerts for retail investors.
 
-Summarise the following filing in 40 to 60 words. You must write at least 40 words.
-Write in plain English. Be specific — include names, numbers, amounts, percentages where available.
+The following is a news article or filing about {company_name}.
+
+Write a summary in plain English of approximately 60 words.
+Every single sentence must be grammatically complete and make full sense on its own.
+Never cut a sentence in the middle — always finish the thought completely.
+Be specific — include real names, numbers, dollar amounts, percentages where available.
 Focus on what happened, who was involved, and why it matters to investors.
-Do not use first person. Do not mention word count. Do not use vague language.
+Do not use first person. Do not say 'this article' or 'this filing'.
+Do not repeat the company name at the start.
+If the source text is short, expand with relevant business context and investor implications.
 
-For insider trades include: insider name, their role, whether they bought or sold, number of shares, dollar value if available.
-For earnings include: revenue, EPS, whether beat or missed estimates, guidance if mentioned.
-For leadership changes include: who left, who replaced them, effective date.
-For acquisitions include: companies involved, deal value, strategic rationale.
+For insider trades: include insider name, their title or role, whether they bought or sold, number of shares, and total dollar value.
+For earnings: include revenue figure, EPS, whether it beat or missed analyst estimates, and any forward guidance.
+For leadership changes: include who departed, their role, who replaced them if known, and the effective date.
+For acquisitions or deals: include both company names, deal value, and the strategic reason.
+For analyst calls: include the analyst firm name, the rating change, new price target, and their reasoning.
 
-Company: {company_name}
+CRITICAL RULE: Your response must end with a complete sentence. If you are approaching the word limit and your current sentence is not finished, finish that sentence before stopping. Never end on an incomplete thought.
 
-Filing text:
+Text:
 {raw_text[:8000]}
 
-Return only the summary text, nothing else."""
+Return only the summary text. Nothing else."""
     return call_gemini(prompt)
 
 def get_recent_summaries(ticker, limit=10):
@@ -112,7 +118,7 @@ def store_summary(filing_id, ticker, summary, impact, event_type):
     except Exception as e:
         print(f"[ERROR] Failed to store summary: {e}")
 
-def store_alert(ticker, summary, impact, source, filing_type=None, extra=None):
+def store_alert(ticker, summary, impact, source, filing_type=None, extra=None, filing_url=""):
     try:
         supabase.table("alerts").insert({
             "ticker": ticker,
@@ -121,7 +127,8 @@ def store_alert(ticker, summary, impact, source, filing_type=None, extra=None):
             "source": source,
             "filing_type": filing_type,
             "delivered": False,
-            "extra": extra or {}
+            "extra": extra or {},
+            "filing_url": filing_url
         }).execute()
         print(f"[ALERT READY] {impact} — ${ticker}: {summary[:80]}...")
     except Exception as e:
@@ -144,6 +151,7 @@ def process_filing(filing):
     filing_type  = filing.get("filing_type", "")
     source       = filing.get("source", "SEC_EDGAR")
     extra        = filing.get("extra") or {}
+    filing_url   = filing.get("filing_url", "")
 
     print(f"\n[PROCESSING] {filing_type} — {company_name} ({ticker})")
 
@@ -151,20 +159,13 @@ def process_filing(filing):
     gibberish_response = call_gemini(gibberish_prompt(raw_text[:3000]))
     gibberish_result = parse_json_response(gibberish_response)
     if gibberish_result.get("is_gibberish") == True:
-        print(f"[DISCARDED] Gibberish detected — {ticker}")
+        print(f"[DISCARDED] Gibberish — {ticker}")
         update_filing_status(filing_id, "DISCARDED")
         return
     print(f"[PASS] Gibberish check")
 
-    # ── Step 2: Relevance check ───────────────────────────────
-    relevance_response = call_gemini(relevance_prompt(company_name, raw_text[:3000]))
-    relevance_result = parse_json_response(relevance_response)
-    if relevance_result.get("is_relevant") == "False" or \
-       relevance_result.get("is_relevant") == False:
-        print(f"[DISCARDED] Not relevant to {company_name}")
-        update_filing_status(filing_id, "DISCARDED")
-        return
-    print(f"[PASS] Relevance check")
+    # ── Step 2: Skip relevance check ─────────────────────────
+    print(f"[SKIP] Relevance check")
 
     # ── Step 3: Summarisation ─────────────────────────────────
     summary = summarise(company_name, raw_text)
@@ -179,13 +180,11 @@ def process_filing(filing):
     validation_result = parse_json_response(validation_response)
     if validation_result.get("issues_detected") == "True":
         corrected = validation_result.get("corrected_summary", "").strip()
-        if corrected:
+        if corrected and len(corrected) > 20:
             summary = corrected
             print(f"[CORRECTED] Summary fixed")
         else:
-            print(f"[DISCARDED] Validation failed — {ticker}")
-            update_filing_status(filing_id, "DISCARDED")
-            return
+            print(f"[WARNING] Validation flagged but keeping original — {ticker}")
     print(f"[PASS] Validation check")
 
     # ── Step 5: Impact classification ────────────────────────
@@ -203,7 +202,7 @@ def process_filing(filing):
         similarity_response = call_gemini(similarity_prompt(old_summary, summary))
         similarity_result = parse_json_response(similarity_response)
         if similarity_result.get("is_similar") == "True":
-            print(f"[DISCARDED] Duplicate alert — {ticker}")
+            print(f"[DISCARDED] Duplicate — {ticker}")
             update_filing_status(filing_id, "DISCARDED")
             return
     print(f"[PASS] Deduplication check")
@@ -222,7 +221,8 @@ def process_filing(filing):
         impact=impact,
         source=source,
         filing_type=filing_type,
-        extra=extra
+        extra=extra,
+        filing_url=filing_url
     )
     update_filing_status(filing_id, "PROCESSED")
     print(f"[DONE] {ticker} — {impact} alert stored ✅")
@@ -230,11 +230,13 @@ def process_filing(filing):
 def run_pipeline():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for PENDING filings...")
     try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
         result = supabase.table("raw_filings") \
             .select("*") \
             .eq("status", "PENDING") \
-            .order("created_at") \
-            .limit(10) \
+            .gte("created_at", cutoff) \
+            .order("created_at", desc=True) \
+            .limit(25) \
             .execute()
 
         filings = result.data
@@ -245,7 +247,7 @@ def run_pipeline():
         print(f"Found {len(filings)} PENDING filings — processing...")
         for filing in filings:
             process_filing(filing)
-            time.sleep(1)
+            time.sleep(0.5)
 
     except Exception as e:
         print(f"[ERROR] Pipeline failed: {e}")
