@@ -66,53 +66,30 @@ def parse_json_response(text):
         return {}
 
 def is_complete_summary(text):
-    """
-    Check if summary is complete and meaningful:
-    - Must end with . ! or ?
-    - Must have at least 40 words
-    - Must not end mid-number or mid-phrase
-    """
     if not text or len(text.strip()) < 10:
         return False
-
     stripped = text.rstrip()
-
-    # Must end with sentence-ending punctuation
     if stripped[-1] not in ".!?":
         return False
-
-    # Must have at least 40 words
     words = stripped.split()
     if len(words) < 40:
         return False
-
-    # Check the full text for incomplete endings — preposition at end before period
-    # Remove the final punctuation and check last word
     text_no_punct = stripped.rstrip(".!?").rstrip()
     last_words = text_no_punct.split()
     if not last_words:
         return False
-
     last_word = last_words[-1].lower().rstrip(",")
     second_last = last_words[-2].lower().rstrip(",") if len(last_words) >= 2 else ""
-
-    # Incomplete if ends with preposition or article
     dangling_words = {"on", "the", "a", "an", "and", "or", "but", "that",
                       "with", "by", "in", "of", "to", "for", "as", "at",
                       "from", "into", "than", "about", "over", "after"}
     if last_word in dangling_words:
         return False
-
-    # Incomplete if last word is a number preceded by a preposition
-    # e.g. "at a price of $227" or "sold 436,2"
     clean_last = last_word.replace(",", "").replace("$", "").replace(".", "")
     if clean_last.isnumeric() and second_last in {"of", "at", "for", "worth", "than", "about", "to", "from"}:
         return False
-
-    # Incomplete if last word looks like a partial number (e.g. "436,2" without trailing digits)
     if re.search(r'\d+,\d{1,2}$', last_word):
         return False
-
     return True
 
 def summarise(company_name, raw_text):
@@ -141,18 +118,15 @@ WHAT TO EXTRACT BY FILING TYPE:
 - Acquisition/merger: both company names, deal value, strategic rationale, expected close date.
 - Government grant or contract: exact dollar amount, awarding body, purpose, what it enables the company to do.
 - Analyst call: firm name, previous rating, new rating, new price target, core reason for the change.
-- Clinical trial: drug/therapy name, trial phase and name, key result (success/failure/milestone), patient numbers, what it means for commercialisation.
-- Exploration/mining update: project name, location, specific milestone achieved (e.g. drill pad construction begun), timeline, investor significance.
+- Clinical trial: drug/therapy name, trial phase and name, key result, patient numbers, what it means for commercialisation.
+- Exploration/mining update: project name, location, specific milestone achieved, timeline, investor significance.
 - Regulatory/legal: what specifically changed, who it affects, financial exposure or benefit.
 - General operational update: the most specific facts available — names, locations, percentages, deadlines.
 
-QUALITY STANDARD — your summary must answer all three of these questions:
+QUALITY STANDARD — your summary must answer all three:
 1. What specifically happened? (not vague — include names and numbers)
 2. What are the key details? (financials, timeline, people involved)
 3. Why does it matter to someone holding or considering this stock?
-
-A summary that says "the company reported results and reaffirmed guidance" is POOR.
-A summary that says "net sales fell 4% to $2.4 billion, adjusted EPS dropped 32% to $0.50, yet the company reaffirmed full-year 2026 guidance suggesting confidence in recovery" is GOOD.
 
 EXAMPLES OF GOOD SUMMARIES:
 
@@ -161,6 +135,9 @@ Earnings example:
 
 Insider trade example:
 "Jorie L. Novacek, Senior Vice President and Controller, purchased 207 shares of Incentive Compensation Deferral Plan Share Credits on June 5, 2026. Each share was acquired at $227.22, bringing the total investment to $46,956. This transaction increases Ms. Novacek's direct ownership, a signal of continued insider confidence in the company's outlook."
+
+Leadership change example:
+"Cocrystal Pharma appointed James Sapirstein as Chief Executive Officer effective June 3, 2026, replacing Co-CEOs Sam Lee and James Martin. Mr. Sapirstein's annual base salary is set at $265,000, with additional performance-based compensation. The leadership consolidation under a single CEO signals a strategic shift toward more focused executive direction."
 
 Government grant example:
 "The U.S. Department of Energy reinstated a $115,489,662 grant to fund construction of a lithium hydroxide processing facility, with the DOE contributing $57,744,831 and the company providing matching funds. The facility is central to domestic EV battery supply chain development. Reinstatement removes a key financial uncertainty and strengthens the company's path to full commercial production."
@@ -172,29 +149,28 @@ Return ONLY the summary. No preamble. No labels. No explanation. Just 3 complete
     return call_llm(prompt, max_tokens=1500)
 
 def expand_summary(summary, company_name, raw_text):
-    """Called when summary is incomplete — completes cut-off sentences and adds depth."""
-    prompt = f"""You are a financial editor. The summary below about {company_name} has a problem — it either ends mid-sentence, ends mid-number, or is too short and vague.
+    prompt = f"""You are a financial editor. The summary below about {company_name} is INCOMPLETE — it ends mid-sentence, mid-number, or without a full stop.
 
 YOUR JOB: Fix it so it becomes a complete, informative 3-sentence summary of 50-70 words.
 
 STRICT RULES:
 1. Keep every word and number from the original exactly as written — do not change any existing content.
 2. Complete any sentence that was cut off using details from the source text below.
-3. If the summary is under 40 words after fixing, add 1-2 more complete sentences with specific details from the source.
+3. If the summary is under 40 words after fixing, add 1-2 more complete sentences with specific details.
 4. The final character of your response MUST be a full stop.
 5. Never truncate a number — write it completely.
 6. The summary must answer: what happened, key details, and why it matters to investors.
 7. Do not say "this filing" or "this article".
 8. Return only the completed summary — no preamble, no explanation.
 
-Current summary (may be incomplete):
+Current summary (incomplete):
 {summary}
 
 Source text:
 {raw_text[:4000]}
 
-Return ONLY the fixed summary."""
-    result = call_llm(prompt, max_tokens=1500)
+Return ONLY the fixed summary. Last character MUST be a full stop."""
+    result = call_llm(prompt, max_tokens=2000)
     return result
 
 def get_recent_summaries(ticker, limit=10):
@@ -279,11 +255,11 @@ def process_filing(filing):
     word_count = len(summary.split())
     print(f"[SUMMARY] {word_count} words — {summary[:100]}...")
 
-    # ── Step 4: Completeness and quality check ────────────────
+    # ── Step 4: Completeness check ───────────────────────────
     if not is_complete_summary(summary):
         print(f"[INCOMPLETE] {word_count} words — expanding...")
         expanded = expand_summary(summary, company_name, raw_text)
-        if expanded and len(expanded.strip()) >= len(summary.strip()):
+        if expanded and expanded.strip().endswith((".", "!", "?")):
             summary = expanded
             print(f"[EXPANDED] {len(summary.split())} words — {summary[:100]}...")
         else:
