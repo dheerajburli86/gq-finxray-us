@@ -18,26 +18,10 @@ HEADERS = {
 }
 
 NEWS_SOURCES = [
-    {
-        "name": "CNBC Markets",
-        "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
-        "source_key": "CNBC"
-    },
-    {
-        "name": "Bloomberg",
-        "url": "https://feeds.bloomberg.com/markets/news.rss",
-        "source_key": "BLOOMBERG"
-    },
-    {
-        "name": "MarketWatch",
-        "url": "https://feeds.marketwatch.com/marketwatch/topstories",
-        "source_key": "MARKETWATCH"
-    },
-    {
-        "name": "Reuters",
-        "url": "https://news.google.com/rss/search?q=reuters+business+markets&ceid=US:en&hl=en-US&gl=US",
-        "source_key": "REUTERS"
-    },
+    {"name": "CNBC Markets", "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147", "source_key": "CNBC"},
+    {"name": "Bloomberg", "url": "https://feeds.bloomberg.com/markets/news.rss", "source_key": "BLOOMBERG"},
+    {"name": "MarketWatch", "url": "https://feeds.marketwatch.com/marketwatch/topstories", "source_key": "MARKETWATCH"},
+    {"name": "Reuters", "url": "https://news.google.com/rss/search?q=reuters+business+markets&ceid=US:en&hl=en-US&gl=US", "source_key": "REUTERS"},
 ]
 
 WATCH_TICKERS = [
@@ -53,10 +37,41 @@ MARKET_KEYWORDS = [
     "global markets", "us markets", "us stocks", "us equities",
     "rate hike", "rate cut", "jerome powell", "fomc", "treasury yields",
     "bond yields", "risk appetite", "safe haven", "market volatility",
-    "ipo", "initial public offering", "spac", "record high", "record low",
+    "ipo", "initial public offering", "record high", "record low",
     "dow hits", "s&p hits", "nasdaq hits", "wall st", "nyse", "trading day",
     "morning bid", "week ahead", "market check", "market wrap"
 ]
+
+NON_US_KEYWORDS = [
+    "state bank of india", "sun pharmaceutical", "sun pharma",
+    "reliance industries", "infosys", "wipro", "hdfc bank",
+    "icici bank", "bajaj finance", "mahindra", "adani group",
+    "sensex", "nifty 50", "reserve bank of india", "sebi",
+    "alibaba group", "tencent holdings", "baidu inc", "xiaomi corp",
+    "huawei technologies", "sinopec", "petrochina",
+    "shanghai composite", "hang seng index", "hkex",
+    "peoples bank of china", "pboc rate",
+    "bank of japan rate", "nikkei 225",
+    "ftse 100 index", "dax index", "cac 40 index",
+]
+
+US_ANCHOR_KEYWORDS = [
+    "nasdaq", "nyse", "s&p 500", "dow jones", "wall street",
+    "federal reserve", "sec filing", "us stock", "american stock",
+    "new york stock exchange", "us market", "us listed",
+    "us shares", "us investors", "us economy", "us gdp",
+    "us dollar", "treasury", "fed funds"
+]
+
+def is_us_relevant(title, summary):
+    text = f"{title} {summary}".lower()
+    for kw in US_ANCHOR_KEYWORDS:
+        if kw in text:
+            return True
+    non_us_hits = sum(1 for kw in NON_US_KEYWORDS if kw in text)
+    if non_us_hits >= 2:
+        return False
+    return True
 
 def get_watched_tickers_from_db():
     try:
@@ -81,8 +96,8 @@ def tag_market_article(title, summary):
     text = f"{title} {summary}".lower()
     for keyword in MARKET_KEYWORDS:
         if keyword in text:
-            return ["SPY", "QQQ", "DIA"]
-    return []
+            return True
+    return False
 
 def extract_image_url(item, description_text):
     raw = ET.tostring(item, encoding='unicode')
@@ -96,10 +111,7 @@ def extract_image_url(item, description_text):
         url = thumb_match.group(1)
         if url.startswith("http"):
             return url
-    namespaces = {
-        "media": "http://search.yahoo.com/mrss/",
-        "content": "http://purl.org/rss/1.0/modules/content/"
-    }
+    namespaces = {"media": "http://search.yahoo.com/mrss/", "content": "http://purl.org/rss/1.0/modules/content/"}
     for ns_key, ns_url in namespaces.items():
         media_content = item.find(f"{{{ns_url}}}content")
         if media_content is not None:
@@ -131,10 +143,7 @@ def extract_image_url(item, description_text):
 
 def news_exists(url):
     try:
-        result = supabase.table("raw_filings") \
-            .select("id") \
-            .eq("filing_url", url) \
-            .execute()
+        result = supabase.table("raw_filings").select("id").eq("filing_url", url).execute()
         return len(result.data) > 0
     except Exception as e:
         print(f"[ERROR] DB check failed: {e}")
@@ -151,15 +160,12 @@ def store_news(source_key, ticker, title, summary, url, published_at, image_url=
             "filing_url": url,
             "filed_at": published_at,
             "status": "PENDING",
-            "extra": {
-                "title": title,
-                "source_name": source_key,
-                "image_url": image_url
-            }
+            "extra": {"title": title, "source_name": source_key, "image_url": image_url}
         }).execute()
         print(f"[STORED] NEWS — {source_key} | {ticker} | {title[:60]}... → PENDING")
     except Exception as e:
-        print(f"[ERROR] Failed to store news: {e}")
+        if "duplicate key" not in str(e).lower():
+            print(f"[ERROR] Failed to store news: {e}")
 
 def parse_rss_date(date_str):
     if not date_str:
@@ -182,6 +188,7 @@ def fetch_source_items(source):
     url = source["url"]
     source_key = source["source_key"]
     items_to_store = []
+    seen_urls = set()
 
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
@@ -214,14 +221,20 @@ def fetch_source_items(source):
             if not article_url:
                 continue
 
-            if news_exists(article_url):
+            if article_url in seen_urls or news_exists(article_url):
                 continue
+            seen_urls.add(article_url)
 
             desc_elem = item.find("description")
             if desc_elem is None:
                 desc_elem = item.find("summary")
             raw_description = desc_elem.text if desc_elem is not None else ""
             summary = re.sub(r'<[^>]+>', '', raw_description).strip() if raw_description else ""
+
+            # Filter non-US articles
+            if not is_us_relevant(title, summary):
+                print(f"[FILTERED] Non-US: {title[:60]}")
+                continue
 
             image_url = extract_image_url(item, raw_description)
 
@@ -234,39 +247,36 @@ def fetch_source_items(source):
             found_tickers = extract_tickers_from_text(full_text, watched_tickers)
 
             if found_tickers:
-                for ticker in found_tickers:
-                    items_to_store.append({
-                        "source_key": source_key,
-                        "ticker": ticker,
-                        "title": title,
-                        "summary": summary,
-                        "url": article_url,
-                        "published_at": published_at,
-                        "image_url": image_url
-                    })
+                # Store for first matching ticker only — avoids duplicate URL constraint
+                items_to_store.append({
+                    "source_key": source_key,
+                    "ticker": found_tickers[0],
+                    "title": title,
+                    "summary": summary,
+                    "url": article_url,
+                    "published_at": published_at,
+                    "image_url": image_url
+                })
+            elif tag_market_article(title, summary):
+                items_to_store.append({
+                    "source_key": source_key,
+                    "ticker": "SPY",
+                    "title": title,
+                    "summary": summary,
+                    "url": article_url,
+                    "published_at": published_at,
+                    "image_url": image_url
+                })
             else:
-                market_tickers = tag_market_article(title, summary)
-                if market_tickers:
-                    for ticker in market_tickers:
-                        items_to_store.append({
-                            "source_key": source_key,
-                            "ticker": ticker,
-                            "title": title,
-                            "summary": summary,
-                            "url": article_url,
-                            "published_at": published_at,
-                            "image_url": image_url
-                        })
-                else:
-                    items_to_store.append({
-                        "source_key": source_key,
-                        "ticker": "MARKET",
-                        "title": title,
-                        "summary": summary,
-                        "url": article_url,
-                        "published_at": published_at,
-                        "image_url": image_url
-                    })
+                items_to_store.append({
+                    "source_key": source_key,
+                    "ticker": "MARKET",
+                    "title": title,
+                    "summary": summary,
+                    "url": article_url,
+                    "published_at": published_at,
+                    "image_url": image_url
+                })
 
     except Exception as e:
         print(f"[ERROR] Failed to fetch {name}: {e}")
@@ -275,7 +285,6 @@ def fetch_source_items(source):
 
 def poll_all_news():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling news sources...")
-
     all_source_items = []
     source_counts = {}
 
@@ -291,7 +300,6 @@ def poll_all_news():
 
     total = 0
     max_len = max(len(s) for s in all_source_items)
-
     for i in range(max_len):
         for source_items in all_source_items:
             if i < len(source_items):
@@ -310,7 +318,6 @@ def poll_all_news():
 
     for source_key, count in source_counts.items():
         print(f"[{source_key}] {count} new articles")
-
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Total: {total} new articles stored — interleaved.")
 
 def run_news_poller():

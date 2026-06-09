@@ -1,32 +1,58 @@
 def get_prompt(company_name, content, cur_date):
 
     prompt = f"""<INST>
-    
-    Your task is to read the provided text and evaluate the perceived impact of the information on the future stock performance of {company_name}.  You must classify the impact as either HIGH, MEDIUM, or LOW.
+
+    Your task is to read the provided text and evaluate the perceived impact of the information on the future stock performance of {company_name}. You must classify the impact as either HIGH, MEDIUM, or LOW.
 
     Follow these instructions precisely:
 
-    1.  **Read and Understand:** Carefully read the text provided after this instruction block.
-    2.  **Categorization:** Classify the text's impact on {company_name}'s stock into *one* of the following categories: HIGH, MEDIUM, or LOW.
-    3.  **Exhaustive Rules:** Apply the following rules in order to determine the classification. Be exhaustive with your application of the rules.
-        *   **Rule 1 (LOW):** If the text describes routine compliance matters where no significant findings are reported, classify it as LOW.
-        *   **Rule 2 (LOW):** If the text relates to share certificates being lost, reissued, or similar administrative tasks, classify it as LOW.
-        *   **Rule 3 (LOW):** If the text contains information that will have *no* discernible impact on the stock price, classify it as LOW. 
-        *   **Rule 4 (LOW):** If any of the inputs are missing or improperly formed, classify it as LOW. 
-        *   **Rule 5 (LOW):** If the text primarily talks about the closure of trading window and similar routine compliance matters, classify it as LOW. 
-        *   **Rule 6 (LOW):** Assume today's date to be {cur_date}. If the text exclusively recounts *materially old* events (i.e., more than 1 month in the past) **without** any mention of a current development or potential future impact, classify it as LOW.
-        *   **Rule 7 (MEDIUM):** If the text is about upcoming meetings (e.g., board meetings, shareholder meetings, earnings calls, analyst meetings, etc.), classify it as MEDIUM.
-        *   **Rule 8 (HIGH):** If the text reports a change in Key Management Personnel (e.g., CEO, CFO, CTO, board members, etc.), classify it as HIGH.
-        *   **Rule 9 (HIGH):** If the text discusses purchase orders received by {company_name}, classify it as HIGH.
-        *   **Rule 10 (HIGH):** If the text describes acquisitions or disposals (buying or selling of assets, businesses, or significant stakes in other companies) involving {company_name}, classify it as HIGH.
-        *   **Rule 11 (Discretion):** For all other matters not covered by the above rules, use your understanding of financial markets and business to determine the impact. Consider factors like the magnitude of the news, potential financial implications, and relevance to investor sentiment.
+    1. **Read and Understand:** Carefully read the text provided after this instruction block.
+    2. **Categorization:** Classify the text's impact on {company_name}'s stock into *one* of the following categories: HIGH, MEDIUM, or LOW.
+    3. **Exhaustive Rules:** Apply the following rules in order to determine the classification.
 
-    4.  **Output Format:** Provide your answer in a JSON format with the key 'impact'. The value should be one of the following words: "HIGH", "MEDIUM", or "LOW". For example: `{{'impact': 'LOW'}}`.
+        **HIGH Rules — classify as HIGH if any of these apply:**
+        *   Rule H1: Change in Key Management Personnel — CEO, CFO, CTO, COO, President, or board member appointment, resignation, or termination.
+        *   Rule H2: Earnings results — quarterly or annual revenue, net income, EPS reported. Especially if beating or missing analyst estimates significantly.
+        *   Rule H3: Acquisition, merger, or disposal — company buying or selling another business, significant asset, or major stake.
+        *   Rule H4: Major contract or purchase order — significant new customer win, government contract, or partnership agreement.
+        *   Rule H5: Bankruptcy, insolvency, restructuring, or Chapter 11 filing.
+        *   Rule H6: FDA approval, clinical trial results, or major regulatory decision affecting the company.
+        *   Rule H7: Significant insider buying — executive or director purchasing company stock with personal money. Especially purchases over $500,000 total value.
+        *   Rule H8: SEC investigation, fraud allegation, or major legal judgment against the company.
+        *   Rule H9: Stock buyback program announcement or major dividend change.
+        *   Rule H10: IPO filing (S-1) or major capital raise.
+        *   Rule H11: Delisting notice or exchange transfer.
+        *   Rule H12: Major product launch, breakthrough technology announcement, or significant market expansion.
 
-    5. Please do not output any other text besides the JSON classification.
-    
-    6. **Text to be Evaluated:** {content}
-    
+        **MEDIUM Rules — classify as MEDIUM if any of these apply:**
+        *   Rule M1: Upcoming earnings call, board meeting, shareholder meeting, or analyst day announcement.
+        *   Rule M2: Insider selling of company stock — executive or director selling shares. Any amount.
+        *   Rule M3: Insider buying under $500,000 total value.
+        *   Rule M4: Minor contract win or renewal.
+        *   Rule M5: Analyst rating change — upgrade, downgrade, or price target revision.
+        *   Rule M6: Guidance update — company revising its financial outlook up or down.
+        *   Rule M7: Strategic partnership or joint venture announcement.
+        *   Rule M8: Dividend declaration (regular quarterly dividend).
+        *   Rule M9: Share issuance, secondary offering, or dilution event.
+        *   Rule M10: Management commentary on market conditions or business outlook.
+        *   Rule M11: Clinical trial update or drug pipeline progress (not final approval).
+
+        **LOW Rules — classify as LOW if none of the above apply:**
+        *   Rule L1: Routine compliance filing with no significant findings.
+        *   Rule L2: Lost share certificates or administrative tasks.
+        *   Rule L3: Trading window closure notification.
+        *   Rule L4: Events more than 1 month old with no current relevance.
+        *   Rule L5: General market commentary with no specific company impact.
+        *   Rule L6: Missing or improperly formed input.
+
+    4. **Important:** When in doubt between HIGH and MEDIUM, choose HIGH. When in doubt between MEDIUM and LOW, choose MEDIUM. Err on the side of higher impact — it is better to alert investors about something moderately important than to miss something significant.
+
+    5. **Output Format:** Provide your answer in JSON format with the key 'impact'. The value must be one of: "HIGH", "MEDIUM", or "LOW". Example: {{'impact': 'HIGH'}}
+
+    6. Do not output any other text besides the JSON classification.
+
+    7. **Text to be Evaluated:** {content}
+
     </INST>"""
-               
+
     return prompt

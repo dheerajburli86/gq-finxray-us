@@ -65,12 +65,16 @@ def format_alert(alert):
     source_name = source_labels.get(source, source)
     time_str = datetime.now().strftime("%I:%M %p EST")
 
-    # Live price
+    # Live price — SPY for MARKET ticker, actual ticker otherwise
     price_line = ""
-    if ticker and ticker not in ("MARKET", "UNKNOWN"):
-        price_data = get_stock_price(ticker)
+    price_ticker = "SPY" if ticker == "MARKET" else ticker
+    if price_ticker and price_ticker != "UNKNOWN":
+        price_data = get_stock_price(price_ticker)
         if price_data:
-            price_line = f"\n📈 *Stock:* {ticker} {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
+            if ticker == "MARKET":
+                price_line = f"\n📈 *S&P 500:* SPY {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
+            else:
+                price_line = f"\n📈 *Stock:* {ticker} {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
 
     # Source link
     source_link = ""
@@ -120,9 +124,9 @@ def format_alert(alert):
             f"{footer}"
         )
 
-    # News
+    # News article
     if filing_type == "NEWS":
-        ticker_display = f"${ticker}" if ticker != "MARKET" else "Market News"
+        ticker_display = f"${ticker}" if ticker not in ("MARKET", "SPY", "QQQ", "DIA") else "Market News"
         return (
             f"{emoji} *{source_name} — {ticker_display}*"
             f"{price_line}\n"
@@ -153,7 +157,7 @@ def get_feedback_keyboard(alert_id: str):
     ]]
     return InlineKeyboardMarkup(keyboard)
 
-# ── Send alert with optional image ───────────────────────────────────────────
+# ── Send Telegram message ─────────────────────────────────────────────────────
 async def send_telegram_message(bot, chat_id, alert):
     msg = format_alert(alert)
     extra = alert.get("extra") or {}
@@ -162,12 +166,11 @@ async def send_telegram_message(bot, chat_id, alert):
     keyboard = get_feedback_keyboard(alert_id)
 
     if image_url:
-        caption = msg[:1024]
         try:
             await bot.send_photo(
                 chat_id=chat_id,
                 photo=image_url,
-                caption=caption,
+                caption=msg[:1024],
                 parse_mode="Markdown",
                 reply_markup=keyboard
             )
@@ -183,7 +186,7 @@ async def send_telegram_message(bot, chat_id, alert):
     )
     return True
 
-# ── Error alerting ────────────────────────────────────────────────────────────
+# ── Error alert ───────────────────────────────────────────────────────────────
 async def send_error_alert(message: str):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
@@ -195,20 +198,22 @@ async def send_error_alert(message: str):
     except:
         pass
 
-# ── Feedback callback handler ─────────────────────────────────────────────────
+# ── Feedback callback ─────────────────────────────────────────────────────────
 async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
     chat_id = str(query.from_user.id)
 
     if data.startswith("useful_"):
         alert_id = data.replace("useful_", "")
         feedback = "useful"
+        toast = "✅ Glad it was useful!"
     elif data.startswith("notuseful_"):
         alert_id = data.replace("notuseful_", "")
         feedback = "not_useful"
+        toast = "👍 Noted — we'll keep improving."
     else:
+        await query.answer()
         return
 
     try:
@@ -218,9 +223,11 @@ async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "feedback": feedback,
             "created_at": datetime.now().isoformat()
         }).execute()
+        await query.answer(toast, show_alert=False)
         await query.edit_message_reply_markup(reply_markup=None)
         print(f"[FEEDBACK] {feedback} — alert {alert_id} from {chat_id}")
     except Exception as e:
+        await query.answer()
         print(f"[ERROR] Feedback logging failed: {e}")
 
 # ── Deliver pending alerts ────────────────────────────────────────────────────
@@ -245,13 +252,10 @@ async def deliver_pending_alerts():
             impact = alert.get("impact", "LOW")
 
             if ticker == "UNKNOWN":
-                supabase.table("alerts") \
-                    .update({"delivered": True}) \
-                    .eq("id", alert["id"]) \
-                    .execute()
+                supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
                 continue
 
-            # MARKET ticker — HIGH/MEDIUM to channel only
+            # MARKET ticker — channel only, HIGH/MEDIUM
             if ticker == "MARKET":
                 if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
                     try:
@@ -259,46 +263,27 @@ async def deliver_pending_alerts():
                         print(f"[CHANNEL] {impact} market alert posted")
                     except Exception as e:
                         print(f"[ERROR] Channel post failed: {e}")
-                supabase.table("alerts") \
-                    .update({"delivered": True}) \
-                    .eq("id", alert["id"]) \
-                    .execute()
+                supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
                 continue
 
-            # Find subscribed users
-            watchlist_result = supabase.table("watchlists") \
-                .select("user_id") \
-                .eq("ticker", ticker) \
-                .execute()
-
+            # Find subscribed users for specific ticker
+            watchlist_result = supabase.table("watchlists").select("user_id").eq("ticker", ticker).execute()
             delivered_to = []
 
             for item in watchlist_result.data:
                 user_id = item.get("user_id")
                 if not user_id:
                     continue
-
-                user_result = supabase.table("users") \
-                    .select("telegram_chat_id") \
-                    .eq("id", user_id) \
-                    .execute()
-
+                user_result = supabase.table("users").select("telegram_chat_id").eq("id", user_id).execute()
                 if not user_result.data:
                     continue
-
                 chat_id = user_result.data[0].get("telegram_chat_id")
                 if not chat_id:
                     continue
-
-                pref_result = supabase.table("user_preferences") \
-                    .select("min_impact") \
-                    .eq("user_id", user_id) \
-                    .execute()
-
+                pref_result = supabase.table("user_preferences").select("min_impact").eq("user_id", user_id).execute()
                 min_impact = "LOW"
                 if pref_result.data:
                     min_impact = pref_result.data[0].get("min_impact", "LOW")
-
                 if impact_order.get(impact, 1) >= impact_order.get(min_impact, 1):
                     try:
                         await send_telegram_message(bot, chat_id, alert)
@@ -322,19 +307,14 @@ async def deliver_pending_alerts():
                 except Exception as e:
                     print(f"[ERROR] Channel post failed: {e}")
 
-            # Mark delivered
-            supabase.table("alerts") \
-                .update({"delivered": True}) \
-                .eq("id", alert["id"]) \
-                .execute()
-
+            supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
             if delivered_to:
                 print(f"[DELIVERED] {impact} — ${ticker} → {len(delivered_to)} users")
 
     except Exception as e:
         print(f"[ERROR] Delivery failed: {e}")
 
-# ── Market report helpers ─────────────────────────────────────────────────────
+# ── Market reports ────────────────────────────────────────────────────────────
 def fetch_index_data():
     indices = {"SPY": "S&P 500", "QQQ": "NASDAQ", "DIA": "Dow Jones"}
     lines = []
@@ -381,20 +361,14 @@ def fetch_top_movers():
             data = r.json()
             if "close" in data:
                 chg = float(data.get("percent_change", 0))
-                results.append({
-                    "ticker": ticker,
-                    "change": chg,
-                    "price": float(data["close"])
-                })
+                results.append({"ticker": ticker, "change": chg, "price": float(data["close"])})
         except:
             pass
     if not results:
         return "Movers data unavailable", "Movers data unavailable"
-
     results.sort(key=lambda x: x["change"], reverse=True)
     actual_gainers = [r for r in results if r["change"] > 0]
     actual_losers = [r for r in results if r["change"] < 0]
-
     gainers = "\n".join([f"🟢 *{r['ticker']}:* +{r['change']:.2f}%" for r in actual_gainers[:3]]) if actual_gainers else "_No gainers_"
     losers = "\n".join([f"🔴 *{r['ticker']}:* {r['change']:.2f}%" for r in actual_losers[-3:]]) if actual_losers else "_No losers_"
     return gainers, losers
@@ -406,38 +380,28 @@ async def send_market_report(title: str, body: str):
         bot = Bot(token=TELEGRAM_TOKEN)
         time_str = datetime.now().strftime("%I:%M %p EST")
         msg = f"📊 *{title}*\n_{time_str}_\n\n{body}\n\n_GQ FinXray US · gquants.com_"
-        await bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            text=msg,
-            parse_mode="Markdown"
-        )
+        await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=msg, parse_mode="Markdown")
         print(f"[REPORT] Sent: {title}")
     except Exception as e:
         print(f"[ERROR] Failed to send market report: {e}")
 
 def send_premarket_report():
-    indices = fetch_index_data()
-    macro = fetch_macro_data()
-    body = f"*US Futures & Pre-Market Snapshot*\n\n{indices}\n\n*Macro*\n{macro}"
+    body = f"*US Futures & Pre-Market Snapshot*\n\n{fetch_index_data()}\n\n*Macro*\n{fetch_macro_data()}"
     asyncio.run(send_market_report("🌅 Pre-Market Report", body))
 
 def send_market_open_report():
-    indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = f"*Markets are now open.*\n\n*Indices at Open*\n{indices}\n\n*Early Gainers*\n{gainers}\n\n*Early Losers*\n{losers}"
+    body = f"*Markets are now open.*\n\n*Indices at Open*\n{fetch_index_data()}\n\n*Early Gainers*\n{gainers}\n\n*Early Losers*\n{losers}"
     asyncio.run(send_market_report("🔔 Market Open", body))
 
 def send_midday_report():
-    indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = f"*Midday Market Check*\n\n*Indices*\n{indices}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}"
+    body = f"*Midday Market Check*\n\n*Indices*\n{fetch_index_data()}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}"
     asyncio.run(send_market_report("⏱ Midday Pulse", body))
 
 def send_market_close_report():
-    indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    macro = fetch_macro_data()
-    body = f"*Markets have closed.*\n\n*Final Index Levels*\n{indices}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}\n\n*Macro*\n{macro}"
+    body = f"*Markets have closed.*\n\n*Final Index Levels*\n{fetch_index_data()}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}\n\n*Macro*\n{fetch_macro_data()}"
     asyncio.run(send_market_report("📉 Market Close Report", body))
 
 def send_afterhours_report():
@@ -445,7 +409,7 @@ def send_afterhours_report():
     body = f"*After-Hours Notable Movers*\n\n*Gainers*\n{gainers}\n\n*Losers*\n{losers}"
     asyncio.run(send_market_report("🌙 After-Hours Movers", body))
 
-# ── Scheduler thread ──────────────────────────────────────────────────────────
+# ── Threads ───────────────────────────────────────────────────────────────────
 def run_scheduler():
     print("[SCHEDULER] Starting...")
     load_cik_map()
@@ -465,7 +429,6 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-# ── AI pipeline thread ────────────────────────────────────────────────────────
 def run_pipeline():
     print("[PIPELINE] Starting...")
     while True:
@@ -477,14 +440,12 @@ def run_pipeline():
             asyncio.run(send_error_alert(f"Pipeline error: {str(e)}"))
         time.sleep(30)
 
-# ── Delivery loop ─────────────────────────────────────────────────────────────
 async def delivery_loop():
     print("[DELIVERY] Starting...")
     while True:
         await deliver_pending_alerts()
         await asyncio.sleep(30)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     print("""
 ╔══════════════════════════════════════════╗
@@ -492,17 +453,12 @@ async def main():
 ║  SEC EDGAR + News + AI + Telegram        ║
 ╚══════════════════════════════════════════╝
     """)
-
-    # Start feedback handler
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^useful_|^notuseful_"))
-
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     pipeline_thread = threading.Thread(target=run_pipeline, daemon=True)
     pipeline_thread.start()
-
-    # Run both delivery loop and telegram app simultaneously
     async with app:
         await app.start()
         await app.updater.start_polling()
