@@ -105,9 +105,9 @@ Answer YES if the article contains any of:
 - Company announcements, deals, leadership changes
 - Analyst upgrades, downgrades, or price target changes
 - Federal Reserve decisions or major economic data releases
-- Market-moving geopolitical or macroeconomic events
-- IPO filings, mergers, acquisitions
-- Any specific named event with financial implications
+- Market-moving geopolitical or macroeconomic events affecting US markets
+- IPO filings, mergers, acquisitions involving US companies
+- Any specific named event with financial implications for US investors
 
 Answer NO if the article is:
 - General market commentary or opinion with no specific development
@@ -115,6 +115,7 @@ Answer NO if the article is:
 - Personal finance advice or lifestyle content
 - Purely educational or explanatory content with no current news
 - Vague analysis with no specific figures or events
+- News primarily about non-US markets, companies, or economies with no direct US market impact
 
 Article:
 {raw_text[:2000]}
@@ -212,7 +213,7 @@ Return ONLY the summary paragraph. Nothing else."""
 
 def summarise_news(company_name, raw_text):
     """For news articles — CNBC, Bloomberg, MarketWatch, Reuters."""
-    prompt = f"""Your task is to summarize the provided news article specifically focusing on the company: {company_name}.
+    prompt = f"""Your task is to summarize the provided news article specifically focusing on: {company_name}.
 
 CONTENT SCOPE:
 1. Include ONLY details from the article directly relevant to {company_name}.
@@ -228,7 +229,7 @@ FORMAT:
 - Do not mention word count.
 - Do not include contact information, salutations, or address anyone.
 - Neutral, objective, professional tone.
-- Do not start with the company name as the first word.
+- Do not start with the subject name as the first word.
 - The final character MUST be a full stop.
 
 COMPLETENESS RULES:
@@ -237,10 +238,10 @@ COMPLETENESS RULES:
 - The final character of your response MUST be a full stop.
 
 WHAT TO INCLUDE:
-- Specific figures: price targets, revenue numbers, percentages, share prices, deal values.
+- Specific figures: price targets, revenue numbers, percentages, share prices, deal values, index levels.
 - Named people: analysts, executives, officials — include their names and organisations.
-- Market context: how does this news affect the stock price or investor sentiment?
-- The last sentence must explain why this matters to investors or what it signals for the stock.
+- Market context: how does this news affect stock prices or investor sentiment?
+- The last sentence must explain why this matters to investors or what it signals for the market.
 
 News article to summarize:
 {raw_text[:8000]}
@@ -364,7 +365,13 @@ def process_filing(filing):
         print(f"[SKIP] Relevance check")
 
     # ── Step 3: Summarisation — routed by filing type ─────────
-    summary = summarise(company_name, raw_text, filing_type)
+    # For market-wide news use descriptive name not raw ticker
+    if filing_type == "NEWS" and company_name in ("MARKET", "SPY", "QQQ", "DIA", "UNKNOWN"):
+        summarise_name = "the US stock market and major indices"
+    else:
+        summarise_name = company_name
+
+    summary = summarise(summarise_name, raw_text, filing_type)
     if not summary or len(summary.strip()) < 10:
         print(f"[DISCARDED] Summarisation failed — {ticker}")
         update_filing_status(filing_id, "DISCARDED")
@@ -375,7 +382,7 @@ def process_filing(filing):
     # ── Step 4: Completeness check ───────────────────────────
     if not is_complete_summary(summary):
         print(f"[INCOMPLETE] {word_count} words — expanding...")
-        expanded = expand_summary(summary, company_name, raw_text)
+        expanded = expand_summary(summary, summarise_name, raw_text)
         if expanded and expanded.strip().endswith((".", "!", "?")):
             summary = expanded
             print(f"[EXPANDED] {len(summary.split())} words — {summary[:100]}...")

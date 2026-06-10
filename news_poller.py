@@ -34,7 +34,7 @@ MARKET_KEYWORDS = [
     "federal reserve", "fed rate", "interest rate", "inflation",
     "earnings season", "bull market", "bear market", "market rally",
     "market selloff", "market close", "market open", "equity markets",
-    "global markets", "us markets", "us stocks", "us equities",
+    "us markets", "us stocks", "us equities",
     "rate hike", "rate cut", "jerome powell", "fomc", "treasury yields",
     "bond yields", "risk appetite", "safe haven", "market volatility",
     "ipo", "initial public offering", "record high", "record low",
@@ -43,16 +43,25 @@ MARKET_KEYWORDS = [
 ]
 
 NON_US_KEYWORDS = [
+    # India
     "state bank of india", "sun pharmaceutical", "sun pharma",
     "reliance industries", "infosys", "wipro", "hdfc bank",
     "icici bank", "bajaj finance", "mahindra", "adani group",
-    "sensex", "nifty 50", "reserve bank of india", "sebi",
+    "sensex", "nifty 50", "reserve bank of india", "rbi rule",
+    "rbi policy", "sebi", "india stock", "india fund",
+    "india market", "india boost", "india lng", "india buying",
+    "india inflow", "india dollar", "india equity",
+    # China
     "alibaba group", "tencent holdings", "baidu inc", "xiaomi corp",
     "huawei technologies", "sinopec", "petrochina",
     "shanghai composite", "hang seng index", "hkex",
     "peoples bank of china", "pboc rate",
+    # Japan
     "bank of japan rate", "nikkei 225",
+    # Europe only
     "ftse 100 index", "dax index", "cac 40 index",
+    # Middle East only
+    "suez canal",
 ]
 
 US_ANCHOR_KEYWORDS = [
@@ -231,7 +240,7 @@ def fetch_source_items(source):
             raw_description = desc_elem.text if desc_elem is not None else ""
             summary = re.sub(r'<[^>]+>', '', raw_description).strip() if raw_description else ""
 
-            # Filter non-US articles
+            # Filter non-US articles early
             if not is_us_relevant(title, summary):
                 print(f"[FILTERED] Non-US: {title[:60]}")
                 continue
@@ -247,7 +256,6 @@ def fetch_source_items(source):
             found_tickers = extract_tickers_from_text(full_text, watched_tickers)
 
             if found_tickers:
-                # Store for first matching ticker only — avoids duplicate URL constraint
                 items_to_store.append({
                     "source_key": source_key,
                     "ticker": found_tickers[0],
