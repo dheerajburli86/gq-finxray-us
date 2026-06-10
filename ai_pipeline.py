@@ -439,7 +439,7 @@ def process_filing(filing):
 def run_pipeline():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for PENDING filings...")
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
         result = supabase.table("raw_filings") \
             .select("*") \
             .eq("status", "PENDING") \
