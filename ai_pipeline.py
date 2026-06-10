@@ -92,71 +92,180 @@ def is_complete_summary(text):
         return False
     return True
 
-def summarise(company_name, raw_text):
-    prompt = f"""You are a senior financial analyst writing a stock market intelligence alert for investors.
+def is_news_relevant(company_name, raw_text):
+    """
+    Relevance check for news articles only.
+    Returns True if article has a specific actionable financial development.
+    Returns False if it is general commentary, opinion, or fluff.
+    """
+    prompt = f"""You are a financial news filter. Read the following news article and determine if it contains a specific, actionable financial development related to {company_name} or the US stock market that is worth alerting investors about.
 
-Company: {company_name}
+Answer YES if the article contains any of:
+- Specific price movements, earnings results, revenue figures
+- Company announcements, deals, leadership changes
+- Analyst upgrades, downgrades, or price target changes
+- Federal Reserve decisions or major economic data releases
+- Market-moving geopolitical or macroeconomic events
+- IPO filings, mergers, acquisitions
+- Any specific named event with financial implications
 
-TASK: Read the source text and write a high-quality summary of what happened and why it matters to investors.
+Answer NO if the article is:
+- General market commentary or opinion with no specific development
+- A recap of events already widely known
+- Personal finance advice or lifestyle content
+- Purely educational or explanatory content with no current news
+- Vague analysis with no specific figures or events
 
-FORMAT: Write exactly 3 complete sentences. Total word count: 50-70 words.
+Article:
+{raw_text[:2000]}
 
-ABSOLUTE RULES — ALL MUST BE FOLLOWED WITHOUT EXCEPTION:
-1. Every sentence must be 100% grammatically complete — never cut off mid-word, mid-number, or mid-phrase.
-2. The final character of your entire response MUST be a full stop.
-3. Never truncate numbers. Write $115,489,662 in full — never as "$115" or "$115 million" if the source says "$115,489,662".
-4. Only use numbers that appear in the source text. Never invent figures.
-5. Write in plain English — a retail investor with no financial background must understand it.
-6. Do not start with the company name as the first word.
-7. Do not use phrases like "this filing", "this article", "the company announced that".
-8. Make the summary genuinely useful — answer: what happened, what are the specific details, and what does it mean for the stock or investors?
+Respond with only a JSON object: {{"relevant": true}} or {{"relevant": false}}"""
 
-WHAT TO EXTRACT BY FILING TYPE:
-- Earnings: revenue figure, net income or EPS, year-over-year change (better or worse), forward guidance if present.
-- Insider trade: insider's full name and exact title, action (bought/sold), exact share count, price per share, total dollar value, date.
-- Leadership change: who left and their exact role, who replaced them (or "replacement not named"), effective date.
-- Acquisition/merger: both company names, deal value, strategic rationale, expected close date.
-- Government grant or contract: exact dollar amount, awarding body, purpose, what it enables the company to do.
-- Analyst call: firm name, previous rating, new rating, new price target, core reason for the change.
-- Clinical trial: drug/therapy name, trial phase and name, key result, patient numbers, what it means for commercialisation.
-- Exploration/mining update: project name, location, specific milestone achieved, timeline, investor significance.
-- Regulatory/legal: what specifically changed, who it affects, financial exposure or benefit.
-- General operational update: the most specific facts available — names, locations, percentages, deadlines.
+    response = call_llm(prompt, max_tokens=50)
+    result = parse_json_response(response)
+    return result.get("relevant", True)
 
-QUALITY STANDARD — your summary must answer all three:
-1. What specifically happened? (not vague — include names and numbers)
-2. What are the key details? (financials, timeline, people involved)
-3. Why does it matter to someone holding or considering this stock?
+def summarise_announcement(company_name, raw_text):
+    """For SEC EDGAR 8-K and S-1 filings."""
+    prompt = f"""Your task is to summarize the provided document specifically focusing on the company: {company_name}.
 
-EXAMPLES OF GOOD SUMMARIES:
+PURPOSE: The summary must help investors understand significant developments related to {company_name}.
 
-Earnings example:
-"Campbell's reported Q3 fiscal 2026 net sales of $2.4 billion, down 4% year-over-year, with adjusted EPS declining 32% to $0.50 due to cost pressures. Reported EPS improved to $0.41 and EBIT rose to $239 million. Despite near-term margin headwinds, the company reaffirmed its full-year fiscal 2026 guidance, signaling management confidence in annual targets."
+CONTENT RULES:
+1. Include ONLY details directly relevant to {company_name} and its investors.
+2. Exclude any information unrelated to {company_name}.
+3. Ensure the summary contains only factual information explicitly mentioned in the original document.
+4. Do not add interpretations, opinions, or recommendations.
+5. After writing, verify accuracy against the original document.
 
-Insider trade example:
-"Jorie L. Novacek, Senior Vice President and Controller, purchased 207 shares of Incentive Compensation Deferral Plan Share Credits on June 5, 2026. Each share was acquired at $227.22, bringing the total investment to $46,956. This transaction increases Ms. Novacek's direct ownership, a signal of continued insider confidence in the company's outlook."
+FORMAT:
+- Write as a single paragraph, no line breaks.
+- Strictly 50-70 words.
+- Do not mention word count.
+- Do not include contact information, salutations, or address anyone.
+- Neutral, objective, professional tone.
+- Do not start with the company name as the first word.
+- The final character MUST be a full stop.
 
-Leadership change example:
-"Cocrystal Pharma appointed James Sapirstein as Chief Executive Officer effective June 3, 2026, replacing Co-CEOs Sam Lee and James Martin. Mr. Sapirstein's annual base salary is set at $265,000, with additional performance-based compensation. The leadership consolidation under a single CEO signals a strategic shift toward more focused executive direction."
+COMPLETENESS RULES:
+- Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
+- Never truncate numbers. Write every number exactly as it appears in the source.
+- The final character of your response MUST be a full stop.
 
-Government grant example:
-"The U.S. Department of Energy reinstated a $115,489,662 grant to fund construction of a lithium hydroxide processing facility, with the DOE contributing $57,744,831 and the company providing matching funds. The facility is central to domestic EV battery supply chain development. Reinstatement removes a key financial uncertainty and strengthens the company's path to full commercial production."
+WHAT TO INCLUDE BY TYPE:
+- Earnings: revenue, net income, EPS, year-over-year change, guidance.
+- Leadership change: who left, their role, replacement name, effective date.
+- Acquisition: both companies, deal value, strategic reason, expected close.
+- Government grant: exact dollar amount, awarding body, purpose, company benefit.
+- Clinical trial: drug name, phase, result, patient count, commercial significance.
+- Exploration update: project name, location, milestone, timeline, investor impact.
+- Regulatory/legal: what changed, who it affects, financial exposure or benefit.
 
-Source text:
+INVESTOR SIGNIFICANCE: The last sentence must explain why this matters to investors or what it signals for the stock.
+
+Document to summarize:
 {raw_text[:8000]}
 
-Return ONLY the summary. No preamble. No labels. No explanation. Just 3 complete sentences ending with a full stop."""
+Return ONLY the summary paragraph. Nothing else."""
     return call_llm(prompt, max_tokens=1500)
+
+def summarise_form4(company_name, raw_text):
+    """Dedicated prompt for Form 4 insider transaction filings."""
+    prompt = f"""Your task is to summarize an SEC Form 4 insider transaction filing for the company: {company_name}.
+
+Form 4 is filed when a company executive, director, or major shareholder buys or sells company stock. Your summary must clearly tell investors exactly what transaction occurred.
+
+CONTENT RULES:
+1. Include ONLY the transaction details from the filing.
+2. Ensure all figures are exactly as stated in the filing — never round or approximate.
+3. Do not add interpretations or opinions.
+4. Verify all names, titles, share counts, and prices against the source before returning.
+
+FORMAT:
+- Write as a single paragraph, no line breaks.
+- Strictly 50-70 words.
+- Do not mention word count.
+- Neutral, objective, professional tone.
+- The final character MUST be a full stop.
+
+REQUIRED INFORMATION — extract all that are present:
+- Insider's full name
+- Insider's exact title or role (CEO, CFO, Director, VP, etc.)
+- Transaction type: purchased or sold
+- Exact number of shares
+- Price per share (if disclosed)
+- Total dollar value of the transaction
+- Date of the transaction
+- Total shares owned after the transaction
+- Type of security (Common Stock, Options, etc.)
+
+INVESTOR SIGNIFICANCE: The last sentence must state what this transaction signals — insider buying generally signals confidence in the company, insider selling may reflect personal financial planning or profit-taking.
+
+EXAMPLE OF A GOOD FORM 4 SUMMARY:
+"John Smith, Chief Financial Officer, purchased 5,000 shares of Common Stock at $42.30 per share on June 5, 2026, for a total investment of $211,500. Following this transaction, Smith now directly owns 47,320 shares. Insider buying at this level typically signals management confidence in the company's near-term financial outlook."
+
+Form 4 filing data:
+{raw_text[:8000]}
+
+Return ONLY the summary paragraph. Nothing else."""
+    return call_llm(prompt, max_tokens=1500)
+
+def summarise_news(company_name, raw_text):
+    """For news articles — CNBC, Bloomberg, MarketWatch, Reuters."""
+    prompt = f"""Your task is to summarize the provided news article specifically focusing on the company: {company_name}.
+
+CONTENT SCOPE:
+1. Include ONLY details from the article directly relevant to {company_name}.
+2. Completely exclude any information unrelated to {company_name}.
+3. If an analyst, firm, or person's name is mentioned in connection with {company_name}, include it.
+4. Ensure the summary contains only factual information explicitly stated in the article.
+5. Do not add interpretations, opinions, or recommendations.
+6. After writing, verify accuracy against the original article.
+
+FORMAT:
+- Write as a single paragraph, no line breaks.
+- Strictly 50-70 words.
+- Do not mention word count.
+- Do not include contact information, salutations, or address anyone.
+- Neutral, objective, professional tone.
+- Do not start with the company name as the first word.
+- The final character MUST be a full stop.
+
+COMPLETENESS RULES:
+- Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
+- Never truncate numbers. Write every number completely as it appears in the source.
+- The final character of your response MUST be a full stop.
+
+WHAT TO INCLUDE:
+- Specific figures: price targets, revenue numbers, percentages, share prices, deal values.
+- Named people: analysts, executives, officials — include their names and organisations.
+- Market context: how does this news affect the stock price or investor sentiment?
+- The last sentence must explain why this matters to investors or what it signals for the stock.
+
+News article to summarize:
+{raw_text[:8000]}
+
+Return ONLY the summary paragraph. Nothing else."""
+    return call_llm(prompt, max_tokens=1500)
+
+def summarise(company_name, raw_text, filing_type=""):
+    """Route to the correct summarisation function based on filing type."""
+    if filing_type == "NEWS":
+        return summarise_news(company_name, raw_text)
+    elif filing_type == "4":
+        return summarise_form4(company_name, raw_text)
+    else:
+        return summarise_announcement(company_name, raw_text)
 
 def expand_summary(summary, company_name, raw_text):
     prompt = f"""You are a financial editor. The summary below about {company_name} is INCOMPLETE — it ends mid-sentence, mid-number, or without a full stop.
 
-YOUR JOB: Fix it so it becomes a complete, informative 3-sentence summary of 50-70 words.
+YOUR JOB: Fix it so it becomes a complete, informative single-paragraph summary of 50-70 words.
 
 STRICT RULES:
 1. Keep every word and number from the original exactly as written — do not change any existing content.
 2. Complete any sentence that was cut off using details from the source text below.
-3. If the summary is under 40 words after fixing, add 1-2 more complete sentences with specific details.
+3. If the summary is under 40 words after fixing, add more complete sentences with specific details.
 4. The final character of your response MUST be a full stop.
 5. Never truncate a number — write it completely.
 6. The summary must answer: what happened, key details, and why it matters to investors.
@@ -243,11 +352,19 @@ def process_filing(filing):
         return
     print(f"[PASS] Gibberish check")
 
-    # ── Step 2: Relevance check skipped ──────────────────────
-    print(f"[SKIP] Relevance check")
+    # ── Step 2: Relevance check for news only ─────────────────
+    if filing_type == "NEWS":
+        relevant = is_news_relevant(company_name, raw_text)
+        if not relevant:
+            print(f"[DISCARDED] Not relevant — {ticker}")
+            update_filing_status(filing_id, "DISCARDED")
+            return
+        print(f"[PASS] Relevance check")
+    else:
+        print(f"[SKIP] Relevance check")
 
-    # ── Step 3: Summarisation ─────────────────────────────────
-    summary = summarise(company_name, raw_text)
+    # ── Step 3: Summarisation — routed by filing type ─────────
+    summary = summarise(company_name, raw_text, filing_type)
     if not summary or len(summary.strip()) < 10:
         print(f"[DISCARDED] Summarisation failed — {ticker}")
         update_filing_status(filing_id, "DISCARDED")

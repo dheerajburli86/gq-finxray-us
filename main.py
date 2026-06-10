@@ -44,7 +44,6 @@ def get_stock_price(ticker: str):
 
 # ── Alert formatter ───────────────────────────────────────────────────────────
 def format_alert(alert):
-    impact = alert.get("impact", "LOW")
     ticker = alert.get("ticker", "UNKNOWN")
     summary = alert.get("summary", "")
     source = alert.get("source", "SEC_EDGAR")
@@ -52,7 +51,6 @@ def format_alert(alert):
     extra = alert.get("extra") or {}
     filing_url = alert.get("filing_url", "")
 
-    impact_emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
     source_labels = {
         "SEC_EDGAR": "SEC EDGAR",
         "CNBC": "CNBC",
@@ -61,7 +59,6 @@ def format_alert(alert):
         "REUTERS": "Reuters"
     }
 
-    emoji = impact_emoji.get(impact, "🟢")
     source_name = source_labels.get(source, source)
     time_str = datetime.now().strftime("%I:%M %p EST")
 
@@ -103,10 +100,8 @@ def format_alert(alert):
     # Form 4 insider trade
     if filing_type == "4":
         insider = extra.get("insider_name", "An insider")
-        transaction = extra.get("transaction_type", "")
-        trans_emoji = "🟢" if transaction == "BUY" else "🔴" if transaction == "SELL" else "📋"
         return (
-            f"{trans_emoji} *INSIDER {transaction or 'TRADE'} — ${ticker}*"
+            f"📋 *INSIDER TRADE — ${ticker}*"
             f"{price_line}\n"
             f"{summary}\n\n"
             f"👤 {insider}\n"
@@ -128,7 +123,7 @@ def format_alert(alert):
     if filing_type == "NEWS":
         ticker_display = f"${ticker}" if ticker not in ("MARKET", "SPY", "QQQ", "DIA") else "Market News"
         return (
-            f"{emoji} *{source_name} — {ticker_display}*"
+            f"📰 *{source_name} — {ticker_display}*"
             f"{price_line}\n"
             f"🔍 *Xray Intel:* {summary}\n\n"
             f"📰 {source_name} · {time_str}"
@@ -143,7 +138,7 @@ def format_alert(alert):
         items_str = f" · {first_item}"
 
     return (
-        f"{emoji} *{impact} — ${ticker}*"
+        f"📊 *{ticker} — SEC Filing*"
         f"{price_line}\n"
         f"🔍 *Xray Intel:* {summary}\n\n"
         f"📋 {source_name}{items_str} · {time_str}"
