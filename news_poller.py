@@ -72,9 +72,48 @@ US_ANCHOR_KEYWORDS = [
     "us dollar", "treasury", "fed funds"
 ]
 
-# Common English words and financial terms that are also valid tickers
+# Minimum ticker length for news matching — prevents single/double letter false positives
+MIN_TICKER_LENGTH = 4
+
+# Important 3-letter tickers to explicitly allow despite MIN_TICKER_LENGTH
+ALLOWED_3_LETTER = {
+    "JPM", "AMD", "BAC", "GLD", "SPY", "QQQ", "DIA", "USO", "UUP",
+    "GLD", "SLV", "VTI", "IWM", "XOM", "CVX", "IBM", "GE", "MMM",
+    "CAT", "HON", "UNH", "MRK", "JNJ", "PFE", "ABT", "TMO", "DHR",
+    "LLY", "BMY", "MDT", "SYK", "BDX", "BSX", "ZTS", "HCA", "CNC",
+    "WBA", "CVS", "MCD", "YUM", "CMG", "DRI", "SYY", "HSY", "GIS",
+    "CPB", "CAG", "HRL", "TSN", "KHC", "MKC", "SJM", "THS", "WMT",
+    "TGT", "KSS", "GPS", "RL", "PVH", "HBI", "UAA", "NKE", "SKX",
+    "VFC", "HAS", "MAT", "WHR", "LEG", "MHK", "SWK", "SNE", "APD",
+    "ECL", "ALB", "PPG", "SHW", "VMC", "MLM", "NUE", "AKS", "CLF",
+    "FCX", "NEM", "AEM", "KGC", "GFI", "HMY", "PBR", "CEO", "TOT",
+    "BP", "COP", "MPC", "VLO", "PSX", "HES", "PXD", "EOG", "DVN",
+    "APA", "OXY", "HAL", "SLB", "BKR", "FTI", "NOV", "RIG", "VAL",
+    "DAL", "UAL", "AAL", "LUV", "ALK", "HA", "JBLU", "BA", "LMT",
+    "RTX", "NOC", "GD", "LHX", "HII", "TXT", "WWD", "DRS", "PRG",
+    "URI", "CAR", "HTZ", "R", "RSG", "WM", "CLH", "GFL", "CWST",
+    "AWK", "AWR", "SJW", "WTR", "CWT", "SRE", "PCG", "EIX", "PPL",
+    "DTE", "AEP", "NEE", "ETR", "FE", "EXC", "CNP", "NI", "OGE",
+    "DUK", "SO", "AES", "NRG", "CEG", "VST", "GEN", "NI", "PNM",
+    "IDA", "POR", "AVA", "EE", "UTL", "BKH", "MGE", "OTTR", "ATO",
+    "NWE", "CPK", "SWX", "NFG", "VVC", "NJR", "SR", "NWN", "GAS",
+    "USB", "PNC", "TFC", "KEY", "CFG", "MTB", "RF", "FITB", "STI",
+    "CMA", "ZION", "SNV", "BOK", "FHN", "TCF", "IBCP", "BXS", "HWC",
+    "AXP", "COF", "DFS", "SYF", "ALL", "TRV", "CB", "AIG", "PRU",
+    "MET", "UNM", "AFL", "LNC", "SFG", "RGA", "FBL", "HIG", "CNA",
+    "WRB", "RLI", "EMC", "STT", "BK", "NTRS", "IVZ", "BEN", "LM",
+    "AMG", "FII", "GBL", "VRTS", "WDR", "CNS", "CLI", "EPR", "SRC",
+    "NNN", "ADC", "STOR", "VER", "SPG", "MAC", "TCO", "CBL", "WPG",
+    "SKT", "PEI", "KIM", "REG", "FRT", "BRX", "AKR", "RPT", "RPAI",
+    "WRI", "EQY", "DDR", "CDR", "CBL", "WPG", "PEI", "KRG", "EQR",
+    "AVB", "ESS", "UDR", "CPT", "MAA", "NMI", "AIV", "IRT", "IRET",
+    "NHI", "LTC", "OHI", "SBRA", "CSW", "DOC", "HR", "HTA", "PEAK",
+    "MPW", "GMRE", "GEO", "CXW", "HCP", "VTR", "WELL", "SNH", "NHC",
+    "LHC", "AMN", "CHE", "ADUS", "AMED", "LHCG", "BRT", "CTO",
+}
+
 ENGLISH_WORD_BLACKLIST = {
-    # 1-2 letter words
+    # 1-2 letter words — all blocked
     "A", "I", "IT", "IN", "IS", "BE", "AS", "AT", "BY", "DO",
     "GO", "HE", "IF", "ME", "MY", "NO", "OF", "ON", "OR", "SO",
     "TO", "UP", "US", "WE", "AM", "AN",
@@ -89,41 +128,41 @@ ENGLISH_WORD_BLACKLIST = {
     "OIL", "PAY", "PUT", "RAW", "RUN", "SAT", "SAW", "SET", "SIT",
     "SIX", "TAX", "TEN", "TIE", "TOP", "TRY", "VIA", "WAR", "WAY",
     "WIN", "WON", "YEN", "ZIP",
-    # 4 letter common words and financial terms
+    # 4+ letter common words and financial terms
     "GAIN", "LOSS", "BOND", "CASH", "COST", "DEAL", "DEBT", "FALL",
     "FLAT", "FUND", "GOLD", "GOOD", "GREW", "HALF", "HARD", "HAVE",
-    "HEAD", "HELP", "HIGH", "HOLD", "HOME", "HOPE", "HURT", "IDEA",
-    "INTO", "JUMP", "KEEP", "KIND", "KNOW", "LACK", "LAND", "LAST",
-    "LATE", "LEAD", "LEAN", "LEFT", "LESS", "LIKE", "LINK", "LIST",
-    "LIVE", "LOAN", "LONG", "LOOK", "MADE", "MAIN", "MAKE", "MANY",
-    "MARK", "MASS", "MEAN", "MEET", "MISS", "MOST", "MOVE", "MUCH",
-    "MUST", "NEAR", "NEED", "NEXT", "NONE", "NORM", "NOTE", "ONCE",
-    "ONLY", "OPEN", "OVER", "PACE", "PAID", "PAIN", "PART", "PAST",
-    "PATH", "PEAK", "PLAN", "PLAY", "PLUS", "POLL", "POOR", "POST",
-    "PULL", "PURE", "PUSH", "RACE", "RAGE", "RATE", "READ", "REAL",
-    "RELY", "RENT", "RISE", "RISK", "ROAD", "ROLE", "ROSE", "RULE",
-    "RUSH", "SAFE", "SAID", "SALE", "SAME", "SAVE", "SEEK", "SELF",
-    "SELL", "SEND", "SENT", "SIGN", "SIZE", "SLIP", "SLOW", "SOLD",
-    "SOME", "SOON", "SORT", "STAY", "STEP", "STOP", "SUCH", "SURE",
-    "TAKE", "TALK", "TELL", "TERM", "TEST", "THAN", "THAT", "THEM",
-    "THEN", "THEY", "THIS", "THUS", "TIME", "TOLD", "TOLL", "TOOK",
-    "TOOL", "TRIM", "TRUE", "TUNE", "TURN", "TYPE", "UNIT", "UPON",
-    "VARY", "VAST", "VIEW", "VOTE", "WAIT", "WALK", "WANT", "WARN",
-    "WEAK", "WEEK", "WELL", "WENT", "WERE", "WHEN", "WIDE", "WILD",
-    "WILL", "WITH", "WORD", "WORK", "YEAR", "YOUR", "ZERO",
-    # Financial jargon that matches tickers
+    "HEAD", "HELP", "HIGH", "HIGHS", "HOLD", "HOME", "HOPE", "HURT",
+    "IDEA", "INTO", "JUMP", "KEEP", "KIND", "KNOW", "LACK", "LAND",
+    "LAST", "LATE", "LEAD", "LEAN", "LEFT", "LESS", "LIKE", "LINK",
+    "LIST", "LIVE", "LOAN", "LONG", "LOOK", "MADE", "MAIN", "MAKE",
+    "MANY", "MARK", "MASS", "MEAN", "MEET", "MISS", "MOST", "MOVE",
+    "MUCH", "MUST", "NEAR", "NEED", "NEXT", "NONE", "NORM", "NOTE",
+    "ONCE", "ONLY", "OPEN", "OVER", "PACE", "PAID", "PAIN", "PART",
+    "PAST", "PATH", "PEAK", "PLAN", "PLAY", "PLUS", "POLL", "POOR",
+    "POST", "PULL", "PURE", "PUSH", "RACE", "RAGE", "RATE", "READ",
+    "REAL", "RELY", "RENT", "RISE", "RISK", "ROAD", "ROLE", "ROSE",
+    "RULE", "RUSH", "SAFE", "SAID", "SALE", "SAME", "SAVE", "SEEK",
+    "SELF", "SELL", "SEND", "SENT", "SIGN", "SIZE", "SLIP", "SLOW",
+    "SOLD", "SOME", "SOON", "SORT", "STAY", "STEP", "STOP", "SUCH",
+    "SURE", "TAKE", "TALK", "TELL", "TERM", "TEST", "THAN", "THAT",
+    "THEM", "THEN", "THEY", "THIS", "THUS", "TIME", "TOLD", "TOLL",
+    "TOOK", "TOOL", "TRIM", "TRUE", "TUNE", "TURN", "TYPE", "UNIT",
+    "UPON", "VARY", "VAST", "VIEW", "VOTE", "WAIT", "WALK", "WANT",
+    "WARN", "WEAK", "WEEK", "WELL", "WENT", "WERE", "WHEN", "WIDE",
+    "WILD", "WILL", "WITH", "WORD", "WORK", "YEAR", "YOUR", "ZERO",
     "BOOM", "FORM", "FLOW", "SHOW", "CORE", "BEAR", "BULL", "CHIP",
-    "COAL", "CROP", "CURE", "EDGE", "FACE", "FIRE", "FIRM", "FLAG",
-    "FLEW", "FLIP", "FOAM", "FOLD", "FOLK", "FOND", "FONT", "FOOL",
-    "FORE", "FORK", "FORT", "FOUL", "FOWL", "FRAY", "FREE", "PREY",
-    "PROD", "PROP", "PROS", "PROW", "PUMP", "PUTS", "RAMP", "RANG",
-    "RANK", "RANT", "RARE", "RAYS", "REEF", "REEL", "REIN", "REPO",
+    "FIRE", "FIRM", "FLAG", "FLIP", "FOAM", "FOLD", "FOLK", "FOND",
+    "FONT", "FOOL", "FORE", "FORK", "FORT", "FOUL", "FOWL", "FRAY",
+    "FREE", "PREY", "PROD", "PROP", "PROS", "PUMP", "PUTS", "RAMP",
+    "RANG", "RANK", "RANT", "RARE", "REEF", "REEL", "REIN", "REPO",
     "REST", "RIFE", "RIFT", "RIOT", "ROAM", "ROAR", "ROBE", "RODE",
     "RODS", "ROMP", "ROOF", "ROOK", "ROOM", "ROOT", "ROPE", "ROUT",
-    "ROWS", "RUIN", "RUNS", "RUSE", "DEBT", "PUTS", "CALL", "SWAP",
-    "SPOT", "FEES", "LEVY", "NORM", "LIEN", "WRIT", "DEED", "LEND",
-    "MINT", "COIN", "BILL", "NOTE", "DRAFT", "WIRE", "WIRE",
-    # 5 letter common words
+    "ROWS", "RUIN", "RUNS", "RUSE", "CALL", "SWAP", "SPOT", "FEES",
+    "LEVY", "LIEN", "WRIT", "DEED", "LEND", "MINT", "COIN", "BILL",
+    "LOWS", "FELL", "DROP", "SLID", "SOAR", "SINK", "LOST", "WINS",
+    "TOPS", "CUTS", "HITS", "BEAT", "MISS", "SOFT", "WARM", "COOL",
+    "HIKE", "EASE", "LIFT", "DRAG", "WEIGH", "ADDS", "SEES", "SETS",
+    "GETS", "PUTS", "BUYS", "SAYS", "PAYS", "LAYS", "LETS",
     "ABOUT", "ABOVE", "AFTER", "AGAIN", "AHEAD", "ALONG", "AMONG",
     "APPLY", "ARISE", "BASIS", "BEGAN", "BEGIN", "BELOW", "BOARD",
     "BOOST", "BREAK", "BRING", "BUILD", "BUILT", "BUYER", "CALLS",
@@ -177,16 +216,22 @@ def load_eodhd_tickers():
 
         data = r.json()
         valid_types = {"Common Stock", "ETF"}
-        tickers = [
-            item["Code"].upper()
-            for item in data
-            if item.get("Type") in valid_types
-            and item.get("Code")
-            and not item["Code"].startswith("^")
-            and "." not in item["Code"]
-            and len(item["Code"]) >= 3
-            and item["Code"].upper() not in ENGLISH_WORD_BLACKLIST
-        ]
+        tickers = []
+        for item in data:
+            code = item.get("Code", "")
+            if not code:
+                continue
+            if item.get("Type") not in valid_types:
+                continue
+            if code.startswith("^") or "." in code:
+                continue
+            code_upper = code.upper()
+            if code_upper in ENGLISH_WORD_BLACKLIST:
+                continue
+            # Apply minimum length — allow 3-letter only if in allowed list
+            if len(code_upper) < MIN_TICKER_LENGTH and code_upper not in ALLOWED_3_LETTER:
+                continue
+            tickers.append(code_upper)
 
         tickers = list(set(tickers))
         print(f"[EODHD] Loaded {len(tickers):,} US tickers (common stocks + ETFs)")
@@ -223,9 +268,11 @@ def extract_tickers_from_text(text, watched_tickers):
     found = []
     text_upper = text.upper()
     for ticker in watched_tickers:
+        # Skip blacklisted words
         if ticker.upper() in ENGLISH_WORD_BLACKLIST:
             continue
-        if len(ticker) <= 2:
+        # Skip short tickers unless explicitly allowed
+        if len(ticker) < MIN_TICKER_LENGTH and ticker.upper() not in ALLOWED_3_LETTER:
             continue
         pattern = r'\b' + re.escape(ticker) + r'\b'
         if re.search(pattern, text_upper):
