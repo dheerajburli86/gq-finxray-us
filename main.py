@@ -16,30 +16,58 @@ load_dotenv()
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+EODHD_API_KEY = os.getenv("EODHD_API_KEY")
 
 from edgar_poller import poll_sec_8k, poll_sec_form4, load_cik_map
 from news_poller import poll_all_news
 
-# ── TwelveData price fetch ────────────────────────────────────────────────────
+# ── EODHD price fetch ─────────────────────────────────────────────────────────
 def get_stock_price(ticker: str):
     try:
-        url = f"https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVEDATA_API_KEY}"
-        r = requests.get(url, timeout=10)
+        url = f"https://eodhd.com/api/real-time/{ticker}.US"
+        params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+        r = requests.get(url, params=params, timeout=10)
         data = r.json()
-        if data.get("status") == "error" or "close" not in data:
+
+        if "close" not in data:
             return None
+
         price = float(data.get("close", 0))
-        change_pct = float(data.get("percent_change", 0))
+        prev_close = float(data.get("previousClose", price))
+        change = price - prev_close
+        change_pct = (change / prev_close * 100) if prev_close else 0
         arrow = "🟢" if change_pct >= 0 else "🔴"
         sign = "+" if change_pct >= 0 else ""
+
         return {
             "price": f"${price:,.2f}",
             "change": f"{sign}{change_pct:.2f}%",
-            "arrow": arrow
+            "arrow": arrow,
+            "name": data.get("name", ticker)
         }
     except Exception as e:
-        print(f"[TWELVEDATA] Price fetch failed for {ticker}: {e}")
+        print(f"[EODHD] Price fetch failed for {ticker}: {e}")
+        return None
+
+def get_index_price(symbol: str, name: str):
+    """Fetch ETF price for index representation."""
+    try:
+        url = f"https://eodhd.com/api/real-time/{symbol}.US"
+        params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+
+        if "close" not in data:
+            return None
+
+        price = float(data.get("close", 0))
+        prev_close = float(data.get("previousClose", price))
+        change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+        arrow = "🟢" if change_pct >= 0 else "🔴"
+        sign = "+" if change_pct >= 0 else ""
+
+        return f"{arrow} *{name}:* ${price:,.2f} ({sign}{change_pct:.2f}%)"
+    except:
         return None
 
 # ── Alert formatter ───────────────────────────────────────────────────────────
@@ -62,7 +90,7 @@ def format_alert(alert):
     source_name = source_labels.get(source, source)
     time_str = datetime.now().strftime("%I:%M %p EST")
 
-    # Live price — SPY for MARKET ticker, actual ticker otherwise
+    # Live price
     price_line = ""
     price_ticker = "SPY" if ticker == "MARKET" else ticker
     if price_ticker and price_ticker != "UNKNOWN":
@@ -71,7 +99,8 @@ def format_alert(alert):
             if ticker == "MARKET":
                 price_line = f"\n📈 *S&P 500:* SPY {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
             else:
-                price_line = f"\n📈 *Stock:* {ticker} {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
+                company_display = price_data.get("name", ticker)
+                price_line = f"\n📈 *Stock:* {company_display} {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
 
     # Source link
     source_link = ""
@@ -119,7 +148,7 @@ def format_alert(alert):
             f"{footer}"
         )
 
-    # News article
+    # News
     if filing_type == "NEWS":
         ticker_display = f"${ticker}" if ticker not in ("MARKET", "SPY", "QQQ", "DIA") else "Market News"
         return (
@@ -250,7 +279,6 @@ async def deliver_pending_alerts():
                 supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
                 continue
 
-            # MARKET ticker — channel only, HIGH/MEDIUM
             if ticker == "MARKET":
                 if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
                     try:
@@ -261,7 +289,6 @@ async def deliver_pending_alerts():
                 supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
                 continue
 
-            # Find subscribed users for specific ticker
             watchlist_result = supabase.table("watchlists").select("user_id").eq("ticker", ticker).execute()
             delivered_to = []
 
@@ -294,7 +321,6 @@ async def deliver_pending_alerts():
                     except Exception as e:
                         print(f"[ERROR] Failed to deliver to {chat_id}: {e}")
 
-            # Post HIGH and MEDIUM to channel
             if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
                 try:
                     await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
@@ -314,36 +340,18 @@ def fetch_index_data():
     indices = {"SPY": "S&P 500", "QQQ": "NASDAQ", "DIA": "Dow Jones"}
     lines = []
     for symbol, name in indices.items():
-        try:
-            url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            if "close" in data:
-                price = float(data["close"])
-                chg = float(data.get("percent_change", 0))
-                arrow = "🟢" if chg >= 0 else "🔴"
-                sign = "+" if chg >= 0 else ""
-                lines.append(f"{arrow} *{name}:* ${price:,.2f} ({sign}{chg:.2f}%)")
-        except:
-            pass
+        line = get_index_price(symbol, name)
+        if line:
+            lines.append(line)
     return "\n".join(lines) if lines else "Index data unavailable"
 
 def fetch_macro_data():
     instruments = {"GLD": "Gold ETF", "USO": "Oil ETF", "UUP": "USD Index ETF"}
     lines = []
     for symbol, name in instruments.items():
-        try:
-            url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            if "close" in data:
-                price = float(data["close"])
-                chg = float(data.get("percent_change", 0))
-                arrow = "🟢" if chg >= 0 else "🔴"
-                sign = "+" if chg >= 0 else ""
-                lines.append(f"{arrow} *{name}:* ${price:,.2f} ({sign}{chg:.2f}%)")
-        except:
-            pass
+        line = get_index_price(symbol, name)
+        if line:
+            lines.append(line)
     return "\n".join(lines) if lines else "Macro data unavailable"
 
 def fetch_top_movers():
@@ -351,16 +359,21 @@ def fetch_top_movers():
     results = []
     for ticker in tickers:
         try:
-            url = f"https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVEDATA_API_KEY}"
-            r = requests.get(url, timeout=10)
+            url = f"https://eodhd.com/api/real-time/{ticker}.US"
+            params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+            r = requests.get(url, params=params, timeout=10)
             data = r.json()
             if "close" in data:
-                chg = float(data.get("percent_change", 0))
-                results.append({"ticker": ticker, "change": chg, "price": float(data["close"])})
+                price = float(data["close"])
+                prev = float(data.get("previousClose", price))
+                chg = ((price - prev) / prev * 100) if prev else 0
+                results.append({"ticker": ticker, "change": chg, "price": price})
         except:
             pass
+
     if not results:
         return "Movers data unavailable", "Movers data unavailable"
+
     results.sort(key=lambda x: x["change"], reverse=True)
     actual_gainers = [r for r in results if r["change"] > 0]
     actual_losers = [r for r in results if r["change"] < 0]

@@ -11,6 +11,7 @@ import re
 load_dotenv()
 
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+EODHD_API_KEY = os.getenv("EODHD_API_KEY")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -24,10 +25,16 @@ NEWS_SOURCES = [
     {"name": "Reuters", "url": "https://news.google.com/rss/search?q=reuters+business+markets&ceid=US:en&hl=en-US&gl=US", "source_key": "REUTERS"},
 ]
 
-WATCH_TICKERS = [
+# Fallback tickers if EODHD fails
+FALLBACK_TICKERS = [
     "AAPL", "NVDA", "TSLA", "MSFT", "META",
     "AMZN", "GOOGL", "JPM", "NFLX", "AMD"
 ]
+
+# Cache for EODHD tickers — refreshed every 24 hours
+_eodhd_ticker_cache = []
+_eodhd_cache_time = 0
+CACHE_TTL = 86400  # 24 hours
 
 MARKET_KEYWORDS = [
     "wall street", "s&p 500", "nasdaq", "dow jones", "stock market",
@@ -43,7 +50,6 @@ MARKET_KEYWORDS = [
 ]
 
 NON_US_KEYWORDS = [
-    # India
     "state bank of india", "sun pharmaceutical", "sun pharma",
     "reliance industries", "infosys", "wipro", "hdfc bank",
     "icici bank", "bajaj finance", "mahindra", "adani group",
@@ -51,16 +57,12 @@ NON_US_KEYWORDS = [
     "rbi policy", "sebi", "india stock", "india fund",
     "india market", "india boost", "india lng", "india buying",
     "india inflow", "india dollar", "india equity",
-    # China
     "alibaba group", "tencent holdings", "baidu inc", "xiaomi corp",
     "huawei technologies", "sinopec", "petrochina",
     "shanghai composite", "hang seng index", "hkex",
     "peoples bank of china", "pboc rate",
-    # Japan
     "bank of japan rate", "nikkei 225",
-    # Europe only
     "ftse 100 index", "dax index", "cac 40 index",
-    # Middle East only
     "suez canal",
 ]
 
@@ -72,6 +74,74 @@ US_ANCHOR_KEYWORDS = [
     "us dollar", "treasury", "fed funds"
 ]
 
+def load_eodhd_tickers():
+    """
+    Load all US common stocks and ETFs from EODHD.
+    Returns list of ticker symbols.
+    Cached for 24 hours.
+    """
+    global _eodhd_ticker_cache, _eodhd_cache_time
+
+    now = time.time()
+    if _eodhd_ticker_cache and (now - _eodhd_cache_time) < CACHE_TTL:
+        return _eodhd_ticker_cache
+
+    if not EODHD_API_KEY:
+        print("[EODHD] No API key — using fallback tickers")
+        return FALLBACK_TICKERS
+
+    try:
+        print("[EODHD] Loading US ticker list...")
+        url = "https://eodhd.com/api/exchange-symbol-list/US"
+        params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+        r = requests.get(url, params=params, timeout=30)
+
+        if r.status_code != 200:
+            print(f"[EODHD] Failed to load tickers: {r.status_code}")
+            return _eodhd_ticker_cache or FALLBACK_TICKERS
+
+        data = r.json()
+
+        # Filter to common stocks and ETFs only
+        valid_types = {"Common Stock", "ETF"}
+        tickers = [
+            item["Code"].upper()
+            for item in data
+            if item.get("Type") in valid_types
+            and item.get("Code")
+            and not item["Code"].startswith("^")
+            and "." not in item["Code"]  # Skip foreign-format codes
+        ]
+
+        # Remove duplicates
+        tickers = list(set(tickers))
+
+        print(f"[EODHD] Loaded {len(tickers):,} US tickers (common stocks + ETFs)")
+        _eodhd_ticker_cache = tickers
+        _eodhd_cache_time = now
+        return tickers
+
+    except Exception as e:
+        print(f"[EODHD] Error loading tickers: {e}")
+        return _eodhd_ticker_cache or FALLBACK_TICKERS
+
+def get_all_watched_tickers():
+    """
+    Combine EODHD tickers with any user watchlist tickers from DB.
+    """
+    # Load EODHD tickers
+    eodhd_tickers = load_eodhd_tickers()
+
+    # Add user watchlist tickers from Supabase
+    try:
+        result = supabase.table("watchlists").select("ticker").execute()
+        db_tickers = list(set([r["ticker"] for r in result.data if r.get("ticker")]))
+        combined = list(set(eodhd_tickers + db_tickers))
+        return combined
+    except Exception as e:
+        print(f"[ERROR] Failed to get DB tickers: {e}")
+        return eodhd_tickers
+
 def is_us_relevant(title, summary):
     text = f"{title} {summary}".lower()
     for kw in US_ANCHOR_KEYWORDS:
@@ -82,24 +152,19 @@ def is_us_relevant(title, summary):
         return False
     return True
 
-def get_watched_tickers_from_db():
-    try:
-        result = supabase.table("watchlists").select("ticker").execute()
-        tickers = list(set([r["ticker"] for r in result.data if r.get("ticker")]))
-        combined = list(set(tickers + WATCH_TICKERS))
-        return combined if combined else WATCH_TICKERS
-    except Exception as e:
-        print(f"[ERROR] Failed to get tickers from DB: {e}")
-        return WATCH_TICKERS
-
 def extract_tickers_from_text(text, watched_tickers):
+    """
+    Extract matching tickers from article text.
+    Uses word boundary matching to avoid false positives.
+    """
     found = []
     text_upper = text.upper()
     for ticker in watched_tickers:
         pattern = r'\b' + re.escape(ticker) + r'\b'
         if re.search(pattern, text_upper):
             found.append(ticker)
-    return found
+    # Return max 3 tickers per article to avoid noise
+    return found[:3]
 
 def tag_market_article(title, summary):
     text = f"{title} {summary}".lower()
@@ -192,7 +257,7 @@ def parse_rss_date(date_str):
             continue
     return datetime.now().isoformat()
 
-def fetch_source_items(source):
+def fetch_source_items(source, watched_tickers):
     name = source["name"]
     url = source["url"]
     source_key = source["source_key"]
@@ -209,8 +274,6 @@ def fetch_source_items(source):
         if not items:
             ns = {"atom": "http://www.w3.org/2005/Atom"}
             items = root.findall("atom:entry", ns)
-
-        watched_tickers = get_watched_tickers_from_db()
 
         for item in items:
             title_elem = item.find("title")
@@ -240,7 +303,6 @@ def fetch_source_items(source):
             raw_description = desc_elem.text if desc_elem is not None else ""
             summary = re.sub(r'<[^>]+>', '', raw_description).strip() if raw_description else ""
 
-            # Filter non-US articles early
             if not is_us_relevant(title, summary):
                 print(f"[FILTERED] Non-US: {title[:60]}")
                 continue
@@ -256,6 +318,7 @@ def fetch_source_items(source):
             found_tickers = extract_tickers_from_text(full_text, watched_tickers)
 
             if found_tickers:
+                # Store for first matching ticker only
                 items_to_store.append({
                     "source_key": source_key,
                     "ticker": found_tickers[0],
@@ -293,11 +356,16 @@ def fetch_source_items(source):
 
 def poll_all_news():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling news sources...")
+
+    # Load tickers once per poll cycle — cached so no performance hit
+    watched_tickers = get_all_watched_tickers()
+    print(f"[TICKERS] Watching {len(watched_tickers):,} instruments")
+
     all_source_items = []
     source_counts = {}
 
     for source in NEWS_SOURCES:
-        items = fetch_source_items(source)
+        items = fetch_source_items(source, watched_tickers)
         if items:
             all_source_items.append(items)
             source_counts[source["source_key"]] = source_counts.get(source["source_key"], 0) + len(items)
