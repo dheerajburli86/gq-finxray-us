@@ -81,18 +81,14 @@ def is_complete_summary(text):
     last_word = last_words[-1].lower().rstrip(",")
     second_last = last_words[-2].lower().rstrip(",") if len(last_words) >= 2 else ""
     dangling_words = {
-        # Articles and prepositions
         "on", "the", "a", "an", "and", "or", "but", "that",
         "with", "by", "in", "of", "to", "for", "as", "at",
         "from", "into", "than", "about", "over", "after",
-        # Conjunctive adverbs
         "concurrently", "additionally", "furthermore", "however",
         "meanwhile", "subsequently", "also", "while", "between",
         "through", "during", "including", "such", "both",
-        # Month names — summary ending on a month name is always incomplete
         "january", "february", "march", "april", "may", "june",
         "july", "august", "september", "october", "november", "december",
-        # Other incomplete endings
         "its", "their", "this", "these", "those", "which", "where",
         "when", "who", "whose", "whom", "per", "versus", "vs"
     }
@@ -106,32 +102,33 @@ def is_complete_summary(text):
     return True
 
 def is_news_relevant(company_name, raw_text):
-    prompt = f"""You are a financial news filter. Read the following news article and determine if it contains a specific, actionable financial development related to {company_name} or the US stock market that is worth alerting investors about.
+    """
+    Lightweight relevance filter — only discards obvious non-financial content.
+    Everything else passes through to the summariser.
+    No LLM call needed — pure keyword matching.
+    """
+    text = raw_text.lower()
 
-Answer YES if the article contains any of:
-- Specific price movements, earnings results, revenue figures
-- Company announcements, deals, leadership changes
-- Analyst upgrades, downgrades, or price target changes
-- Federal Reserve decisions or major economic data releases
-- Market-moving geopolitical or macroeconomic events affecting US markets
-- IPO filings, mergers, acquisitions involving US companies
-- Any specific named event with financial implications for US investors
+    # Hard discard patterns — clearly not financial news
+    non_financial_phrases = [
+        "summer cabin", "should i pay", "my child was given",
+        "dear abby", "horoscope", "recipe for", "movie review",
+        "celebrity", "fashion week", "sports score", "nfl score",
+        "nba score", "nhl score", "mlb score", "soccer score",
+        "dating advice", "relationship advice", "health tips",
+        "weight loss", "diet plan", "workout routine",
+        "travel guide", "vacation tips", "restaurant review",
+        "book review", "tv show", "film review", "music review",
+        "crossword", "sudoku", "puzzle", "lottery results"
+    ]
 
-Answer NO if the article is:
-- General market commentary or opinion with no specific development
-- A recap of events already widely known
-- Personal finance advice or lifestyle content
-- Purely educational or explanatory content with no current news
-- Vague analysis with no specific figures or events
-- News primarily about non-US markets, companies, or economies with no direct US market impact
+    for phrase in non_financial_phrases:
+        if phrase in text:
+            print(f"[RELEVANCE] Discarded — matched: {phrase}")
+            return False
 
-Article:
-{raw_text[:2000]}
-
-Respond with only a JSON object: {{"relevant": true}} or {{"relevant": false}}"""
-    response = call_llm(prompt, max_tokens=50)
-    result = parse_json_response(response)
-    return result.get("relevant", True)
+    # Everything else is considered relevant
+    return True
 
 def summarise_announcement(company_name, raw_text):
     prompt = f"""Your task is to summarize the provided document specifically focusing on the company: {company_name}.
