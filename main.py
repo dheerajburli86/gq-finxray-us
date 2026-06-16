@@ -50,7 +50,6 @@ def get_stock_price(ticker: str):
         return None
 
 def get_index_price(symbol: str, name: str):
-    """Fetch ETF price for index representation."""
     try:
         url = f"https://eodhd.com/api/real-time/{symbol}.US"
         params = {"api_token": EODHD_API_KEY, "fmt": "json"}
@@ -216,7 +215,7 @@ async def send_error_alert(message: str):
         bot = Bot(token=TELEGRAM_TOKEN)
         await bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
-            text=f"⚠️ *GQ FinXray US — System Alert*\n\n{message}\n\n🕐 {datetime.now().strftime('%I:%M %p IST')}",
+            text=f"⚠️ *GQ FinXray US — System Alert*\n\n{message}\n\n🕐 {datetime.now().strftime('%I:%M %p UTC')}",
             parse_mode="Markdown"
         )
     except:
@@ -427,11 +426,12 @@ def run_scheduler():
     schedule.every(30).seconds.do(poll_sec_8k)
     schedule.every(30).seconds.do(poll_sec_form4)
     schedule.every(60).seconds.do(poll_all_news)
-    schedule.every().day.at("09:25").do(send_premarket_report)
-    schedule.every().day.at("09:30").do(send_market_open_report)
-    schedule.every().day.at("13:00").do(send_midday_report)
-    schedule.every().day.at("16:00").do(send_market_close_report)
-    schedule.every().day.at("16:30").do(send_afterhours_report)
+    # UTC times for Railway (EST + 4 hours during EDT)
+    schedule.every().day.at("13:25").do(send_premarket_report)   # 9:25 AM EST
+    schedule.every().day.at("13:30").do(send_market_open_report)  # 9:30 AM EST
+    schedule.every().day.at("17:00").do(send_midday_report)       # 1:00 PM EST
+    schedule.every().day.at("20:00").do(send_market_close_report) # 4:00 PM EST
+    schedule.every().day.at("20:30").do(send_afterhours_report)   # 4:30 PM EST
     print("[SCHEDULER] All pollers and market reports scheduled.")
     while True:
         schedule.run_pending()
