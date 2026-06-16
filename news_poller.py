@@ -25,13 +25,11 @@ NEWS_SOURCES = [
     {"name": "Reuters", "url": "https://news.google.com/rss/search?q=reuters+business+markets&ceid=US:en&hl=en-US&gl=US", "source_key": "REUTERS"},
 ]
 
-# Fallback tickers if EODHD fails
 FALLBACK_TICKERS = [
     "AAPL", "NVDA", "TSLA", "MSFT", "META",
     "AMZN", "GOOGL", "JPM", "NFLX", "AMD"
 ]
 
-# Cache for EODHD tickers — refreshed every 24 hours
 _eodhd_ticker_cache = []
 _eodhd_cache_time = 0
 CACHE_TTL = 86400  # 24 hours
@@ -74,12 +72,83 @@ US_ANCHOR_KEYWORDS = [
     "us dollar", "treasury", "fed funds"
 ]
 
+# Common English words that are also valid tickers — skip to avoid false positives
+ENGLISH_WORD_BLACKLIST = {
+    "A", "I", "IT", "IN", "IS", "BE", "AS", "AT", "BY", "DO",
+    "GO", "HE", "IF", "ME", "MY", "NO", "OF", "ON", "OR", "SO",
+    "TO", "UP", "US", "WE", "AM", "AN", "ARE", "BUT", "CAN",
+    "DID", "FOR", "GET", "GOT", "HAD", "HAS", "HER", "HIM",
+    "HIS", "HOW", "ITS", "LET", "MAY", "NOT", "NOW", "OLD",
+    "ONE", "OUR", "OUT", "OWN", "SAY", "SHE", "THE", "TOO",
+    "TWO", "WAS", "WHO", "WHY", "YES", "YET", "YOU", "ALL",
+    "AND", "ANY", "DAY", "EAT", "END", "FAR", "FEW", "GAS",
+    "GOD", "GUN", "GUY", "HOT", "JOB", "KEY", "KID", "LAW",
+    "LAY", "LED", "LOT", "LOW", "MAN", "MAP", "MET", "MID",
+    "MOM", "NET", "NEW", "OFF", "OIL", "PAY", "PUT", "RAW",
+    "RUN", "SAT", "SAW", "SET", "SIT", "SIX", "TAX", "TEN",
+    "TIE", "TOP", "TRY", "VIA", "WAR", "WAY", "WIN", "WON",
+    "YEN", "ZIP", "GAIN", "LOSS", "BOND", "CASH", "COST",
+    "DEAL", "DEBT", "FALL", "FLAT", "FUND", "GOLD", "GOOD",
+    "GREW", "HALF", "HARD", "HAVE", "HEAD", "HELP", "HIGH",
+    "HOLD", "HOME", "HOPE", "HURT", "IDEA", "INTO", "JUMP",
+    "KEEP", "KIND", "KNOW", "LACK", "LAND", "LAST", "LATE",
+    "LEAD", "LEAN", "LEFT", "LESS", "LIKE", "LINK", "LIST",
+    "LIVE", "LOAN", "LONG", "LOOK", "MADE", "MAIN", "MAKE",
+    "MANY", "MARK", "MASS", "MEAN", "MEET", "MISS", "MOST",
+    "MOVE", "MUCH", "MUST", "NEAR", "NEED", "NEXT", "NONE",
+    "NORM", "NOTE", "ONCE", "ONLY", "OPEN", "OVER", "PACE",
+    "PAID", "PAIN", "PART", "PAST", "PATH", "PEAK", "PLAN",
+    "PLAY", "PLUS", "POLL", "POOR", "POST", "PULL", "PURE",
+    "PUSH", "RACE", "RAGE", "RATE", "READ", "REAL", "RELY",
+    "RENT", "RISE", "RISK", "ROAD", "ROLE", "ROSE", "RULE",
+    "RUSH", "SAFE", "SAID", "SALE", "SAME", "SAVE", "SEEK",
+    "SELF", "SELL", "SEND", "SENT", "SIGN", "SIZE", "SLIP",
+    "SLOW", "SOLD", "SOME", "SOON", "SORT", "STAY", "STEP",
+    "STOP", "SUCH", "SURE", "TAKE", "TALK", "TELL", "TERM",
+    "TEST", "THAN", "THAT", "THEM", "THEN", "THEY", "THIS",
+    "THUS", "TIME", "TOLD", "TOLL", "TOOK", "TOOL", "TRIM",
+    "TRUE", "TUNE", "TURN", "TYPE", "UNIT", "UPON", "VARY",
+    "VAST", "VIEW", "VOTE", "WAIT", "WALK", "WANT", "WARN",
+    "WEAK", "WEEK", "WELL", "WENT", "WERE", "WHEN", "WIDE",
+    "WILD", "WILL", "WITH", "WORD", "WORK", "YEAR", "YOUR",
+    "ZERO", "RAISE", "RALLY", "RANGE", "RAPID", "RATIO",
+    "REACH", "READY", "ABOVE", "ABOUT", "AFTER", "AGAIN",
+    "AHEAD", "ALONG", "AMONG", "APPLY", "ARISE", "BASIS",
+    "BEGAN", "BEGIN", "BELOW", "BOARD", "BOOST", "BREAK",
+    "BRING", "BUILD", "BUILT", "BUYER", "CALLS", "CAUSE",
+    "CLAIM", "CLASS", "CLEAN", "CLEAR", "CLOSE", "COMES",
+    "COULD", "COUNT", "COVER", "CRASH", "CROSS", "CURVE",
+    "CYCLE", "DAILY", "DOING", "DOLLAR", "DRIVE", "DROP",
+    "EARLY", "EIGHT", "ENTER", "EQUAL", "EVERY", "EXACT",
+    "EXIST", "EXTRA", "FALLS", "FAVOR", "FINAL", "FIRST",
+    "FIXED", "FOCUS", "FORCE", "FORTH", "FOUND", "FOUR",
+    "FRONT", "FULLY", "GIVEN", "GIVES", "GOING", "GRANT",
+    "GREAT", "GREEN", "GROUP", "GROW", "GROWN", "GROWS",
+    "GUIDE", "HANDS", "HEAVY", "HENCE", "HOLDS", "HOURS",
+    "HOUSE", "HUMAN", "INDEX", "ISSUE", "ITEMS", "JOINT",
+    "JUDGE", "LABOR", "LARGE", "LATER", "LEARN", "LEAST",
+    "LEGAL", "LEVEL", "LIGHT", "LIMIT", "LOCAL", "LOWER",
+    "LOWER", "LUCKY", "MAJOR", "MAKER", "MATCH", "MEDIA",
+    "MODEL", "MONEY", "MONTH", "MOVED", "MOVES", "NAMED",
+    "OFFER", "OFTEN", "ORDER", "OTHER", "OWNED", "OWNER",
+    "PAPER", "PARTY", "PLACE", "POINT", "POWER", "PRICE",
+    "PRIOR", "PROOF", "PROVE", "QUITE", "QUOTE", "RAISE",
+    "REACH", "REFER", "RIGHT", "ROUND", "SCORE", "SENSE",
+    "SERVE", "SEVEN", "SHARE", "SHARP", "SHORT", "SINCE",
+    "SIXTH", "SIXTY", "SMALL", "SMART", "SOLVE", "SPEAK",
+    "SPEND", "SPLIT", "SPOKE", "STAND", "START", "STATE",
+    "STILL", "STOCK", "STORE", "STUDY", "STYLE", "THIRD",
+    "THINK", "THREE", "THREW", "THROW", "TIGHT", "TIMES",
+    "TIRED", "TOTAL", "TOUCH", "TRACK", "TRADE", "TRAIL",
+    "TRAIN", "TREND", "TRIAL", "TRIED", "TRIES", "TRULY",
+    "TRUST", "UNDER", "UNIFY", "UNION", "UNTIL", "UPPER",
+    "USAGE", "USERS", "USING", "USUAL", "VALUE", "VERSE",
+    "VISIT", "VITAL", "VOICE", "WASTE", "WATCH", "WATER",
+    "WHOLE", "WIDER", "WORLD", "WORSE", "WORTH", "WOULD",
+    "WRITE", "WROTE", "YARDS", "YIELD"
+}
+
 def load_eodhd_tickers():
-    """
-    Load all US common stocks and ETFs from EODHD.
-    Returns list of ticker symbols.
-    Cached for 24 hours.
-    """
     global _eodhd_ticker_cache, _eodhd_cache_time
 
     now = time.time()
@@ -102,7 +171,6 @@ def load_eodhd_tickers():
 
         data = r.json()
 
-        # Filter to common stocks and ETFs only
         valid_types = {"Common Stock", "ETF"}
         tickers = [
             item["Code"].upper()
@@ -110,12 +178,12 @@ def load_eodhd_tickers():
             if item.get("Type") in valid_types
             and item.get("Code")
             and not item["Code"].startswith("^")
-            and "." not in item["Code"]  # Skip foreign-format codes
+            and "." not in item["Code"]
+            and len(item["Code"]) >= 3  # Skip 1-2 char tickers
+            and item["Code"].upper() not in ENGLISH_WORD_BLACKLIST
         ]
 
-        # Remove duplicates
         tickers = list(set(tickers))
-
         print(f"[EODHD] Loaded {len(tickers):,} US tickers (common stocks + ETFs)")
         _eodhd_ticker_cache = tickers
         _eodhd_cache_time = now
@@ -126,13 +194,7 @@ def load_eodhd_tickers():
         return _eodhd_ticker_cache or FALLBACK_TICKERS
 
 def get_all_watched_tickers():
-    """
-    Combine EODHD tickers with any user watchlist tickers from DB.
-    """
-    # Load EODHD tickers
     eodhd_tickers = load_eodhd_tickers()
-
-    # Add user watchlist tickers from Supabase
     try:
         result = supabase.table("watchlists").select("ticker").execute()
         db_tickers = list(set([r["ticker"] for r in result.data if r.get("ticker")]))
@@ -153,17 +215,16 @@ def is_us_relevant(title, summary):
     return True
 
 def extract_tickers_from_text(text, watched_tickers):
-    """
-    Extract matching tickers from article text.
-    Uses word boundary matching to avoid false positives.
-    """
     found = []
     text_upper = text.upper()
     for ticker in watched_tickers:
+        if ticker.upper() in ENGLISH_WORD_BLACKLIST:
+            continue
+        if len(ticker) <= 2:
+            continue
         pattern = r'\b' + re.escape(ticker) + r'\b'
         if re.search(pattern, text_upper):
             found.append(ticker)
-    # Return max 3 tickers per article to avoid noise
     return found[:3]
 
 def tag_market_article(title, summary):
@@ -318,7 +379,6 @@ def fetch_source_items(source, watched_tickers):
             found_tickers = extract_tickers_from_text(full_text, watched_tickers)
 
             if found_tickers:
-                # Store for first matching ticker only
                 items_to_store.append({
                     "source_key": source_key,
                     "ticker": found_tickers[0],
@@ -357,7 +417,6 @@ def fetch_source_items(source, watched_tickers):
 def poll_all_news():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling news sources...")
 
-    # Load tickers once per poll cycle — cached so no performance hit
     watched_tickers = get_all_watched_tickers()
     print(f"[TICKERS] Watching {len(watched_tickers):,} instruments")
 
