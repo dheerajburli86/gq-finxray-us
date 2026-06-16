@@ -72,7 +72,7 @@ def is_complete_summary(text):
     if stripped[-1] not in ".!?":
         return False
     words = stripped.split()
-    if len(words) < 40:
+    if len(words) < 55:
         return False
     text_no_punct = stripped.rstrip(".!?").rstrip()
     last_words = text_no_punct.split()
@@ -80,9 +80,22 @@ def is_complete_summary(text):
         return False
     last_word = last_words[-1].lower().rstrip(",")
     second_last = last_words[-2].lower().rstrip(",") if len(last_words) >= 2 else ""
-    dangling_words = {"on", "the", "a", "an", "and", "or", "but", "that",
-                      "with", "by", "in", "of", "to", "for", "as", "at",
-                      "from", "into", "than", "about", "over", "after"}
+    dangling_words = {
+        # Articles and prepositions
+        "on", "the", "a", "an", "and", "or", "but", "that",
+        "with", "by", "in", "of", "to", "for", "as", "at",
+        "from", "into", "than", "about", "over", "after",
+        # Conjunctive adverbs
+        "concurrently", "additionally", "furthermore", "however",
+        "meanwhile", "subsequently", "also", "while", "between",
+        "through", "during", "including", "such", "both",
+        # Month names — summary ending on a month name is always incomplete
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+        # Other incomplete endings
+        "its", "their", "this", "these", "those", "which", "where",
+        "when", "who", "whose", "whom", "per", "versus", "vs"
+    }
     if last_word in dangling_words:
         return False
     clean_last = last_word.replace(",", "").replace("$", "").replace(".", "")
@@ -93,11 +106,6 @@ def is_complete_summary(text):
     return True
 
 def is_news_relevant(company_name, raw_text):
-    """
-    Relevance check for news articles only.
-    Returns True if article has a specific actionable financial development.
-    Returns False if it is general commentary, opinion, or fluff.
-    """
     prompt = f"""You are a financial news filter. Read the following news article and determine if it contains a specific, actionable financial development related to {company_name} or the US stock market that is worth alerting investors about.
 
 Answer YES if the article contains any of:
@@ -121,13 +129,11 @@ Article:
 {raw_text[:2000]}
 
 Respond with only a JSON object: {{"relevant": true}} or {{"relevant": false}}"""
-
     response = call_llm(prompt, max_tokens=50)
     result = parse_json_response(response)
     return result.get("relevant", True)
 
 def summarise_announcement(company_name, raw_text):
-    """For SEC EDGAR 8-K and S-1 filings."""
     prompt = f"""Your task is to summarize the provided document specifically focusing on the company: {company_name}.
 
 PURPOSE: The summary must help investors understand significant developments related to {company_name}.
@@ -141,7 +147,7 @@ CONTENT RULES:
 
 FORMAT:
 - Write as a single paragraph, no line breaks.
-- Strictly 50-70 words.
+- Strictly 55-70 words.
 - Do not mention word count.
 - Do not include contact information, salutations, or address anyone.
 - Neutral, objective, professional tone.
@@ -151,6 +157,7 @@ FORMAT:
 COMPLETENESS RULES:
 - Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
 - Never truncate numbers. Write every number exactly as it appears in the source.
+- Never end on a month name, preposition, conjunction, or article.
 - The final character of your response MUST be a full stop.
 
 WHAT TO INCLUDE BY TYPE:
@@ -171,7 +178,6 @@ Return ONLY the summary paragraph. Nothing else."""
     return call_llm(prompt, max_tokens=1500)
 
 def summarise_form4(company_name, raw_text):
-    """Dedicated prompt for Form 4 insider transaction filings."""
     prompt = f"""Your task is to summarize an SEC Form 4 insider transaction filing for the company: {company_name}.
 
 Form 4 is filed when a company executive, director, or major shareholder buys or sells company stock. Your summary must clearly tell investors exactly what transaction occurred.
@@ -184,9 +190,14 @@ CONTENT RULES:
 
 FORMAT:
 - Write as a single paragraph, no line breaks.
-- Strictly 50-70 words.
+- Strictly 55-70 words.
 - Do not mention word count.
 - Neutral, objective, professional tone.
+- The final character MUST be a full stop.
+
+COMPLETENESS RULES:
+- Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
+- Never end on a month name, preposition, conjunction, or article.
 - The final character MUST be a full stop.
 
 REQUIRED INFORMATION — extract all that are present:
@@ -212,7 +223,6 @@ Return ONLY the summary paragraph. Nothing else."""
     return call_llm(prompt, max_tokens=1500)
 
 def summarise_news(company_name, raw_text):
-    """For news articles — CNBC, Bloomberg, MarketWatch, Reuters."""
     prompt = f"""Your task is to summarize the provided news article specifically focusing on: {company_name}.
 
 CONTENT SCOPE:
@@ -225,7 +235,7 @@ CONTENT SCOPE:
 
 FORMAT:
 - Write as a single paragraph, no line breaks.
-- Strictly 50-70 words.
+- Strictly 55-70 words.
 - Do not mention word count.
 - Do not include contact information, salutations, or address anyone.
 - Neutral, objective, professional tone.
@@ -234,6 +244,7 @@ FORMAT:
 
 COMPLETENESS RULES:
 - Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
+- Never end on a month name, preposition, conjunction, or article.
 - Never truncate numbers. Write every number completely as it appears in the source.
 - The final character of your response MUST be a full stop.
 
@@ -250,7 +261,6 @@ Return ONLY the summary paragraph. Nothing else."""
     return call_llm(prompt, max_tokens=1500)
 
 def summarise(company_name, raw_text, filing_type=""):
-    """Route to the correct summarisation function based on filing type."""
     if filing_type == "NEWS":
         return summarise_news(company_name, raw_text)
     elif filing_type == "4":
@@ -259,27 +269,42 @@ def summarise(company_name, raw_text, filing_type=""):
         return summarise_announcement(company_name, raw_text)
 
 def expand_summary(summary, company_name, raw_text):
-    prompt = f"""You are a financial editor. The summary below about {company_name} is INCOMPLETE — it ends mid-sentence, mid-number, or without a full stop.
+    prompt = f"""You are a financial editor. The summary below about {company_name} is INCOMPLETE.
 
-YOUR JOB: Fix it so it becomes a complete, informative single-paragraph summary of 50-70 words.
+Problems it may have:
+- Ends mid-sentence or mid-phrase
+- Ends on a month name, preposition, conjunction, or article
+- Missing the investor significance sentence
+- Too short — under 55 words
+- Cuts off mid-number or mid-thought
+
+YOUR JOB: Rewrite it as a complete, polished 55-70 word summary.
 
 STRICT RULES:
-1. Keep every word and number from the original exactly as written — do not change any existing content.
-2. Complete any sentence that was cut off using details from the source text below.
-3. If the summary is under 40 words after fixing, add more complete sentences with specific details.
-4. The final character of your response MUST be a full stop.
-5. Never truncate a number — write it completely.
-6. The summary must answer: what happened, key details, and why it matters to investors.
+1. Keep all original facts and numbers exactly as written.
+2. Complete any cut-off sentence using details from the source text.
+3. Add an investor significance sentence at the end if missing.
+4. The final character MUST be a full stop.
+5. Never truncate any number.
+6. Never end on a month name, preposition, conjunction, or article.
 7. Do not say "this filing" or "this article".
-8. Return only the completed summary — no preamble, no explanation.
+8. Return only the completed summary — no preamble.
 
-Current summary (incomplete):
+For Form 4 insider trades the summary must include:
+- Full name and title
+- Bought or sold
+- Share count and price per share
+- Total dollar value
+- Shares owned after transaction
+- What this signals for investors
+
+Current summary:
 {summary}
 
 Source text:
 {raw_text[:4000]}
 
-Return ONLY the fixed summary. Last character MUST be a full stop."""
+Return ONLY the fixed complete summary. Last character MUST be a full stop."""
     result = call_llm(prompt, max_tokens=2000)
     return result
 
@@ -364,8 +389,7 @@ def process_filing(filing):
     else:
         print(f"[SKIP] Relevance check")
 
-    # ── Step 3: Summarisation — routed by filing type ─────────
-    # For market-wide news use descriptive name not raw ticker
+    # ── Step 3: Summarisation ─────────────────────────────────
     if filing_type == "NEWS" and company_name in ("MARKET", "SPY", "QQQ", "DIA", "UNKNOWN"):
         summarise_name = "the US stock market and major indices"
     else:
