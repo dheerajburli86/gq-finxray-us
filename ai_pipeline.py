@@ -90,7 +90,9 @@ def is_complete_summary(text):
         "january", "february", "march", "april", "may", "june",
         "july", "august", "september", "october", "november", "december",
         "its", "their", "this", "these", "those", "which", "where",
-        "when", "who", "whose", "whom", "per", "versus", "vs"
+        "when", "who", "whose", "whom", "per", "versus", "vs",
+        "meeting", "approval", "pending", "plan", "agreement",
+        "announcement", "filing", "report", "quarter", "year"
     }
     if last_word in dangling_words:
         return False
@@ -102,14 +104,7 @@ def is_complete_summary(text):
     return True
 
 def is_news_relevant(company_name, raw_text):
-    """
-    Lightweight relevance filter — only discards obvious non-financial content.
-    Everything else passes through to the summariser.
-    No LLM call needed — pure keyword matching.
-    """
     text = raw_text.lower()
-
-    # Hard discard patterns — clearly not financial news
     non_financial_phrases = [
         "summer cabin", "should i pay", "my child was given",
         "dear abby", "horoscope", "recipe for", "movie review",
@@ -121,13 +116,10 @@ def is_news_relevant(company_name, raw_text):
         "book review", "tv show", "film review", "music review",
         "crossword", "sudoku", "puzzle", "lottery results"
     ]
-
     for phrase in non_financial_phrases:
         if phrase in text:
             print(f"[RELEVANCE] Discarded — matched: {phrase}")
             return False
-
-    # Everything else is considered relevant
     return True
 
 def summarise_announcement(company_name, raw_text):
@@ -151,10 +143,11 @@ FORMAT:
 - Do not start with the company name as the first word.
 - The final character MUST be a full stop.
 
-COMPLETENESS RULES:
+COMPLETENESS RULES — CRITICAL:
 - Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
 - Never truncate numbers. Write every number exactly as it appears in the source.
-- Never end on a month name, preposition, conjunction, or article.
+- Never end on a month name, date, preposition, conjunction, article, or noun that starts a new thought.
+- The last sentence MUST be a complete standalone sentence ending with a full stop.
 - The final character of your response MUST be a full stop.
 
 WHAT TO INCLUDE BY TYPE:
@@ -165,6 +158,7 @@ WHAT TO INCLUDE BY TYPE:
 - Clinical trial: drug name, phase, result, patient count, commercial significance.
 - Exploration update: project name, location, milestone, timeline, investor impact.
 - Regulatory/legal: what changed, who it affects, financial exposure or benefit.
+- Annual meeting: what was voted on, key outcomes, what it means for shareholders.
 
 INVESTOR SIGNIFICANCE: The last sentence must explain why this matters to investors or what it signals for the stock.
 
@@ -192,9 +186,10 @@ FORMAT:
 - Neutral, objective, professional tone.
 - The final character MUST be a full stop.
 
-COMPLETENESS RULES:
+COMPLETENESS RULES — CRITICAL:
 - Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
-- Never end on a month name, preposition, conjunction, or article.
+- Never end on a month name, date, preposition, conjunction, or article.
+- The last sentence MUST be a complete standalone sentence ending with a full stop.
 - The final character MUST be a full stop.
 
 REQUIRED INFORMATION — extract all that are present:
@@ -239,9 +234,10 @@ FORMAT:
 - Do not start with the subject name as the first word.
 - The final character MUST be a full stop.
 
-COMPLETENESS RULES:
+COMPLETENESS RULES — CRITICAL:
 - Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
-- Never end on a month name, preposition, conjunction, or article.
+- Never end on a month name, date, preposition, conjunction, or article.
+- The last sentence MUST be a complete standalone sentence ending with a full stop.
 - Never truncate numbers. Write every number completely as it appears in the source.
 - The final character of your response MUST be a full stop.
 
@@ -269,23 +265,23 @@ def expand_summary(summary, company_name, raw_text):
     prompt = f"""You are a financial editor. The summary below about {company_name} is INCOMPLETE.
 
 Problems it may have:
-- Ends mid-sentence or mid-phrase
-- Ends on a month name, preposition, conjunction, or article
+- Ends mid-sentence, mid-phrase, or mid-thought
+- Ends on a month name, date, preposition, conjunction, article, or noun that starts a new thought
 - Missing the investor significance sentence
 - Too short — under 55 words
-- Cuts off mid-number or mid-thought
+- Cuts off mid-number
 
-YOUR JOB: Rewrite it as a complete, polished 55-70 word summary.
+YOUR JOB: Rewrite it as a complete, polished 55-70 word single paragraph summary.
 
 STRICT RULES:
 1. Keep all original facts and numbers exactly as written.
-2. Complete any cut-off sentence using details from the source text.
+2. Complete any cut-off sentence using details from the source text below.
 3. Add an investor significance sentence at the end if missing.
 4. The final character MUST be a full stop.
 5. Never truncate any number.
-6. Never end on a month name, preposition, conjunction, or article.
+6. Never end on a month name, date, preposition, conjunction, article, or noun that starts a new thought.
 7. Do not say "this filing" or "this article".
-8. Return only the completed summary — no preamble.
+8. Return only the completed summary — no preamble, no labels.
 
 For Form 4 insider trades the summary must include:
 - Full name and title
@@ -295,7 +291,7 @@ For Form 4 insider trades the summary must include:
 - Shares owned after transaction
 - What this signals for investors
 
-Current summary:
+Current summary (incomplete):
 {summary}
 
 Source text:

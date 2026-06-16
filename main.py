@@ -28,21 +28,16 @@ def get_stock_price(ticker: str):
         params = {"api_token": EODHD_API_KEY, "fmt": "json"}
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
-
         if "close" not in data:
             return None
-
         price = float(data.get("close", 0))
         prev_close = float(data.get("previousClose", price))
         change = price - prev_close
         change_pct = (change / prev_close * 100) if prev_close else 0
-        arrow = "🟢" if change_pct >= 0 else "🔴"
         sign = "+" if change_pct >= 0 else ""
-
         return {
             "price": f"${price:,.2f}",
             "change": f"{sign}{change_pct:.2f}%",
-            "arrow": arrow,
             "name": data.get("name", ticker)
         }
     except Exception as e:
@@ -55,17 +50,13 @@ def get_index_price(symbol: str, name: str):
         params = {"api_token": EODHD_API_KEY, "fmt": "json"}
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
-
         if "close" not in data:
             return None
-
         price = float(data.get("close", 0))
         prev_close = float(data.get("previousClose", price))
         change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
-        arrow = "🟢" if change_pct >= 0 else "🔴"
         sign = "+" if change_pct >= 0 else ""
-
-        return f"{arrow} *{name}:* ${price:,.2f} ({sign}{change_pct:.2f}%)"
+        return f"*{name}:* ${price:,.2f} ({sign}{change_pct:.2f}%)"
     except:
         return None
 
@@ -95,31 +86,22 @@ def format_alert(alert):
     if price_ticker and price_ticker != "UNKNOWN":
         price_data = get_stock_price(price_ticker)
         if price_data:
+            company_display = price_data.get("name", ticker)
             if ticker == "MARKET":
-                price_line = f"\n📈 *S&P 500:* SPY {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
+                price_line = f"📈 *Stock:* S&P 500   {price_data['price']} ({price_data['change']})\n"
             else:
-                company_display = price_data.get("name", ticker)
-                price_line = f"\n📈 *Stock:* {company_display} {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
+                price_line = f"📈 *Stock:* {company_display}   {price_data['price']} ({price_data['change']})\n"
 
     # Source link
     source_link = ""
     if filing_url:
         if source == "SEC_EDGAR":
-            source_link = f"\n🔗 [View SEC Filing]({filing_url})"
-        elif source == "CNBC":
-            source_link = f"\n🔗 [Read on CNBC]({filing_url})"
-        elif source == "BLOOMBERG":
-            source_link = f"\n🔗 [Read on Bloomberg]({filing_url})"
-        elif source == "MARKETWATCH":
-            source_link = f"\n🔗 [Read on MarketWatch]({filing_url})"
-        elif source == "REUTERS":
-            source_link = f"\n🔗 [Read on Reuters]({filing_url})"
+            source_link = f"🔗 *Full Story (SEC EDGAR):* [View Filing]({filing_url})"
         else:
-            source_link = f"\n🔗 [Read Full Article]({filing_url})"
+            source_link = f"🔗 *Full Story ({source_name}):* [Read Article]({filing_url})"
 
     footer = (
-        f"{source_link}\n\n"
-        f"_You are receiving this notification based on your request to "
+        f"\n_You are receiving this notification based on your request to "
         f"monitor this stock's news, updates and transactions._\n"
         f"_Disclaimer: gquants.com/disclaimer_\n\n"
         f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
@@ -129,32 +111,35 @@ def format_alert(alert):
     if filing_type == "4":
         insider = extra.get("insider_name", "An insider")
         return (
-            f"📋 *INSIDER TRADE — ${ticker}*"
             f"{price_line}\n"
+            f"📋 *News Flash: Insider Transaction — ${ticker}*\n\n"
             f"{summary}\n\n"
             f"👤 {insider}\n"
-            f"📋 SEC Form 4 · {time_str}"
+            f"📋 SEC Form 4 · {time_str}\n\n"
+            f"{source_link}"
             f"{footer}"
         )
 
     # S-1 IPO
     if filing_type == "S-1":
         return (
-            f"🚀 *IPO FILING — ${ticker}*"
             f"{price_line}\n"
+            f"🚀 *News Flash: IPO Filing — ${ticker}*\n\n"
             f"{summary}\n\n"
-            f"📋 SEC S-1 · {time_str}"
+            f"📋 SEC S-1 · {time_str}\n\n"
+            f"{source_link}"
             f"{footer}"
         )
 
-    # News
+    # News article
     if filing_type == "NEWS":
-        ticker_display = f"${ticker}" if ticker not in ("MARKET", "SPY", "QQQ", "DIA") else "Market News"
+        ticker_display = f"${ticker}" if ticker not in ("MARKET", "SPY", "QQQ", "DIA") else "Market Update"
         return (
-            f"📰 *{source_name} — {ticker_display}*"
             f"{price_line}\n"
-            f"🔍 *Xray Intel:* {summary}\n\n"
-            f"📰 {source_name} · {time_str}"
+            f"📰 *News Flash: {source_name} — {ticker_display}*\n\n"
+            f"{summary}\n\n"
+            f"📰 {source_name} · {time_str}\n\n"
+            f"{source_link}"
             f"{footer}"
         )
 
@@ -166,10 +151,11 @@ def format_alert(alert):
         items_str = f" · {first_item}"
 
     return (
-        f"📊 *{ticker} — SEC Filing*"
         f"{price_line}\n"
-        f"🔍 *Xray Intel:* {summary}\n\n"
-        f"📋 {source_name}{items_str} · {time_str}"
+        f"📊 *News Flash: SEC Filing — ${ticker}*\n\n"
+        f"{summary}\n\n"
+        f"📋 {source_name}{items_str} · {time_str}\n\n"
+        f"{source_link}"
         f"{footer}"
     )
 
@@ -376,8 +362,8 @@ def fetch_top_movers():
     results.sort(key=lambda x: x["change"], reverse=True)
     actual_gainers = [r for r in results if r["change"] > 0]
     actual_losers = [r for r in results if r["change"] < 0]
-    gainers = "\n".join([f"🟢 *{r['ticker']}:* +{r['change']:.2f}%" for r in actual_gainers[:3]]) if actual_gainers else "_No gainers_"
-    losers = "\n".join([f"🔴 *{r['ticker']}:* {r['change']:.2f}%" for r in actual_losers[-3:]]) if actual_losers else "_No losers_"
+    gainers = "\n".join([f"*{r['ticker']}:* +{r['change']:.2f}%" for r in actual_gainers[:3]]) if actual_gainers else "_No gainers_"
+    losers = "\n".join([f"*{r['ticker']}:* {r['change']:.2f}%" for r in actual_losers[-3:]]) if actual_losers else "_No losers_"
     return gainers, losers
 
 async def send_market_report(title: str, body: str):
@@ -426,12 +412,11 @@ def run_scheduler():
     schedule.every(30).seconds.do(poll_sec_8k)
     schedule.every(30).seconds.do(poll_sec_form4)
     schedule.every(60).seconds.do(poll_all_news)
-    # UTC times for Railway (EST + 4 hours during EDT)
-    schedule.every().day.at("13:25").do(send_premarket_report)   # 9:25 AM EST
-    schedule.every().day.at("13:30").do(send_market_open_report)  # 9:30 AM EST
-    schedule.every().day.at("17:00").do(send_midday_report)       # 1:00 PM EST
-    schedule.every().day.at("20:00").do(send_market_close_report) # 4:00 PM EST
-    schedule.every().day.at("20:30").do(send_afterhours_report)   # 4:30 PM EST
+    schedule.every().day.at("13:25").do(send_premarket_report)
+    schedule.every().day.at("13:30").do(send_market_open_report)
+    schedule.every().day.at("17:00").do(send_midday_report)
+    schedule.every().day.at("20:00").do(send_market_close_report)
+    schedule.every().day.at("20:30").do(send_afterhours_report)
     print("[SCHEDULER] All pollers and market reports scheduled.")
     while True:
         schedule.run_pending()
