@@ -19,7 +19,7 @@ from Prompt_P2_GibberishChecker import get_prompt as gibberish_prompt
 from Prompt_V2_SimilarityCheck import get_prompt as similarity_prompt
 from Prompt_C1_ImpactClassification import get_prompt as impact_prompt
 
-def call_llm(prompt, retries=3, max_tokens=1500):
+def call_llm(prompt, retries=3, max_tokens=1000):
     for attempt in range(retries):
         try:
             r = http_requests.post(
@@ -65,41 +65,46 @@ def parse_json_response(text):
     except:
         return {}
 
+def force_complete_summary(summary, company_name, raw_text):
+    """
+    Pass 2 — always runs after Pass 1.
+    Takes the generated summary and either confirms it is complete
+    or rewrites the ending to ensure it ends properly with investor significance.
+    This is not a fallback — it runs on EVERY summary.
+    """
+    prompt = f"""You are a financial editor reviewing a summary about {company_name}.
+
+Your job is to check if the summary below is complete and ends with a clear investor significance sentence. Then return a polished final version.
+
+RULES:
+1. If the summary is complete and already ends with investor significance — return it exactly as is with no changes.
+2. If it ends mid-sentence, mid-phrase, or without investor significance — fix the ending using details from the source text.
+3. The final sentence must explain why this matters to investors or what it signals for the stock.
+4. Total word count must be 55-70 words.
+5. The final character MUST be a full stop.
+6. Never say "this filing" or "this article".
+7. Return ONLY the final summary — no preamble, no labels, no explanation.
+
+Summary to review:
+{summary}
+
+Source text for reference:
+{raw_text[:3000]}
+
+Return ONLY the final polished summary. Last character MUST be a full stop."""
+    result = call_llm(prompt, max_tokens=600)
+    return result
+
 def is_complete_summary(text):
+    """
+    Basic sanity check only — catches catastrophic failures.
+    The force_complete_summary step handles quality.
+    """
     if not text or len(text.strip()) < 10:
         return False
-    stripped = text.rstrip()
-    if stripped[-1] not in ".!?":
+    if text.strip().rstrip()[-1] not in ".!?":
         return False
-    words = stripped.split()
-    if len(words) < 55:
-        return False
-    text_no_punct = stripped.rstrip(".!?").rstrip()
-    last_words = text_no_punct.split()
-    if not last_words:
-        return False
-    last_word = last_words[-1].lower().rstrip(",")
-    second_last = last_words[-2].lower().rstrip(",") if len(last_words) >= 2 else ""
-    dangling_words = {
-        "on", "the", "a", "an", "and", "or", "but", "that",
-        "with", "by", "in", "of", "to", "for", "as", "at",
-        "from", "into", "than", "about", "over", "after",
-        "concurrently", "additionally", "furthermore", "however",
-        "meanwhile", "subsequently", "also", "while", "between",
-        "through", "during", "including", "such", "both",
-        "january", "february", "march", "april", "may", "june",
-        "july", "august", "september", "october", "november", "december",
-        "its", "their", "this", "these", "those", "which", "where",
-        "when", "who", "whose", "whom", "per", "versus", "vs",
-        "meeting", "approval", "pending", "plan", "agreement",
-        "announcement", "filing", "report", "quarter", "year"
-    }
-    if last_word in dangling_words:
-        return False
-    clean_last = last_word.replace(",", "").replace("$", "").replace(".", "")
-    if clean_last.isnumeric() and second_last in {"of", "at", "for", "worth", "than", "about", "to", "from"}:
-        return False
-    if re.search(r'\d+,\d{1,2}$', last_word):
+    if len(text.split()) < 30:
         return False
     return True
 
@@ -130,128 +135,61 @@ PURPOSE: The summary must help investors understand significant developments rel
 CONTENT RULES:
 1. Include ONLY details directly relevant to {company_name} and its investors.
 2. Exclude any information unrelated to {company_name}.
-3. Ensure the summary contains only factual information explicitly mentioned in the original document.
+3. Only use factual information explicitly mentioned in the original document.
 4. Do not add interpretations, opinions, or recommendations.
-5. After writing, verify accuracy against the original document.
 
 FORMAT:
-- Write as a single paragraph, no line breaks.
-- Strictly 55-70 words.
-- Do not mention word count.
-- Do not include contact information, salutations, or address anyone.
-- Neutral, objective, professional tone.
-- Do not start with the company name as the first word.
-- The final character MUST be a full stop.
+- Single paragraph, no line breaks.
+- 55-70 words.
+- Do not start with the company name.
+- Do not say "this filing" or "this document".
 
-COMPLETENESS RULES — CRITICAL:
-- Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
-- Never truncate numbers. Write every number exactly as it appears in the source.
-- Never end on a month name, date, preposition, conjunction, article, or noun that starts a new thought.
-- The last sentence MUST be a complete standalone sentence ending with a full stop.
-- The final character of your response MUST be a full stop.
-
-WHAT TO INCLUDE BY TYPE:
+WHAT TO EXTRACT BY TYPE:
 - Earnings: revenue, net income, EPS, year-over-year change, guidance.
 - Leadership change: who left, their role, replacement name, effective date.
 - Acquisition: both companies, deal value, strategic reason, expected close.
-- Government grant: exact dollar amount, awarding body, purpose, company benefit.
-- Clinical trial: drug name, phase, result, patient count, commercial significance.
-- Exploration update: project name, location, milestone, timeline, investor impact.
-- Regulatory/legal: what changed, who it affects, financial exposure or benefit.
-- Annual meeting: what was voted on, key outcomes, what it means for shareholders.
+- Government grant: exact dollar amount, awarding body, purpose.
+- Clinical trial: drug name, phase, result, patient count.
+- Annual meeting: key votes, outcomes, directors elected.
+- Regulatory/legal: what changed, who it affects, financial exposure.
 
-INVESTOR SIGNIFICANCE: The last sentence must explain why this matters to investors or what it signals for the stock.
+IMPORTANT: Write 2-3 sentences of facts, then end with one sentence explaining why this matters to investors.
 
-Document to summarize:
+Document:
 {raw_text[:8000]}
 
-Return ONLY the summary paragraph. Nothing else."""
-    return call_llm(prompt, max_tokens=1500)
+Return ONLY the summary. Nothing else."""
+    return call_llm(prompt, max_tokens=800)
 
 def summarise_form4(company_name, raw_text):
-    prompt = f"""Your task is to summarize an SEC Form 4 insider transaction filing for the company: {company_name}.
+    prompt = f"""Summarize this SEC Form 4 insider transaction for {company_name} in 55-70 words.
 
-Form 4 is filed when a company executive, director, or major shareholder buys or sells company stock. Your summary must clearly tell investors exactly what transaction occurred.
+Extract: insider full name, exact title, bought or sold, exact share count, price per share, total dollar value, date, shares owned after.
 
-CONTENT RULES:
-1. Include ONLY the transaction details from the filing.
-2. Ensure all figures are exactly as stated in the filing — never round or approximate.
-3. Do not add interpretations or opinions.
-4. Verify all names, titles, share counts, and prices against the source before returning.
+End with one sentence on what this signals for investors.
 
-FORMAT:
-- Write as a single paragraph, no line breaks.
-- Strictly 55-70 words.
-- Do not mention word count.
-- Neutral, objective, professional tone.
-- The final character MUST be a full stop.
+Single paragraph. No line breaks. Final character must be a full stop.
 
-COMPLETENESS RULES — CRITICAL:
-- Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
-- Never end on a month name, date, preposition, conjunction, or article.
-- The last sentence MUST be a complete standalone sentence ending with a full stop.
-- The final character MUST be a full stop.
-
-REQUIRED INFORMATION — extract all that are present:
-- Insider's full name
-- Insider's exact title or role (CEO, CFO, Director, VP, etc.)
-- Transaction type: purchased or sold
-- Exact number of shares
-- Price per share (if disclosed)
-- Total dollar value of the transaction
-- Date of the transaction
-- Total shares owned after the transaction
-- Type of security (Common Stock, Options, etc.)
-
-INVESTOR SIGNIFICANCE: The last sentence must state what this transaction signals — insider buying generally signals confidence in the company, insider selling may reflect personal financial planning or profit-taking.
-
-EXAMPLE OF A GOOD FORM 4 SUMMARY:
-"John Smith, Chief Financial Officer, purchased 5,000 shares of Common Stock at $42.30 per share on June 5, 2026, for a total investment of $211,500. Following this transaction, Smith now directly owns 47,320 shares. Insider buying at this level typically signals management confidence in the company's near-term financial outlook."
-
-Form 4 filing data:
+Form 4 data:
 {raw_text[:8000]}
 
-Return ONLY the summary paragraph. Nothing else."""
-    return call_llm(prompt, max_tokens=1500)
+Return ONLY the summary."""
+    return call_llm(prompt, max_tokens=800)
 
 def summarise_news(company_name, raw_text):
-    prompt = f"""Your task is to summarize the provided news article specifically focusing on: {company_name}.
+    prompt = f"""Summarize this news article focusing on {company_name} in 55-70 words.
 
-CONTENT SCOPE:
-1. Include ONLY details from the article directly relevant to {company_name}.
-2. Completely exclude any information unrelated to {company_name}.
-3. If an analyst, firm, or person's name is mentioned in connection with {company_name}, include it.
-4. Ensure the summary contains only factual information explicitly stated in the article.
-5. Do not add interpretations, opinions, or recommendations.
-6. After writing, verify accuracy against the original article.
+Include only facts directly relevant to {company_name}. Include analyst names and firms if mentioned. Include specific figures — prices, percentages, targets.
 
-FORMAT:
-- Write as a single paragraph, no line breaks.
-- Strictly 55-70 words.
-- Do not mention word count.
-- Do not include contact information, salutations, or address anyone.
-- Neutral, objective, professional tone.
-- Do not start with the subject name as the first word.
-- The final character MUST be a full stop.
+End with one sentence explaining why this matters to investors.
 
-COMPLETENESS RULES — CRITICAL:
-- Every sentence must be 100% complete. Never cut off mid-word, mid-number, or mid-phrase.
-- Never end on a month name, date, preposition, conjunction, or article.
-- The last sentence MUST be a complete standalone sentence ending with a full stop.
-- Never truncate numbers. Write every number completely as it appears in the source.
-- The final character of your response MUST be a full stop.
+Single paragraph. No line breaks. Final character must be a full stop.
 
-WHAT TO INCLUDE:
-- Specific figures: price targets, revenue numbers, percentages, share prices, deal values, index levels.
-- Named people: analysts, executives, officials — include their names and organisations.
-- Market context: how does this news affect stock prices or investor sentiment?
-- The last sentence must explain why this matters to investors or what it signals for the market.
-
-News article to summarize:
+Article:
 {raw_text[:8000]}
 
-Return ONLY the summary paragraph. Nothing else."""
-    return call_llm(prompt, max_tokens=1500)
+Return ONLY the summary."""
+    return call_llm(prompt, max_tokens=800)
 
 def summarise(company_name, raw_text, filing_type=""):
     if filing_type == "NEWS":
@@ -260,46 +198,6 @@ def summarise(company_name, raw_text, filing_type=""):
         return summarise_form4(company_name, raw_text)
     else:
         return summarise_announcement(company_name, raw_text)
-
-def expand_summary(summary, company_name, raw_text):
-    prompt = f"""You are a financial editor. The summary below about {company_name} is INCOMPLETE.
-
-Problems it may have:
-- Ends mid-sentence, mid-phrase, or mid-thought
-- Ends on a month name, date, preposition, conjunction, article, or noun that starts a new thought
-- Missing the investor significance sentence
-- Too short — under 55 words
-- Cuts off mid-number
-
-YOUR JOB: Rewrite it as a complete, polished 55-70 word single paragraph summary.
-
-STRICT RULES:
-1. Keep all original facts and numbers exactly as written.
-2. Complete any cut-off sentence using details from the source text below.
-3. Add an investor significance sentence at the end if missing.
-4. The final character MUST be a full stop.
-5. Never truncate any number.
-6. Never end on a month name, date, preposition, conjunction, article, or noun that starts a new thought.
-7. Do not say "this filing" or "this article".
-8. Return only the completed summary — no preamble, no labels.
-
-For Form 4 insider trades the summary must include:
-- Full name and title
-- Bought or sold
-- Share count and price per share
-- Total dollar value
-- Shares owned after transaction
-- What this signals for investors
-
-Current summary (incomplete):
-{summary}
-
-Source text:
-{raw_text[:4000]}
-
-Return ONLY the fixed complete summary. Last character MUST be a full stop."""
-    result = call_llm(prompt, max_tokens=2000)
-    return result
 
 def get_recent_summaries(ticker, limit=10):
     try:
@@ -382,7 +280,7 @@ def process_filing(filing):
     else:
         print(f"[SKIP] Relevance check")
 
-    # ── Step 3: Summarisation ─────────────────────────────────
+    # ── Step 3: Pass 1 — Generate summary ────────────────────
     if filing_type == "NEWS" and company_name in ("MARKET", "SPY", "QQQ", "DIA", "UNKNOWN"):
         summarise_name = "the US stock market and major indices"
     else:
@@ -393,23 +291,18 @@ def process_filing(filing):
         print(f"[DISCARDED] Summarisation failed — {ticker}")
         update_filing_status(filing_id, "DISCARDED")
         return
-    word_count = len(summary.split())
-    print(f"[SUMMARY] {word_count} words — {summary[:100]}...")
+    print(f"[PASS 1] {len(summary.split())} words — {summary[:80]}...")
 
-    # ── Step 4: Completeness check ───────────────────────────
-    if not is_complete_summary(summary):
-        print(f"[INCOMPLETE] {word_count} words — expanding...")
-        expanded = expand_summary(summary, summarise_name, raw_text)
-        if expanded and expanded.strip().endswith((".", "!", "?")):
-            summary = expanded
-            print(f"[EXPANDED] {len(summary.split())} words — {summary[:100]}...")
-        else:
-            print(f"[WARNING] Expansion failed — keeping original")
+    # ── Step 4: Pass 2 — Force complete ──────────────────────
+    # Runs on EVERY summary — not just incomplete ones
+    completed = force_complete_summary(summary, summarise_name, raw_text)
+    if completed and is_complete_summary(completed):
+        summary = completed
+        print(f"[PASS 2] {len(summary.split())} words — complete ✅")
+    elif is_complete_summary(summary):
+        print(f"[PASS 2] Kept Pass 1 — {len(summary.split())} words ✅")
     else:
-        print(f"[COMPLETE] {word_count} words ✅")
-
-    if not summary or len(summary.strip()) < 10:
-        print(f"[DISCARDED] Summary unusable — {ticker}")
+        print(f"[DISCARDED] Both passes failed — {ticker}")
         update_filing_status(filing_id, "DISCARDED")
         return
 
