@@ -17,6 +17,7 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 EODHD_API_KEY = os.getenv("EODHD_API_KEY")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 from edgar_poller import poll_sec_8k, poll_sec_form4, load_cik_map
 from news_poller import poll_all_news
@@ -60,7 +61,7 @@ def get_index_price(symbol: str, name: str):
     except:
         return None
 
-# ── Alert formatter ───────────────────────────────────────────────────────────
+# ── Format alert text ─────────────────────────────────────────────────────────
 def format_alert(alert):
     ticker = alert.get("ticker", "UNKNOWN")
     summary = alert.get("summary", "")
@@ -107,7 +108,6 @@ def format_alert(alert):
         f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
     )
 
-    # Form 4 insider trade
     if filing_type == "4":
         insider = extra.get("insider_name", "An insider")
         return (
@@ -120,7 +120,6 @@ def format_alert(alert):
             f"{footer}"
         )
 
-    # S-1 IPO
     if filing_type == "S-1":
         return (
             f"{price_line}\n"
@@ -131,7 +130,6 @@ def format_alert(alert):
             f"{footer}"
         )
 
-    # News article
     if filing_type == "NEWS":
         ticker_display = f"${ticker}" if ticker not in ("MARKET", "SPY", "QQQ", "DIA") else "Market Update"
         return (
@@ -143,7 +141,6 @@ def format_alert(alert):
             f"{footer}"
         )
 
-    # Default 8-K
     item_types = extra.get("item_types", [])
     items_str = ""
     if item_types:
@@ -158,6 +155,31 @@ def format_alert(alert):
         f"{source_link}"
         f"{footer}"
     )
+
+# ── Slack delivery ────────────────────────────────────────────────────────────
+def send_slack_message(text: str):
+    if not SLACK_WEBHOOK_URL:
+        return False
+    try:
+        # Convert Telegram markdown to Slack mrkdwn
+        slack_text = text
+        # Bold: *text* stays as is in Slack
+        # Strip underscores used for italic in Telegram
+        slack_text = slack_text.replace("_", "")
+        r = requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": slack_text},
+            timeout=10
+        )
+        if r.status_code == 200:
+            print("[SLACK] Message sent ✅")
+            return True
+        else:
+            print(f"[SLACK] Failed: {r.status_code} {r.text}")
+            return False
+    except Exception as e:
+        print(f"[SLACK] Error: {e}")
+        return False
 
 def get_feedback_keyboard(alert_id: str):
     keyboard = [[
@@ -206,6 +228,8 @@ async def send_error_alert(message: str):
         )
     except:
         pass
+    # Also send to Slack
+    send_slack_message(f"⚠️ GQ FinXray US — System Alert\n\n{message}")
 
 # ── Feedback callback ─────────────────────────────────────────────────────────
 async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,12 +289,17 @@ async def deliver_pending_alerts():
                 continue
 
             if ticker == "MARKET":
-                if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
-                    try:
-                        await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
-                        print(f"[CHANNEL] {impact} market alert posted")
-                    except Exception as e:
-                        print(f"[ERROR] Channel post failed: {e}")
+                if impact in ("HIGH", "MEDIUM"):
+                    msg = format_alert(alert)
+                    # Try Telegram
+                    if TELEGRAM_CHANNEL_ID:
+                        try:
+                            await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
+                            print(f"[CHANNEL] {impact} market alert posted — Telegram")
+                        except Exception as e:
+                            print(f"[TELEGRAM] Channel post failed: {e}")
+                    # Always try Slack
+                    send_slack_message(msg)
                 supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
                 continue
 
@@ -306,12 +335,18 @@ async def deliver_pending_alerts():
                     except Exception as e:
                         print(f"[ERROR] Failed to deliver to {chat_id}: {e}")
 
-            if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
-                try:
-                    await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
-                    print(f"[CHANNEL] {impact} alert posted — ${ticker}")
-                except Exception as e:
-                    print(f"[ERROR] Channel post failed: {e}")
+            # Post HIGH and MEDIUM to Telegram channel + Slack
+            if impact in ("HIGH", "MEDIUM"):
+                msg = format_alert(alert)
+                if TELEGRAM_CHANNEL_ID:
+                    try:
+                        await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
+                        print(f"[CHANNEL] {impact} alert posted — Telegram — ${ticker}")
+                    except Exception as e:
+                        print(f"[TELEGRAM] Channel post failed: {e}")
+                # Always send to Slack
+                send_slack_message(msg)
+                print(f"[SLACK] {impact} alert posted — ${ticker}")
 
             supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
             if delivered_to:
@@ -377,29 +412,31 @@ async def send_market_report(title: str, body: str):
         print(f"[REPORT] Sent: {title}")
     except Exception as e:
         print(f"[ERROR] Failed to send market report: {e}")
+    # Also send to Slack
+    send_slack_message(f"📊 {title}\n\n{body}\n\nGQ FinXray US · gquants.com")
 
 def send_premarket_report():
-    body = f"*US Futures & Pre-Market Snapshot*\n\n{fetch_index_data()}\n\n*Macro*\n{fetch_macro_data()}"
+    body = f"US Futures & Pre-Market Snapshot\n\n{fetch_index_data()}\n\nMacro\n{fetch_macro_data()}"
     asyncio.run(send_market_report("🌅 Pre-Market Report", body))
 
 def send_market_open_report():
     gainers, losers = fetch_top_movers()
-    body = f"*Markets are now open.*\n\n*Indices at Open*\n{fetch_index_data()}\n\n*Early Gainers*\n{gainers}\n\n*Early Losers*\n{losers}"
+    body = f"Markets are now open.\n\nIndices at Open\n{fetch_index_data()}\n\nEarly Gainers\n{gainers}\n\nEarly Losers\n{losers}"
     asyncio.run(send_market_report("🔔 Market Open", body))
 
 def send_midday_report():
     gainers, losers = fetch_top_movers()
-    body = f"*Midday Market Check*\n\n*Indices*\n{fetch_index_data()}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}"
+    body = f"Midday Market Check\n\nIndices\n{fetch_index_data()}\n\nTop Gainers\n{gainers}\n\nTop Losers\n{losers}"
     asyncio.run(send_market_report("⏱ Midday Pulse", body))
 
 def send_market_close_report():
     gainers, losers = fetch_top_movers()
-    body = f"*Markets have closed.*\n\n*Final Index Levels*\n{fetch_index_data()}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}\n\n*Macro*\n{fetch_macro_data()}"
+    body = f"Markets have closed.\n\nFinal Index Levels\n{fetch_index_data()}\n\nTop Gainers\n{gainers}\n\nTop Losers\n{losers}\n\nMacro\n{fetch_macro_data()}"
     asyncio.run(send_market_report("📉 Market Close Report", body))
 
 def send_afterhours_report():
     gainers, losers = fetch_top_movers()
-    body = f"*After-Hours Notable Movers*\n\n*Gainers*\n{gainers}\n\n*Losers*\n{losers}"
+    body = f"After-Hours Notable Movers\n\nGainers\n{gainers}\n\nLosers\n{losers}"
     asyncio.run(send_market_report("🌙 After-Hours Movers", body))
 
 # ── Threads ───────────────────────────────────────────────────────────────────
