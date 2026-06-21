@@ -18,9 +18,12 @@ HEADERS = {
 
 CIK_MAP = {}
 
-EDGAR_8K_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_8K_URL   = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&search_text=&output=atom"
 EDGAR_FORM4_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=40&search_text=&output=atom"
-EDGAR_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
+EDGAR_10Q_URL  = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-Q&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_10K_URL  = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-K&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_S1_URL   = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-1&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_CIK_URL  = "https://www.sec.gov/files/company_tickers.json"
 
 def load_cik_map():
     global CIK_MAP
@@ -53,7 +56,6 @@ def get_ticker_from_cik(cik: str) -> str:
     return "UNKNOWN"
 
 def clean_html_text(html: str) -> str:
-    """Strip HTML/XML tags and clean text for AI processing."""
     text = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<[^>]+>', ' ', text)
@@ -69,13 +71,6 @@ def clean_html_text(html: str) -> str:
     return text
 
 def fetch_filing_text(index_url: str) -> str:
-    """
-    Fetch actual 8-K document text from SEC EDGAR.
-    Strategy:
-    1. Try JSON index to find primary .htm document
-    2. Fallback to .txt submission file, extract content after <TEXT> tag
-    3. Fallback to RSS title + summary
-    """
     try:
         acc_match = re.search(r'(\d{10}-\d{2}-\d{6})', index_url)
         if not acc_match:
@@ -88,15 +83,12 @@ def fetch_filing_text(index_url: str) -> str:
             return ""
         cik = cik_match.group(1)
 
-        # ── Strategy 1: JSON index → primary document ──────────
         index_json_url = f"https://data.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{accession}-index.json"
         r = requests.get(index_json_url, headers=HEADERS, timeout=15)
 
         primary_doc = None
         if r.status_code == 200:
             files = r.json().get("directory", {}).get("item", [])
-
-            # First pass: look for typed 8-K/S-1 document
             for f in files:
                 name = f.get("name", "").lower()
                 doc_type = f.get("type", "")
@@ -105,16 +97,12 @@ def fetch_filing_text(index_url: str) -> str:
                 if (name.endswith(".htm") or name.endswith(".html")) and doc_type in ("8-K", "S-1", "10-Q", "10-K"):
                     primary_doc = f.get("name", "")
                     break
-
-            # Second pass: any non-index htm
             if not primary_doc:
                 for f in files:
                     name = f.get("name", "").lower()
                     if (name.endswith(".htm") or name.endswith(".html")) and "index" not in name:
                         primary_doc = f.get("name", "")
                         break
-
-            # Third pass: exhibit 99 press release
             if not primary_doc:
                 for f in files:
                     name = f.get("name", "").lower()
@@ -130,69 +118,51 @@ def fetch_filing_text(index_url: str) -> str:
                 if len(text) > 300:
                     return text[:6000]
 
-        # ── Strategy 2: .txt submission file → extract after <TEXT> ──
         txt_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{accession}.txt"
         r3 = requests.get(txt_url, headers=HEADERS, timeout=15)
         if r3.status_code == 200:
             raw = r3.text
-
-            # Find the actual document content — skip SEC header
-            # The <TEXT> tag marks the start of real content
             text_tag_pos = raw.find("<TEXT>")
             if text_tag_pos != -1:
                 raw = raw[text_tag_pos + 6:]
-                # Remove the closing tags
                 end_pos = raw.find("</TEXT>")
                 if end_pos != -1:
                     raw = raw[:end_pos]
             elif "</SEC-HEADER>" in raw:
                 raw = raw[raw.find("</SEC-HEADER>") + 13:]
-
             text = clean_html_text(raw)
-            # Remove SGML document tags
             text = re.sub(r'<[A-Z][A-Z\-]*>', ' ', text)
             text = re.sub(r'</[A-Z][A-Z\-]*>', ' ', text)
             text = re.sub(r'\s+', ' ', text).strip()
-
             if len(text) > 300:
                 return text[:6000]
 
         return ""
-
     except Exception as e:
         return ""
 
 def fetch_form4_text(index_url: str, company_name: str, insider_name: str) -> str:
-    """Fetch and parse Form 4 XML from .txt submission file."""
     try:
         acc_match = re.search(r'(\d{10}-\d{2}-\d{6})', index_url)
         if not acc_match:
             return ""
         accession = acc_match.group(1)
-
         cik_match = re.search(r'/data/(\d+)/', index_url)
         if not cik_match:
             return ""
         cik = cik_match.group(1)
-
         acc_nodash = accession.replace("-", "")
         txt_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}.txt"
         r = requests.get(txt_url, headers=HEADERS, timeout=15)
-
         if r.status_code != 200:
             return ""
-
         content = r.text
         xml_start = content.find("<ownershipDocument>")
         xml_end = content.find("</ownershipDocument>")
-
         if xml_start == -1 or xml_end == -1:
             return ""
-
         xml_text = content[xml_start:xml_end + len("</ownershipDocument>")]
         root = ET.fromstring(xml_text)
-
-        # Extract issuer
         issuer_name = company_name
         issuer_ticker = ""
         issuer_elem = root.find(".//issuer")
@@ -203,8 +173,6 @@ def fetch_form4_text(index_url: str, company_name: str, insider_name: str) -> st
                 issuer_name = name_elem.text.strip()
             if tick_elem is not None and tick_elem.text:
                 issuer_ticker = tick_elem.text.strip()
-
-        # Extract reporter
         reporter_name = insider_name
         reporter_title = ""
         reporting_owner = root.find(".//reportingOwner")
@@ -222,10 +190,7 @@ def fetch_form4_text(index_url: str, company_name: str, insider_name: str) -> st
                     reporter_title = "Director"
                 elif is_ten_pct is not None and is_ten_pct.text == "1":
                     reporter_title = "10% Owner"
-
-        # Extract transactions
         transactions = []
-
         for trans in root.findall(".//nonDerivativeTransaction"):
             security = trans.find(".//securityTitle/value")
             trans_date = trans.find(".//transactionDate/value")
@@ -234,7 +199,6 @@ def fetch_form4_text(index_url: str, company_name: str, insider_name: str) -> st
             price = trans.find(".//transactionPricePerShare/value")
             shares_owned = trans.find(".//sharesOwnedFollowingTransaction/value")
             acquired_disposed = trans.find(".//transactionAcquiredDisposedCode/value")
-
             if shares is not None and trans_code is not None:
                 direction = acquired_disposed.text.strip() if acquired_disposed is not None and acquired_disposed.text else ""
                 action = "purchased" if direction == "A" else "sold" if direction == "D" else "transacted"
@@ -245,14 +209,9 @@ def fetch_form4_text(index_url: str, company_name: str, insider_name: str) -> st
                     owned_after = float(shares_owned.text.replace(",", "")) if shares_owned is not None and shares_owned.text else 0
                     date_str = trans_date.text.strip() if trans_date is not None and trans_date.text else ""
                     security_name = security.text.strip() if security is not None and security.text else "Common Stock"
-                    transactions.append({
-                        "action": action, "shares": share_count, "price": price_val,
-                        "total": total_val, "owned_after": owned_after,
-                        "date": date_str, "security": security_name,
-                    })
+                    transactions.append({"action": action, "shares": share_count, "price": price_val, "total": total_val, "owned_after": owned_after, "date": date_str, "security": security_name})
                 except:
                     pass
-
         for trans in root.findall(".//derivativeTransaction"):
             security = trans.find(".//securityTitle/value")
             trans_date = trans.find(".//transactionDate/value")
@@ -268,23 +227,12 @@ def fetch_form4_text(index_url: str, company_name: str, insider_name: str) -> st
                     total_val = share_count * price_val if price_val > 0 else 0
                     date_str = trans_date.text.strip() if trans_date is not None and trans_date.text else ""
                     security_name = security.text.strip() if security is not None and security.text else "Derivative Security"
-                    transactions.append({
-                        "action": action, "shares": share_count, "price": price_val,
-                        "total": total_val, "owned_after": 0,
-                        "date": date_str, "security": security_name,
-                    })
+                    transactions.append({"action": action, "shares": share_count, "price": price_val, "total": total_val, "owned_after": 0, "date": date_str, "security": security_name})
                 except:
                     pass
-
         if not transactions:
             return f"{issuer_name} insider {reporter_name} ({reporter_title}) filed Form 4 disclosing changes in ownership of {issuer_name} shares."
-
-        lines = [
-            f"Company: {issuer_name} ({issuer_ticker})",
-            f"Insider: {reporter_name}, {reporter_title or 'Insider'}",
-            f"Filing: Form 4 — Insider Transaction Report",
-            ""
-        ]
+        lines = [f"Company: {issuer_name} ({issuer_ticker})", f"Insider: {reporter_name}, {reporter_title or 'Insider'}", f"Filing: Form 4 – Insider Transaction Report", ""]
         for t in transactions:
             share_str = f"{t['shares']:,.0f} shares"
             price_str = f"at ${t['price']:.2f} per share" if t['price'] > 0 else "at undisclosed price"
@@ -294,9 +242,7 @@ def fetch_form4_text(index_url: str, company_name: str, insider_name: str) -> st
             lines.append(f"{reporter_name} {t['action']} {share_str} of {t['security']} {price_str} {total_str} {date_str}.")
             if owned_str:
                 lines.append(owned_str)
-
         return "\n".join(lines)
-
     except Exception as e:
         print(f"[FORM4] Parse error: {e}")
         return f"{company_name} insider {insider_name} filed Form 4 disclosing changes in ownership."
@@ -321,14 +267,16 @@ def store_filing(filing_type, company_name, ticker, raw_text, filing_url, extra=
             "status": "PENDING",
             "extra": extra or {}
         }).execute()
-        print(f"[STORED] {filing_type} — {company_name} ({ticker}) → PENDING")
+        print(f"[STORED] {filing_type} – {company_name} ({ticker}) → PENDING")
     except Exception as e:
         print(f"[ERROR] Failed to store filing: {e}")
 
-def poll_sec_8k():
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling SEC EDGAR for 8-K...")
+# ── Generic EDGAR poller ──────────────────────────────────────────────────────
+def poll_edgar_generic(url, form_type, label):
+    """Generic EDGAR RSS poller — works for 8-K, 10-Q, 10-K, S-1."""
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling SEC EDGAR for {label}...")
     try:
-        r = requests.get(EDGAR_8K_URL, headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
             print(f"[ERROR] SEC EDGAR returned {r.status_code}")
             return
@@ -340,7 +288,7 @@ def poll_sec_8k():
         new_count = 0
         for entry in entries:
             title_elem = entry.find("atom:title", ns)
-            link_elem = entry.find("atom:link", ns)
+            link_elem  = entry.find("atom:link", ns)
             summary_elem = entry.find("atom:summary", ns)
 
             if title_elem is None or link_elem is None:
@@ -353,35 +301,51 @@ def poll_sec_8k():
             if not filing_url or filing_exists(filing_url):
                 continue
 
-            company_match = re.match(r'8-K\s*-\s*(.+?)\s*\((\d+)\)', title)
+            pattern = rf'{re.escape(form_type)}\s*-\s*(.+?)\s*\((\d+)\)'
+            company_match = re.match(pattern, title)
             company_name = company_match.group(1).strip() if company_match else title
             cik = company_match.group(2) if company_match else ""
             ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
-            item_types = re.findall(r'Item \d+\.\d+[^,<\n]*', summary_text)
 
             filing_text = fetch_filing_text(filing_url)
             if not filing_text or len(filing_text) < 100:
-                # Last resort fallback — use RSS content
                 filing_text = f"{company_name}\n\n{title}\n\n{summary_text}"
 
+            # Tag 10-Q and 10-K for Result Snapshot processing
+            extra = {"cik": cik, "form_type": form_type}
+            if form_type in ("10-Q", "10-K"):
+                extra["needs_result_snapshot"] = True
+
             store_filing(
-                filing_type="8-K",
+                filing_type=form_type,
                 company_name=company_name,
                 ticker=ticker,
                 raw_text=filing_text,
                 filing_url=filing_url,
-                extra={"item_types": item_types, "cik": cik}
+                extra=extra
             )
             new_count += 1
             time.sleep(0.3)
 
         if new_count == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new 8-K filings.")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new {label} filings.")
         else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new 8-K filings.")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new {label} filings.")
 
     except Exception as e:
-        print(f"[ERROR] 8-K poll failed: {e}")
+        print(f"[ERROR] {label} poll failed: {e}")
+
+def poll_sec_8k():
+    poll_edgar_generic(EDGAR_8K_URL, "8-K", "8-K")
+
+def poll_sec_10q():
+    poll_edgar_generic(EDGAR_10Q_URL, "10-Q", "10-Q (Quarterly Results)")
+
+def poll_sec_10k():
+    poll_edgar_generic(EDGAR_10K_URL, "10-K", "10-K (Annual Results)")
+
+def poll_sec_s1():
+    poll_edgar_generic(EDGAR_S1_URL, "S-1", "S-1 (IPO Filing)")
 
 def poll_sec_form4():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling SEC EDGAR for Form 4...")
@@ -398,7 +362,7 @@ def poll_sec_form4():
         accession_map = {}
         for entry in entries:
             title_elem = entry.find("atom:title", ns)
-            link_elem = entry.find("atom:link", ns)
+            link_elem  = entry.find("atom:link", ns)
             if title_elem is None or link_elem is None:
                 continue
             title = title_elem.text or ""
@@ -470,4 +434,7 @@ if __name__ == "__main__":
     while True:
         poll_sec_8k()
         poll_sec_form4()
+        poll_sec_10q()
+        poll_sec_10k()
+        poll_sec_s1()
         time.sleep(30)

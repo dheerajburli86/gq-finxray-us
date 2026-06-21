@@ -6,9 +6,7 @@ import schedule
 import requests
 from dotenv import load_dotenv
 from supabase import create_client
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
-from telegram import Update
+from telegram import Bot
 from datetime import datetime
 
 load_dotenv()
@@ -16,129 +14,180 @@ load_dotenv()
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-EODHD_API_KEY = os.getenv("EODHD_API_KEY")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
-from edgar_poller import poll_sec_8k, poll_sec_form4, load_cik_map
+from edgar_poller import poll_sec_8k, poll_sec_form4, poll_sec_10q, poll_sec_10k, poll_sec_s1, load_cik_map
 from news_poller import poll_all_news
+from eodhd_poller import poll_eodhd_news, poll_eodhd_events
+from result_snapshot import process_pending_snapshots
+from eodhd_technical_poller import run_technical_poller
+from eodhd_ipo_poller import run_ipo_poller
+from news_roundup import run_morning_roundup, run_evening_roundup, run_etf_xray
 
-# ── EODHD price fetch ─────────────────────────────────────────────────────────
+# ── TwelveData price fetch ────────────────────────────────────────────────────
 def get_stock_price(ticker: str):
+    """Fetch live price and % change for a ticker from TwelveData."""
     try:
-        url = f"https://eodhd.com/api/real-time/{ticker}.US"
-        params = {"api_token": EODHD_API_KEY, "fmt": "json"}
-        r = requests.get(url, params=params, timeout=10)
+        url = f"https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVEDATA_API_KEY}"
+        r = requests.get(url, timeout=10)
         data = r.json()
-        if "close" not in data:
+        if data.get("status") == "error" or "close" not in data:
             return None
         price = float(data.get("close", 0))
-        prev_close = float(data.get("previousClose", price))
-        change = price - prev_close
-        change_pct = (change / prev_close * 100) if prev_close else 0
+        change_pct = float(data.get("percent_change", 0))
+        arrow = "🟢" if change_pct >= 0 else "🔴"
         sign = "+" if change_pct >= 0 else ""
         return {
             "price": f"${price:,.2f}",
             "change": f"{sign}{change_pct:.2f}%",
-            "name": data.get("name", ticker)
+            "arrow": arrow
         }
     except Exception as e:
-        print(f"[EODHD] Price fetch failed for {ticker}: {e}")
+        print(f"[TWELVEDATA] Price fetch failed for {ticker}: {e}")
         return None
 
-def get_index_price(symbol: str, name: str):
-    try:
-        url = f"https://eodhd.com/api/real-time/{symbol}.US"
-        params = {"api_token": EODHD_API_KEY, "fmt": "json"}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if "close" not in data:
-            return None
-        price = float(data.get("close", 0))
-        prev_close = float(data.get("previousClose", price))
-        change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
-        sign = "+" if change_pct >= 0 else ""
-        return f"*{name}:* ${price:,.2f} ({sign}{change_pct:.2f}%)"
-    except:
-        return None
-
-# ── Format alert text ─────────────────────────────────────────────────────────
+# ── Alert formatter ───────────────────────────────────────────────────────────
 def format_alert(alert):
+    impact = alert.get("impact", "LOW")
     ticker = alert.get("ticker", "UNKNOWN")
     summary = alert.get("summary", "")
     source = alert.get("source", "SEC_EDGAR")
     filing_type = alert.get("filing_type", "")
     extra = alert.get("extra") or {}
-    filing_url = alert.get("filing_url", "")
 
+    impact_emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
     source_labels = {
         "SEC_EDGAR": "SEC EDGAR",
         "CNBC": "CNBC",
-        "BLOOMBERG": "Bloomberg",
+        "REUTERS": "Reuters",
         "MARKETWATCH": "MarketWatch",
-        "REUTERS": "Reuters"
+        "EODHD": "EODHD",
+        "EODHD_TECHNICAL": "EODHD Technical",
+        "EODHD_IPO": "EODHD IPO Calendar"
     }
 
+    emoji = impact_emoji.get(impact, "🟢")
     source_name = source_labels.get(source, source)
     time_str = datetime.now().strftime("%I:%M %p EST")
 
-    # Live price
+    # Fetch live price from TwelveData (skip MARKET ticker)
     price_line = ""
-    price_ticker = "SPY" if ticker == "MARKET" else ticker
-    if price_ticker and price_ticker != "UNKNOWN":
-        price_data = get_stock_price(price_ticker)
+    if ticker and ticker != "MARKET":
+        price_data = get_stock_price(ticker)
         if price_data:
-            company_display = price_data.get("name", ticker)
-            if ticker == "MARKET":
-                price_line = f"📈 *Stock:* S&P 500   {price_data['price']} ({price_data['change']})\n"
-            else:
-                price_line = f"📈 *Stock:* {company_display}   {price_data['price']} ({price_data['change']})\n"
+            price_line = f"\n📈 *Stock:* {ticker} {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
 
-    # Source link
-    source_link = ""
-    if filing_url:
-        if source == "SEC_EDGAR":
-            source_link = f"🔗 *Full Story (SEC EDGAR):* [View Filing]({filing_url})"
-        else:
-            source_link = f"🔗 *Full Story ({source_name}):* [Read Article]({filing_url})"
+    if filing_type == "EARNINGS_CALENDAR":
+        report_date = extra.get("report_date", "")
+        timing_str = extra.get("timing", "")
+        eps = extra.get("eps_estimate")
+        eps_line = f"Analyst EPS Estimate: {eps}" if eps else "No EPS estimate available"
+        return (
+            f"📅 *Earnings Tomorrow — *"
+            f"{price_line}
+"
+            f"🕐 *When:* {timing_str} on {report_date}
+"
+            f"📊 {eps_line}
 
-    footer = (
-        f"\n_You are receiving this notification based on your request to "
-        f"monitor this stock's news, updates and transactions._\n"
-        f"_Disclaimer: gquants.com/disclaimer_\n\n"
-        f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-    )
+"
+            f"Watch for potential volatility.
+
+"
+            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._
+"
+            f"_Disclaimer: gquants.com/disclaimer_
+
+"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+        )
+
+    if filing_type == "RESULT_SNAPSHOT":
+        metrics = extra.get("metrics", {}) if extra else {}
+        period = extra.get("period", "") if extra else ""
+        form = extra.get("form_type", "") if extra else ""
+        form_label = "Quarterly Results" if form == "10-Q" else "Annual Results"
+        return (
+            f"📊 *{form_label} — ${ticker}*"
+            f"{price_line}\n"
+            f"📅 *Period:* {period}\n\n"
+            f"{summary}\n\n"
+            f"📋 SEC {form} · {time_str}\n\n"
+            f"_You are receiving this notification based on your request to monitor this stock\'s news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+        )
+
+    if filing_type == "BULK_DEAL":
+        insider = extra.get("insider_name", "Large investor") if extra else "Large investor"
+        action = extra.get("transaction_type", "TRADE") if extra else "TRADE"
+        value = extra.get("value", "N/A") if extra else "N/A"
+        shares = extra.get("shares", "N/A") if extra else "N/A"
+        trans_emoji = "🟢" if action == "BUY" else "🔴"
+        return (
+            f"{trans_emoji} *LARGE TRANSACTION — ${ticker}*"
+            f"{price_line}\n"
+            f"{summary}\n\n"
+            f"💰 Value: {value} · Shares: {shares}\n"
+            f"👤 {insider}\n"
+            f"📋 EODHD Insider Data · {time_str}\n\n"
+            f"_You are receiving this notification based on your request to monitor this stock\'s news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+        )
 
     if filing_type == "4":
         insider = extra.get("insider_name", "An insider")
+        transaction = extra.get("transaction_type", "")
+        trans_emoji = "🟢" if transaction == "BUY" else "🔴" if transaction == "SELL" else "📋"
         return (
+            f"{trans_emoji} *INSIDER {transaction or 'TRADE'} — ${ticker}*"
             f"{price_line}\n"
-            f"📋 *News Flash: Insider Transaction — ${ticker}*\n\n"
             f"{summary}\n\n"
             f"👤 {insider}\n"
             f"📋 SEC Form 4 · {time_str}\n\n"
-            f"{source_link}"
-            f"{footer}"
+            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
         )
 
     if filing_type == "S-1":
         return (
+            f"🚀 *IPO FILING — ${ticker}*"
             f"{price_line}\n"
-            f"🚀 *News Flash: IPO Filing — ${ticker}*\n\n"
             f"{summary}\n\n"
             f"📋 SEC S-1 · {time_str}\n\n"
-            f"{source_link}"
-            f"{footer}"
+            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
         )
 
     if filing_type == "NEWS":
-        ticker_display = f"${ticker}" if ticker not in ("MARKET", "SPY", "QQQ", "DIA") else "Market Update"
         return (
+            f"{emoji} *{source_name} — ${ticker}*"
             f"{price_line}\n"
-            f"📰 *News Flash: {source_name} — {ticker_display}*\n\n"
-            f"{summary}\n\n"
+            f"🔍 *Xray Intel:* {summary}\n\n"
             f"📰 {source_name} · {time_str}\n\n"
-            f"{source_link}"
-            f"{footer}"
+            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+        )
+
+    if source == "EODHD_TECHNICAL":
+        return (
+            f"{summary}\n\n"
+            f"{price_line}"
+            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+        )
+
+    if source == "EODHD_IPO":
+        return (
+            f"{summary}\n\n"
+            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
         )
 
     item_types = extra.get("item_types", [])
@@ -148,120 +197,26 @@ def format_alert(alert):
         items_str = f" · {first_item}"
 
     return (
+        f"{emoji} *{impact} — ${ticker}*"
         f"{price_line}\n"
-        f"📊 *News Flash: SEC Filing — ${ticker}*\n\n"
-        f"{summary}\n\n"
+        f"🔍 *Xray Intel:* {summary}\n\n"
         f"📋 {source_name}{items_str} · {time_str}\n\n"
-        f"{source_link}"
-        f"{footer}"
+        f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
+        f"_Disclaimer: gquants.com/disclaimer_\n\n"
+        f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
     )
 
-# ── Slack delivery ────────────────────────────────────────────────────────────
-def send_slack_message(text: str):
-    if not SLACK_WEBHOOK_URL:
-        return False
-    try:
-        # Convert Telegram markdown to Slack mrkdwn
-        slack_text = text
-        # Bold: *text* stays as is in Slack
-        # Strip underscores used for italic in Telegram
-        slack_text = slack_text.replace("_", "")
-        r = requests.post(
-            SLACK_WEBHOOK_URL,
-            json={"text": slack_text},
-            timeout=10
-        )
-        if r.status_code == 200:
-            print("[SLACK] Message sent ✅")
-            return True
-        else:
-            print(f"[SLACK] Failed: {r.status_code} {r.text}")
-            return False
-    except Exception as e:
-        print(f"[SLACK] Error: {e}")
-        return False
-
-def get_feedback_keyboard(alert_id: str):
-    keyboard = [[
-        InlineKeyboardButton("✅ Useful", callback_data=f"useful_{alert_id}"),
-        InlineKeyboardButton("❌ Not Useful", callback_data=f"notuseful_{alert_id}")
-    ]]
-    return InlineKeyboardMarkup(keyboard)
-
-# ── Send Telegram message ─────────────────────────────────────────────────────
-async def send_telegram_message(bot, chat_id, alert):
-    msg = format_alert(alert)
-    extra = alert.get("extra") or {}
-    image_url = extra.get("image_url", "")
-    alert_id = str(alert.get("id", ""))
-    keyboard = get_feedback_keyboard(alert_id)
-
-    if image_url:
-        try:
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=image_url,
-                caption=msg[:1024],
-                parse_mode="Markdown",
-                reply_markup=keyboard
-            )
-            return True
-        except Exception:
-            pass
-
-    await bot.send_message(
-        chat_id=chat_id,
-        text=msg,
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-    return True
-
-# ── Error alert ───────────────────────────────────────────────────────────────
+# ── Error alerting ────────────────────────────────────────────────────────────
 async def send_error_alert(message: str):
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         await bot.send_message(
             chat_id=TELEGRAM_CHANNEL_ID,
-            text=f"⚠️ *GQ FinXray US — System Alert*\n\n{message}\n\n🕐 {datetime.now().strftime('%I:%M %p UTC')}",
+            text=f"⚠️ *GQ FinXray US — System Alert*\n\n{message}\n\n🕐 {datetime.now().strftime('%I:%M %p IST')}",
             parse_mode="Markdown"
         )
     except:
         pass
-    # Also send to Slack
-    send_slack_message(f"⚠️ GQ FinXray US — System Alert\n\n{message}")
-
-# ── Feedback callback ─────────────────────────────────────────────────────────
-async def feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    chat_id = str(query.from_user.id)
-
-    if data.startswith("useful_"):
-        alert_id = data.replace("useful_", "")
-        feedback = "useful"
-        toast = "✅ Glad it was useful!"
-    elif data.startswith("notuseful_"):
-        alert_id = data.replace("notuseful_", "")
-        feedback = "not_useful"
-        toast = "👍 Noted — we'll keep improving."
-    else:
-        await query.answer()
-        return
-
-    try:
-        supabase.table("feedback").insert({
-            "alert_id": alert_id,
-            "telegram_chat_id": chat_id,
-            "feedback": feedback,
-            "created_at": datetime.now().isoformat()
-        }).execute()
-        await query.answer(toast, show_alert=False)
-        await query.edit_message_reply_markup(reply_markup=None)
-        print(f"[FEEDBACK] {feedback} — alert {alert_id} from {chat_id}")
-    except Exception as e:
-        await query.answer()
-        print(f"[ERROR] Feedback logging failed: {e}")
 
 # ── Deliver pending alerts ────────────────────────────────────────────────────
 async def deliver_pending_alerts():
@@ -285,44 +240,56 @@ async def deliver_pending_alerts():
             impact = alert.get("impact", "LOW")
 
             if ticker == "UNKNOWN":
-                supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
+                supabase.table("alerts") \
+                    .update({"delivered": True}) \
+                    .eq("id", alert["id"]) \
+                    .execute()
                 continue
 
-            if ticker == "MARKET":
-                if impact in ("HIGH", "MEDIUM"):
-                    msg = format_alert(alert)
-                    # Try Telegram
-                    if TELEGRAM_CHANNEL_ID:
-                        try:
-                            await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
-                            print(f"[CHANNEL] {impact} market alert posted — Telegram")
-                        except Exception as e:
-                            print(f"[TELEGRAM] Channel post failed: {e}")
-                    # Always try Slack
-                    send_slack_message(msg)
-                supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
-                continue
+            # Find users subscribed to this ticker
+            watchlist_result = supabase.table("watchlists") \
+                .select("user_id") \
+                .eq("ticker", ticker) \
+                .execute()
 
-            watchlist_result = supabase.table("watchlists").select("user_id").eq("ticker", ticker).execute()
             delivered_to = []
 
             for item in watchlist_result.data:
                 user_id = item.get("user_id")
                 if not user_id:
                     continue
-                user_result = supabase.table("users").select("telegram_chat_id").eq("id", user_id).execute()
+
+                # Get user telegram chat ID
+                user_result = supabase.table("users") \
+                    .select("telegram_chat_id") \
+                    .eq("id", user_id) \
+                    .execute()
+
                 if not user_result.data:
                     continue
+
                 chat_id = user_result.data[0].get("telegram_chat_id")
                 if not chat_id:
                     continue
-                pref_result = supabase.table("user_preferences").select("min_impact").eq("user_id", user_id).execute()
+
+                # Check impact preference
+                pref_result = supabase.table("user_preferences") \
+                    .select("min_impact") \
+                    .eq("user_id", user_id) \
+                    .execute()
+
                 min_impact = "LOW"
                 if pref_result.data:
                     min_impact = pref_result.data[0].get("min_impact", "LOW")
+
                 if impact_order.get(impact, 1) >= impact_order.get(min_impact, 1):
+                    msg = format_alert(alert)
                     try:
-                        await send_telegram_message(bot, chat_id, alert)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=msg,
+                            parse_mode="Markdown"
+                        )
                         delivered_to.append(chat_id)
                         supabase.table("delivery_logs").insert({
                             "alert_id": alert["id"],
@@ -334,131 +301,222 @@ async def deliver_pending_alerts():
                         }).execute()
                     except Exception as e:
                         print(f"[ERROR] Failed to deliver to {chat_id}: {e}")
+                        supabase.table("delivery_logs").insert({
+                            "alert_id": alert["id"],
+                            "user_id": user_id,
+                            "channel": "telegram",
+                            "status": "failed",
+                            "attempts": 1
+                        }).execute()
 
-            # Post HIGH and MEDIUM to Telegram channel + Slack
-            if impact in ("HIGH", "MEDIUM"):
-                msg = format_alert(alert)
-                if TELEGRAM_CHANNEL_ID:
-                    try:
-                        await send_telegram_message(bot, TELEGRAM_CHANNEL_ID, alert)
-                        print(f"[CHANNEL] {impact} alert posted — Telegram — ${ticker}")
-                    except Exception as e:
-                        print(f"[TELEGRAM] Channel post failed: {e}")
-                # Always send to Slack
-                send_slack_message(msg)
-                print(f"[SLACK] {impact} alert posted — ${ticker}")
+            # Post HIGH and MEDIUM alerts to channel
+            if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
+                try:
+                    msg = format_alert(alert)
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        text=msg,
+                        parse_mode="Markdown"
+                    )
+                    print(f"[CHANNEL] {impact} alert posted — ${ticker}")
+                except Exception as e:
+                    print(f"[ERROR] Channel post failed: {e}")
 
-            supabase.table("alerts").update({"delivered": True}).eq("id", alert["id"]).execute()
+            # Mark delivered
+            supabase.table("alerts") \
+                .update({"delivered": True}) \
+                .eq("id", alert["id"]) \
+                .execute()
+
             if delivered_to:
                 print(f"[DELIVERED] {impact} — ${ticker} → {len(delivered_to)} users")
 
     except Exception as e:
         print(f"[ERROR] Delivery failed: {e}")
 
-# ── Market reports ────────────────────────────────────────────────────────────
+# ── Market report helpers ─────────────────────────────────────────────────────
 def fetch_index_data():
+    """Fetch S&P 500, NASDAQ, Dow from TwelveData."""
     indices = {"SPY": "S&P 500", "QQQ": "NASDAQ", "DIA": "Dow Jones"}
     lines = []
     for symbol, name in indices.items():
-        line = get_index_price(symbol, name)
-        if line:
-            lines.append(line)
-    return "\n".join(lines) if lines else "Index data unavailable"
-
-def fetch_macro_data():
-    instruments = {"GLD": "Gold ETF", "USO": "Oil ETF", "UUP": "USD Index ETF"}
-    lines = []
-    for symbol, name in instruments.items():
-        line = get_index_price(symbol, name)
-        if line:
-            lines.append(line)
-    return "\n".join(lines) if lines else "Macro data unavailable"
-
-def fetch_top_movers():
-    tickers = ["AAPL", "NVDA", "TSLA", "MSFT", "META", "AMZN", "GOOGL", "JPM", "NFLX", "AMD"]
-    results = []
-    for ticker in tickers:
         try:
-            url = f"https://eodhd.com/api/real-time/{ticker}.US"
-            params = {"api_token": EODHD_API_KEY, "fmt": "json"}
-            r = requests.get(url, params=params, timeout=10)
+            url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
+            r = requests.get(url, timeout=10)
             data = r.json()
             if "close" in data:
                 price = float(data["close"])
-                prev = float(data.get("previousClose", price))
-                chg = ((price - prev) / prev * 100) if prev else 0
-                results.append({"ticker": ticker, "change": chg, "price": price})
+                chg = float(data.get("percent_change", 0))
+                arrow = "🟢" if chg >= 0 else "🔴"
+                sign = "+" if chg >= 0 else ""
+                lines.append(f"{arrow} *{name}:* ${price:,.2f} ({sign}{chg:.2f}%)")
         except:
             pass
+    return "\n".join(lines) if lines else "Index data unavailable"
 
+def fetch_macro_data():
+    """Fetch DXY, Gold, Crude Oil from TwelveData."""
+    instruments = {"DX-Y.NYB": "DXY (Dollar)", "GC=F": "Gold", "CL=F": "Crude Oil"}
+    lines = []
+    for symbol, name in instruments.items():
+        try:
+            url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            if "close" in data:
+                price = float(data["close"])
+                chg = float(data.get("percent_change", 0))
+                arrow = "🟢" if chg >= 0 else "🔴"
+                sign = "+" if chg >= 0 else ""
+                lines.append(f"{arrow} *{name}:* ${price:,.2f} ({sign}{chg:.2f}%)")
+        except:
+            pass
+    return "\n".join(lines) if lines else "Macro data unavailable"
+
+def fetch_top_movers():
+    """Fetch top 3 gainers and losers from a default watchlist."""
+    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AMD", "JPM", "BAC"]
+    results = []
+    for ticker in tickers:
+        try:
+            url = f"https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVEDATA_API_KEY}"
+            r = requests.get(url, timeout=10)
+            data = r.json()
+            if "close" in data:
+                results.append({
+                    "ticker": ticker,
+                    "change": float(data.get("percent_change", 0)),
+                    "price": float(data["close"])
+                })
+        except:
+            pass
     if not results:
         return "Movers data unavailable", "Movers data unavailable"
-
     results.sort(key=lambda x: x["change"], reverse=True)
-    actual_gainers = [r for r in results if r["change"] > 0]
-    actual_losers = [r for r in results if r["change"] < 0]
-    gainers = "\n".join([f"*{r['ticker']}:* +{r['change']:.2f}%" for r in actual_gainers[:3]]) if actual_gainers else "_No gainers_"
-    losers = "\n".join([f"*{r['ticker']}:* {r['change']:.2f}%" for r in actual_losers[-3:]]) if actual_losers else "_No losers_"
+    gainers = "\n".join([f"🟢 *{r['ticker']}:* +{r['change']:.2f}%" for r in results[:3]])
+    losers = "\n".join([f"🔴 *{r['ticker']}:* {r['change']:.2f}%" for r in results[-3:]])
     return gainers, losers
 
 async def send_market_report(title: str, body: str):
+    """Send a market report to the Telegram channel."""
     if not TELEGRAM_CHANNEL_ID:
         return
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         time_str = datetime.now().strftime("%I:%M %p EST")
         msg = f"📊 *{title}*\n_{time_str}_\n\n{body}\n\n_GQ FinXray US · gquants.com_"
-        await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=msg, parse_mode="Markdown")
+        await bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            text=msg,
+            parse_mode="Markdown"
+        )
         print(f"[REPORT] Sent: {title}")
     except Exception as e:
         print(f"[ERROR] Failed to send market report: {e}")
-    # Also send to Slack
-    send_slack_message(f"📊 {title}\n\n{body}\n\nGQ FinXray US · gquants.com")
 
 def send_premarket_report():
-    body = f"US Futures & Pre-Market Snapshot\n\n{fetch_index_data()}\n\nMacro\n{fetch_macro_data()}"
+    indices = fetch_index_data()
+    macro = fetch_macro_data()
+    body = (
+        f"*US Futures & Pre-Market Snapshot*\n\n"
+        f"{indices}\n\n"
+        f"*Macro*\n{macro}"
+    )
     asyncio.run(send_market_report("🌅 Pre-Market Report", body))
 
 def send_market_open_report():
+    indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = f"Markets are now open.\n\nIndices at Open\n{fetch_index_data()}\n\nEarly Gainers\n{gainers}\n\nEarly Losers\n{losers}"
+    body = (
+        f"*Markets are now open.*\n\n"
+        f"*Indices at Open*\n{indices}\n\n"
+        f"*Early Gainers*\n{gainers}\n\n"
+        f"*Early Losers*\n{losers}"
+    )
     asyncio.run(send_market_report("🔔 Market Open", body))
 
 def send_midday_report():
+    indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = f"Midday Market Check\n\nIndices\n{fetch_index_data()}\n\nTop Gainers\n{gainers}\n\nTop Losers\n{losers}"
+    body = (
+        f"*Midday Market Check*\n\n"
+        f"*Indices*\n{indices}\n\n"
+        f"*Top Gainers*\n{gainers}\n\n"
+        f"*Top Losers*\n{losers}"
+    )
     asyncio.run(send_market_report("⏱ Midday Pulse", body))
 
 def send_market_close_report():
+    indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = f"Markets have closed.\n\nFinal Index Levels\n{fetch_index_data()}\n\nTop Gainers\n{gainers}\n\nTop Losers\n{losers}\n\nMacro\n{fetch_macro_data()}"
+    macro = fetch_macro_data()
+    body = (
+        f"*Markets have closed.*\n\n"
+        f"*Final Index Levels*\n{indices}\n\n"
+        f"*Top Gainers*\n{gainers}\n\n"
+        f"*Top Losers*\n{losers}\n\n"
+        f"*Macro*\n{macro}"
+    )
     asyncio.run(send_market_report("📉 Market Close Report", body))
 
 def send_afterhours_report():
     gainers, losers = fetch_top_movers()
-    body = f"After-Hours Notable Movers\n\nGainers\n{gainers}\n\nLosers\n{losers}"
+    body = (
+        f"*After-Hours Notable Movers*\n\n"
+        f"*Gainers*\n{gainers}\n\n"
+        f"*Losers*\n{losers}"
+    )
     asyncio.run(send_market_report("🌙 After-Hours Movers", body))
 
-# ── Threads ───────────────────────────────────────────────────────────────────
+# ── Scheduler thread ──────────────────────────────────────────────────────────
 def run_scheduler():
     print("[SCHEDULER] Starting...")
     load_cik_map()
     poll_sec_8k()
     poll_sec_form4()
+    poll_sec_10q()
+    poll_sec_10k()
+    poll_sec_s1()
     poll_all_news()
     schedule.every(30).seconds.do(poll_sec_8k)
     schedule.every(30).seconds.do(poll_sec_form4)
+    schedule.every(5).minutes.do(poll_sec_10q)
+    schedule.every(5).minutes.do(poll_sec_10k)
+    schedule.every(10).minutes.do(poll_sec_s1)
+    schedule.every(30).minutes.do(process_pending_snapshots)
     schedule.every(60).seconds.do(poll_all_news)
-    schedule.every().day.at("13:25").do(send_premarket_report)
-    schedule.every().day.at("13:30").do(send_market_open_report)
-    schedule.every().day.at("17:00").do(send_midday_report)
-    schedule.every().day.at("20:00").do(send_market_close_report)
-    schedule.every().day.at("20:30").do(send_afterhours_report)
+
+    # Market reports — times in EST (adjust if Railway runs UTC: subtract 5hrs)
+    # EODHD pollers
+    poll_eodhd_news()
+    poll_eodhd_events()
+    schedule.every(10).minutes.do(poll_eodhd_news)
+    schedule.every(60).minutes.do(poll_eodhd_events)
+
+    # Round 2 — Technical + IPO pollers
+    run_technical_poller()
+    run_ipo_poller()
+    schedule.every(60).minutes.do(run_technical_poller)
+    schedule.every().day.at("08:00").do(run_ipo_poller)
+
+    # Round 3 — News Roundup + ETF Xray
+    schedule.every().day.at("07:00").do(run_morning_roundup)
+    schedule.every().day.at("09:00").do(run_etf_xray)
+    schedule.every().day.at("18:00").do(run_evening_roundup)
+
+    # Market reports
+    schedule.every().day.at("09:25").do(send_premarket_report)
+    schedule.every().day.at("09:30").do(send_market_open_report)
+    schedule.every().day.at("13:00").do(send_midday_report)
+    schedule.every().day.at("16:00").do(send_market_close_report)
+    schedule.every().day.at("16:30").do(send_afterhours_report)
+
     print("[SCHEDULER] All pollers and market reports scheduled.")
     while True:
         schedule.run_pending()
         time.sleep(1)
 
+# ── AI pipeline thread ────────────────────────────────────────────────────────
 def run_pipeline():
     print("[PIPELINE] Starting...")
     while True:
@@ -468,33 +526,28 @@ def run_pipeline():
         except Exception as e:
             print(f"[PIPELINE ERROR] {e}")
             asyncio.run(send_error_alert(f"Pipeline error: {str(e)}"))
-        time.sleep(30)
+        time.sleep(60)
 
+# ── Delivery loop ─────────────────────────────────────────────────────────────
 async def delivery_loop():
     print("[DELIVERY] Starting...")
     while True:
         await deliver_pending_alerts()
         await asyncio.sleep(30)
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     print("""
 ╔══════════════════════════════════════════╗
 ║       GQ FinXray US — Starting Up        ║
-║  SEC EDGAR + News + AI + Telegram        ║
+║  SEC EDGAR + EODHD + News + AI + Telegram ║
 ╚══════════════════════════════════════════╝
     """)
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CallbackQueryHandler(feedback_callback, pattern="^useful_|^notuseful_"))
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     pipeline_thread = threading.Thread(target=run_pipeline, daemon=True)
     pipeline_thread.start()
-    async with app:
-        await app.start()
-        await app.updater.start_polling()
-        await delivery_loop()
-        await app.updater.stop()
-        await app.stop()
+    await delivery_loop()
 
 if __name__ == "__main__":
     asyncio.run(main())
