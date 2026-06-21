@@ -83,22 +83,13 @@ def format_alert(alert):
         eps = extra.get("eps_estimate")
         eps_line = f"Analyst EPS Estimate: {eps}" if eps else "No EPS estimate available"
         return (
-            f"📅 *Earnings Tomorrow — *"
-            f"{price_line}
-"
-            f"🕐 *When:* {timing_str} on {report_date}
-"
-            f"📊 {eps_line}
-
-"
-            f"Watch for potential volatility.
-
-"
-            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._
-"
-            f"_Disclaimer: gquants.com/disclaimer_
-
-"
+            f"📅 *Earnings Tomorrow — *\n"
+            f"{price_line}\n"
+            f"🕐 *When:* {timing_str} on {report_date}\n"
+            f"📊 {eps_line}\n\n"
+            f"Watch for potential volatility.\n\n"
+            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
         )
 
