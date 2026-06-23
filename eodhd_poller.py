@@ -456,6 +456,110 @@ def poll_insider_transactions(tickers):
 
     return total
 
+
+# ── 5. Bulk / Block Deals ─────────────────────────────────────────────────────
+def bulk_deal_already_sent(ticker, transaction_date, insider_name, value):
+    """Check if this bulk deal alert was already sent today."""
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        result = supabase.table("alerts") \
+            .select("id") \
+            .eq("ticker", ticker) \
+            .eq("source", "EODHD") \
+            .eq("filing_type", "BULK_DEAL") \
+            .gte("created_at", f"{today}T00:00:00+00:00") \
+            .execute()
+        return len(result.data) > 0
+    except:
+        return False
+
+
+def check_bulk_deals(tickers):
+    """
+    Check insider transactions for large block trades ($1M+).
+    Flags HIGH impact deals and stores them as BULK_DEAL alerts.
+    """
+    if not tickers:
+        return 0
+
+    BULK_THRESHOLD = 1_000_000  # $1M minimum
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    total = 0
+
+    for ticker in tickers:
+        data = eodhd_get("insider-transactions", {
+            "code": f"{ticker}.US",
+            "limit": 10
+        })
+        if not data or not isinstance(data, list):
+            continue
+
+        for txn in data:
+            txn_date = txn.get("date", "") or txn.get("transactionDate", "")
+            if txn_date and txn_date < cutoff:
+                continue
+
+            insider_name = txn.get("ownerName", "") or "Unknown"
+            transaction_type = (txn.get("transactionCode", "") or "").upper()
+            shares = txn.get("numberOfShares", 0) or 0
+            price = txn.get("price", 0) or 0
+            value = txn.get("value", 0) or (float(shares) * float(price))
+            role = txn.get("ownerRelationship", "") or ""
+
+            # Only flag transactions above the threshold
+            if not value or float(value) < BULK_THRESHOLD:
+                continue
+
+            if transaction_type in ("P", "BUY"):
+                action = "BUY"
+                emoji = "\U0001F7E2"  # green circle
+            elif transaction_type in ("S", "SELL"):
+                action = "SELL"
+                emoji = "\U0001F534"  # red circle
+            else:
+                continue
+
+            if bulk_deal_already_sent(ticker, txn_date, insider_name, value):
+                continue
+
+            value_str = f"${float(value):,.0f}"
+            shares_str = f"{int(shares):,}" if shares else "N/A"
+            price_str = f"${float(price):.2f}" if price else "N/A"
+
+            summary = (
+                f"{emoji} *Bulk Deal Alert — ${ticker}*\n\n"
+                f"*Insider:* {insider_name} ({role})\n"
+                f"*Action:* {action}\n"
+                f"*Shares:* {shares_str}\n"
+                f"*Price:* {price_str}\n"
+                f"*Total Value:* {value_str}\n"
+                f"*Date:* {txn_date}\n"
+                f"_Source: EODHD Insider Transactions | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
+            )
+
+            store_alert(
+                ticker=ticker,
+                summary=summary,
+                impact="HIGH",
+                filing_type="BULK_DEAL",
+                extra={
+                    "insider_name": insider_name,
+                    "action": action,
+                    "shares": shares_str,
+                    "price": price_str,
+                    "value": value_str,
+                    "role": role,
+                    "transaction_date": txn_date,
+                    "source": "EODHD"
+                }
+            )
+            print(f"[BULK DEAL] {emoji} {ticker} — {insider_name} {action}S {shares_str} @ {price_str} = {value_str}")
+            total += 1
+
+        time.sleep(0.2)
+
+    return total
+
 # ── Master poll functions ─────────────────────────────────────────────────────
 def poll_eodhd_news():
     """Poll ticker news and sector news."""

@@ -23,6 +23,7 @@ from result_snapshot import process_pending_snapshots
 from eodhd_technical_poller import run_technical_poller
 from eodhd_ipo_poller import run_ipo_poller
 from news_roundup import run_morning_roundup, run_evening_roundup, run_etf_xray
+from etf_flow_poller import run_etf_flow_poller
 
 # ── TwelveData price fetch ────────────────────────────────────────────────────
 def get_stock_price(ticker: str):
@@ -493,6 +494,8 @@ def run_scheduler():
     # Round 3 — News Roundup + ETF Xray
     schedule.every().day.at("07:00").do(run_morning_roundup)
     schedule.every().day.at("09:00").do(run_etf_xray)
+    run_etf_flow_poller()
+    schedule.every(60).minutes.do(run_etf_flow_poller)
     schedule.every().day.at("18:00").do(run_evening_roundup)
 
     # Market reports
