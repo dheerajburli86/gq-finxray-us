@@ -39,7 +39,7 @@ def call_deepinfra(prompt, retries=3, max_tokens=1000):
             r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=30)
             if r.status_code == 200:
                 import re
-                text = r.json()["choices"][0]["message"]["content"].strip()
+                text = (r.json()["choices"][0]["message"]["content"] or "").strip()
                 text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
                 return text
             else:
