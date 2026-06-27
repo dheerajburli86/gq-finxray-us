@@ -336,8 +336,9 @@ def fetch_index_data():
             url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
             r = requests.get(url, timeout=10)
             data = r.json()
-            if "close" in data:
-                price = float(data["close"])
+            price_val = data.get("close") or data.get("price")
+            if price_val:
+                price = float(price_val)
                 chg = float(data.get("percent_change", 0))
                 arrow = "🟢" if chg >= 0 else "🔴"
                 sign = "+" if chg >= 0 else ""
@@ -348,15 +349,16 @@ def fetch_index_data():
 
 def fetch_macro_data():
     """Fetch DXY, Gold, Crude Oil from TwelveData."""
-    instruments = {"DX-Y.NYB": "DXY (Dollar)", "GC=F": "Gold", "CL=F": "Crude Oil"}
+    instruments = {"XAU/USD": "Gold", "USOIL": "Crude Oil", "USD/DXY": "DXY (Dollar)"}
     lines = []
     for symbol, name in instruments.items():
         try:
             url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
             r = requests.get(url, timeout=10)
             data = r.json()
-            if "close" in data:
-                price = float(data["close"])
+            price_val = data.get("close") or data.get("price")
+            if price_val:
+                price = float(price_val)
                 chg = float(data.get("percent_change", 0))
                 arrow = "🟢" if chg >= 0 else "🔴"
                 sign = "+" if chg >= 0 else ""
