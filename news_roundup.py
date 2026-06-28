@@ -64,7 +64,10 @@ def call_deepinfra(prompt, max_tokens=500):
     try:
         r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=30)
         if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"].strip()
+            import re
+            text = (r.json()["choices"][0]["message"]["content"] or "").strip()
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            return text
         else:
             logger.error(f"[DEEPINFRA] Error {r.status_code}: {r.text[:200]}")
             return None
@@ -204,12 +207,12 @@ def generate_ai_roundup(news_text, period_label):
 Below are news headlines from the past few hours, grouped by sector.
 Write a concise digest of 5-7 bullet points covering the most important market-moving stories.
 Each bullet should be one sentence. Focus on what matters for investors.
-Use plain English. No fluff. No intro sentence. Just the bullets.
+Use plain English. No fluff. No intro sentence. Just the bullets. No reasoning. No explanation.
 
 Headlines:
 {news_text[:3000]}
 
-Return only the bullet points, each starting with •"""
+Return ONLY the bullet points, each starting with •. Nothing else. No preamble. No thinking."""
 
     return call_deepinfra(prompt, max_tokens=400)
 
