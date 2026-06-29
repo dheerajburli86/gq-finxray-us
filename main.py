@@ -232,78 +232,8 @@ async def deliver_pending_alerts():
             ticker = alert.get("ticker", "UNKNOWN")
             impact = alert.get("impact", "LOW")
 
-            if ticker == "UNKNOWN":
-                supabase.table("alerts") \
-                    .update({"delivered": True}) \
-                    .eq("id", alert["id"]) \
-                    .execute()
-                continue
-
-            # Find users subscribed to this ticker
-            watchlist_result = supabase.table("watchlists") \
-                .select("user_id") \
-                .eq("ticker", ticker) \
-                .execute()
-
-            delivered_to = []
-
-            for item in watchlist_result.data:
-                user_id = item.get("user_id")
-                if not user_id:
-                    continue
-
-                # Get user telegram chat ID
-                user_result = supabase.table("users") \
-                    .select("telegram_chat_id") \
-                    .eq("id", user_id) \
-                    .execute()
-
-                if not user_result.data:
-                    continue
-
-                chat_id = user_result.data[0].get("telegram_chat_id")
-                if not chat_id:
-                    continue
-
-                # Check impact preference
-                pref_result = supabase.table("user_preferences") \
-                    .select("min_impact") \
-                    .eq("user_id", user_id) \
-                    .execute()
-
-                min_impact = "LOW"
-                if pref_result.data:
-                    min_impact = pref_result.data[0].get("min_impact", "LOW")
-
-                if impact_order.get(impact, 1) >= impact_order.get(min_impact, 1):
-                    msg = format_alert(alert)
-                    try:
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=msg,
-                            parse_mode="Markdown"
-                        )
-                        delivered_to.append(chat_id)
-                        supabase.table("delivery_logs").insert({
-                            "alert_id": alert["id"],
-                            "user_id": user_id,
-                            "channel": "telegram",
-                            "status": "sent",
-                            "attempts": 1,
-                            "delivered_at": datetime.now().isoformat()
-                        }).execute()
-                    except Exception as e:
-                        print(f"[ERROR] Failed to deliver to {chat_id}: {e}")
-                        supabase.table("delivery_logs").insert({
-                            "alert_id": alert["id"],
-                            "user_id": user_id,
-                            "channel": "telegram",
-                            "status": "failed",
-                            "attempts": 1
-                        }).execute()
-
-            # Post HIGH and MEDIUM alerts to channel
-            if impact in ("HIGH", "MEDIUM") and TELEGRAM_CHANNEL_ID:
+            # Send ALL alerts to Telegram channel — no watchlist/user filtering
+            if TELEGRAM_CHANNEL_ID:
                 try:
                     msg = format_alert(alert)
                     await bot.send_message(
@@ -311,18 +241,16 @@ async def deliver_pending_alerts():
                         text=msg,
                         parse_mode="Markdown"
                     )
-                    print(f"[CHANNEL] {impact} alert posted — ${ticker}")
+                    print(f"[CHANNEL] {impact} — ${ticker} sent to channel")
                 except Exception as e:
-                    print(f"[ERROR] Channel post failed: {e}")
+                    print(f"[ERROR] Channel post failed for {ticker}: {e}")
 
             # Mark delivered
             supabase.table("alerts") \
                 .update({"delivered": True}) \
                 .eq("id", alert["id"]) \
                 .execute()
-
-            if delivered_to:
-                print(f"[DELIVERED] {impact} — ${ticker} → {len(delivered_to)} users")
+            print(f"[DELIVERED] {impact} — ${ticker}")
 
     except Exception as e:
         print(f"[ERROR] Delivery failed: {e}")

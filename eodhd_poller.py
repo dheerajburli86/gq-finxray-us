@@ -564,8 +564,10 @@ def check_bulk_deals(tickers):
 def poll_eodhd_news():
     """Poll ticker news and sector news."""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] EODHD — Polling news...")
+    # Ticker news for watchlisted stocks (specific stock alerts)
     tickers = get_watched_tickers()
     ticker_count = poll_ticker_news(tickers)
+    # Sector news covers all stocks broadly via sector-level feeds
     sector_count = poll_sector_news()
     print(f"[EODHD NEWS] Ticker articles: {ticker_count} | Sector articles: {sector_count}")
 
