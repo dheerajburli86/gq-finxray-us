@@ -24,6 +24,7 @@ from eodhd_technical_poller import run_technical_poller
 from eodhd_ipo_poller import run_ipo_poller
 from news_roundup import run_morning_roundup, run_evening_roundup, run_etf_xray
 from etf_flow_poller import run_etf_flow_poller
+from heatmap_generator import run_sector_heatmap_daily, run_sector_heatmap_weekly, run_sector_heatmap_monthly
 
 # ── TwelveData price fetch ────────────────────────────────────────────────────
 def get_stock_price(ticker: str):

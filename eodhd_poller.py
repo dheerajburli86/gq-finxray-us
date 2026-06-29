@@ -579,23 +579,9 @@ def poll_eodhd_events():
     print(f"[EODHD EVENTS] Earnings alerts: {earnings_count} | Insider transactions: {insider_count} | Bulk deals: {bulk_count}")
 
 def run_eodhd_poller():
-    """Start the EODHD poller with scheduled jobs."""
-    print("[EODHD] Starting poller...")
-
-    # Run immediately on startup
+    """Legacy entry point kept for compatibility. main.py handles scheduling."""
     poll_eodhd_news()
     poll_eodhd_events()
-
-    # News — every 10 minutes
-    schedule.every(10).minutes.do(poll_eodhd_news)
-
-    # Earnings + insider — every 60 minutes
-    schedule.every(60).minutes.do(poll_eodhd_events)
-
-    print("[EODHD] Poller running — news every 10 mins, events every 60 mins.")
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
 
 if __name__ == "__main__":
     run_eodhd_poller()

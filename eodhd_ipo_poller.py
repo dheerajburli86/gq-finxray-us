@@ -28,14 +28,13 @@ def get_supabase():
 
 
 def already_sent(ticker, start_date):
-    """Check if this IPO alert was already sent (by ticker + start_date)."""
+    """Check if this IPO alert was already sent for this specific ticker."""
     sb = get_supabase()
     result = sb.table("alerts") \
         .select("id") \
         .eq("ticker", ticker) \
         .eq("source", "EODHD_IPO") \
         .eq("filing_type", "IPO_UPCOMING") \
-        .gte("created_at", f"{date.today().isoformat()}T00:00:00+00:00") \
         .execute()
     return len(result.data) > 0
 
