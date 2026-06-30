@@ -432,6 +432,10 @@ def run_scheduler():
     # Market reports
     schedule.every().day.at("09:25").do(send_premarket_report)
     schedule.every().day.at("09:30").do(send_market_open_report)
+    schedule.every().day.at("09:30").do(run_sector_heatmap_daily)
+    schedule.every().day.at("13:00").do(run_sector_heatmap_daily)
+    schedule.every().day.at("16:00").do(run_sector_heatmap_weekly)
+    schedule.every().day.at("16:30").do(run_sector_heatmap_monthly)
     schedule.every().day.at("13:00").do(send_midday_report)
     schedule.every().day.at("16:00").do(send_market_close_report)
     schedule.every().day.at("16:30").do(send_afterhours_report)
