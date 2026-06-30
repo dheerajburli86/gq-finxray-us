@@ -27,7 +27,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
 DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
-DEEPINFRA_MODEL = "google/gemini-2.0-flash-001"
+DEEPINFRA_MODEL = "google/gemini-3.5-flash"
 
 # ETFs to cover in ETF Xray
 ETF_UNIVERSE = [
@@ -206,15 +206,28 @@ def generate_ai_roundup(news_text, period_label):
 
 Below are news headlines from the past few hours, grouped by sector.
 Write a concise digest of 5-7 bullet points covering the most important market-moving stories.
-Each bullet should be one sentence. Focus on what matters for investors.
-Use plain English. No fluff. No intro sentence. Just the bullets. No reasoning. No explanation.
+Each bullet must be a SHORT, COMPLETE sentence under 20 words. Never cut off mid-sentence.
+Focus on what matters for investors. Use plain English. No fluff. No intro sentence.
+Just the bullets. No reasoning. No explanation. No markdown formatting beyond the bullet character.
 
 Headlines:
 {news_text[:3000]}
 
-Return ONLY the bullet points, each starting with •. Nothing else. No preamble. No thinking."""
+Return ONLY the bullet points, each starting with •, each a short complete sentence. Nothing else."""
 
-    return call_deepinfra(prompt, max_tokens=400)
+    result = call_deepinfra(prompt, max_tokens=700)
+
+    # Safety: if result ends mid-sentence (no terminal punctuation on last line), trim that line
+    if result:
+        lines = [l.strip() for l in result.split("\n") if l.strip()]
+        if lines:
+            last_line = lines[-1]
+            if last_line and last_line[-1] not in ".!?":
+                # Last bullet got cut off — drop it rather than show broken text
+                lines = lines[:-1]
+            result = "\n".join(lines)
+
+    return result
 
 
 def run_morning_roundup():
