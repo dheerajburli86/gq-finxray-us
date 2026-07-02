@@ -14,8 +14,9 @@ DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
 DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
 DEEPINFRA_MODEL = "google/gemini-3.5-flash"
 
-# -- AI Mode enabled via DeepInfra (paid) -------------------------------------
-RAW_MODE = False
+# -- AI Mode disabled for now (DeepInfra key pulled) — using keyword-based RAW mode.
+# Flip back to False once DEEPINFRA_API_KEY is restored in Railway.
+RAW_MODE = True
 
 from Prompt_P2_GibberishChecker import get_prompt as gibberish_prompt
 from Prompt_V3_RelevanceCheck import get_prompt as relevance_prompt
@@ -25,7 +26,7 @@ from Prompt_C1_ImpactClassification import get_prompt as impact_prompt
 
 
 # ── DeepInfra caller ─────────────────────────────────────────────────────────
-def call_deepinfra(prompt, retries=3, max_tokens=1000):
+def call_deepinfra(prompt, retries=2, max_tokens=1000):
     """Call DeepInfra API with Gemini 3.5 Flash."""
     headers = {
         "Authorization": f"Bearer {DEEPINFRA_API_KEY}",
@@ -226,7 +227,7 @@ def parse_json_response(text):
     except:
         return {}
 
-def get_recent_summaries(ticker, limit=10):
+def get_recent_summaries(ticker, limit=3):
     try:
         result = supabase.table("ai_summaries") \
             .select("summary") \

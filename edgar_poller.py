@@ -18,6 +18,26 @@ HEADERS = {
 
 CIK_MAP = {}
 
+# ── Watchlist filtering ───────────────────────────────────────────────────────
+_WATCHLIST_CACHE = {"tickers": set(), "loaded_at": 0}
+WATCHLIST_CACHE_TTL_SECONDS = 300  # refresh every 5 minutes
+
+def get_watchlist_tickers() -> set:
+    """Get the current set of watchlisted tickers from Supabase, cached briefly."""
+    now = time.time()
+    if _WATCHLIST_CACHE["tickers"] and (now - _WATCHLIST_CACHE["loaded_at"] < WATCHLIST_CACHE_TTL_SECONDS):
+        return _WATCHLIST_CACHE["tickers"]
+    try:
+        result = supabase.table("watchlists").select("ticker").execute()
+        tickers = {r["ticker"].upper() for r in result.data if r.get("ticker")}
+        if tickers:
+            _WATCHLIST_CACHE["tickers"] = tickers
+            _WATCHLIST_CACHE["loaded_at"] = now
+        return _WATCHLIST_CACHE["tickers"]
+    except Exception as e:
+        print(f"[ERROR] Failed to load watchlist tickers: {e}")
+        return _WATCHLIST_CACHE["tickers"]
+
 EDGAR_8K_URL   = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&search_text=&output=atom"
 EDGAR_FORM4_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=40&search_text=&output=atom"
 EDGAR_10Q_URL  = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-Q&dateb=&owner=include&count=40&search_text=&output=atom"
@@ -285,7 +305,10 @@ def poll_edgar_generic(url, form_type, label):
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         entries = root.findall("atom:entry", ns)
 
+        watchlist = get_watchlist_tickers()
+
         new_count = 0
+        skipped_not_watched = 0
         for entry in entries:
             title_elem = entry.find("atom:title", ns)
             link_elem  = entry.find("atom:link", ns)
@@ -306,6 +329,12 @@ def poll_edgar_generic(url, form_type, label):
             company_name = company_match.group(1).strip() if company_match else title
             cik = company_match.group(2) if company_match else ""
             ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
+
+            # Only process filings for tickers on someone's watchlist —
+            # skip everything else before we spend time/LLM calls on it.
+            if ticker not in watchlist:
+                skipped_not_watched += 1
+                continue
 
             filing_text = fetch_filing_text(filing_url)
             if not filing_text or len(filing_text) < 100:
@@ -328,9 +357,9 @@ def poll_edgar_generic(url, form_type, label):
             time.sleep(0.3)
 
         if new_count == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new {label} filings.")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new {label} filings. ({skipped_not_watched} skipped, not watchlisted)")
         else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new {label} filings.")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new {label} filings. ({skipped_not_watched} skipped, not watchlisted)")
 
     except Exception as e:
         print(f"[ERROR] {label} poll failed: {e}")
@@ -375,7 +404,10 @@ def poll_sec_form4():
                 accession_map[acc_num] = []
             accession_map[acc_num].append({"title": title, "url": filing_url})
 
+        watchlist = get_watchlist_tickers()
+
         new_count = 0
+        skipped_not_watched = 0
         processed_urls = set()
 
         for acc_num, entries_list in accession_map.items():
@@ -400,6 +432,11 @@ def poll_sec_form4():
             cik = issuer_match.group(2) if issuer_match else ""
             ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
 
+            # Only process insider filings for tickers on someone's watchlist.
+            if ticker not in watchlist:
+                skipped_not_watched += 1
+                continue
+
             insider_name = "Unknown Insider"
             if reporting:
                 rep_match = re.match(r'4\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)', reporting["title"])
@@ -422,9 +459,9 @@ def poll_sec_form4():
             time.sleep(0.3)
 
         if new_count == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new Form 4 filings.")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new Form 4 filings. ({skipped_not_watched} skipped, not watchlisted)")
         else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new Form 4 filings.")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new Form 4 filings. ({skipped_not_watched} skipped, not watchlisted)")
 
     except Exception as e:
         print(f"[ERROR] Form 4 poll failed: {e}")

@@ -52,6 +52,11 @@ def get_supabase():
 
 def call_deepinfra(prompt, max_tokens=500):
     """Call DeepInfra API with Gemini 2.0 Flash."""
+    if not DEEPINFRA_API_KEY:
+        # AI mode disabled for now — skip the network call and let the caller's
+        # fallback (headline-only digest) handle it. No wasted request, no cost.
+        logger.info("[DEEPINFRA] Skipped — DEEPINFRA_API_KEY not set (AI disabled for now).")
+        return None
     headers = {
         "Authorization": f"Bearer {DEEPINFRA_API_KEY}",
         "Content-Type": "application/json"
