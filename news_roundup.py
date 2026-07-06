@@ -16,8 +16,17 @@ from supabase import create_client
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("news_roundup")
+if not logger.handlers:
+    import logging.handlers, os as _os
+    _os.makedirs("logs", exist_ok=True)
+    _h = logging.handlers.RotatingFileHandler(
+        "logs/news_roundup.log", maxBytes=5*1024*1024, backupCount=3
+    )
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_h)
+    logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.INFO)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -27,7 +36,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
 DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
-DEEPINFRA_MODEL = "google/gemini-3.5-flash"
+DEEPINFRA_MODEL = "google/gemini-2.5-flash"
 
 # ETFs to cover in ETF Xray
 ETF_UNIVERSE = [

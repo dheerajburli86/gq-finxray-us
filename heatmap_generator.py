@@ -85,6 +85,8 @@ def fetch_sector_data_daily():
         except Exception as e:
             logger.error(f"[HEATMAP] Failed to fetch {ticker}: {e}")
             results.append({"ticker": ticker, "name": etf["name"], "change_p": 0.0, "close": 0.0})
+    # Sort descending by change_p
+    results.sort(key=lambda x: x["change_p"], reverse=True)
     return results
 
 
@@ -132,29 +134,32 @@ def fetch_sector_data_period(period="WEEKLY"):
 # ── Color helpers ─────────────────────────────────────────────────────────────
 def get_tile_color(change_p, max_abs_change):
     """
-    Color intensity normalized against max absolute return in this heatmap.
-    Green for positive, red for negative, near-white for near-zero.
+    5-band color system matching India FinXray spec:
+    Dark Green  → change_p >= 66% of max (strong gain)
+    Light Green → change_p >= 20% of max (moderate gain)
+    Neutral     → change_p near 0 (flat)
+    Light Red   → change_p <= -20% of max (moderate loss)
+    Dark Red    → change_p <= -66% of max (strong loss)
     """
     if max_abs_change == 0:
         intensity = 0.0
     else:
-        intensity = min(abs(change_p) / max_abs_change, 1.0)
-
-    # Near-zero: almost white
-    neutral = (235, 235, 235)
+        intensity = abs(change_p) / max_abs_change  # 0.0 to 1.0
 
     if change_p >= 0:
-        # Light green (#C8E6C9) to deep green (#1B5E20)
-        r = int(neutral[0] + intensity * (27  - neutral[0]))
-        g = int(neutral[1] + intensity * (94  - neutral[1]))
-        b = int(neutral[2] + intensity * (32  - neutral[2]))
+        if intensity >= 0.66:
+            return (27, 130, 50)      # Dark green
+        elif intensity >= 0.20:
+            return (102, 187, 106)    # Light green
+        else:
+            return (220, 237, 200)    # Near-neutral green (barely up)
     else:
-        # Light red (#FFCDD2) to deep red (#7F0000)
-        r = int(neutral[0] + intensity * (127 - neutral[0]))
-        g = int(neutral[1] + intensity * (0   - neutral[1]))
-        b = int(neutral[2] + intensity * (0   - neutral[2]))
-
-    return (r, g, b)
+        if intensity >= 0.66:
+            return (183, 28, 28)      # Dark red
+        elif intensity >= 0.20:
+            return (229, 115, 115)    # Light red
+        else:
+            return (255, 205, 210)    # Near-neutral red (barely down)
 
 
 def get_text_color(bg_rgb):
@@ -168,6 +173,9 @@ def get_text_color(bg_rgb):
 def generate_heatmap_image(sectors, period="DAILY"):
     """Generate heatmap image matching India FinXray spec."""
     from PIL import Image, ImageDraw, ImageFont
+
+    # Sort descending: biggest gainers first, biggest losers last
+    sectors = sorted(sectors, key=lambda x: x["change_p"], reverse=True)
 
     n = len(sectors)
     rows = -(-n // COLS)  # ceiling division

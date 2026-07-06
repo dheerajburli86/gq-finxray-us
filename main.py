@@ -11,6 +11,10 @@ from datetime import datetime
 
 load_dotenv()
 
+# Ensure logs directory exists for rotating loggers
+import os as _os
+_os.makedirs("logs", exist_ok=True)
+
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")

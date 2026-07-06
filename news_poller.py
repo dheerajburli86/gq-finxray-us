@@ -1,4 +1,17 @@
 import requests
+import logging
+import logging.handlers
+
+# Rotating logger — keeps last 5MB of logs, 3 backup files
+logger = logging.getLogger("news_poller")
+if not logger.handlers:
+    handler = logging.handlers.RotatingFileHandler(
+        "logs/news_poller.log", maxBytes=5*1024*1024, backupCount=3
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.INFO)
 import xml.etree.ElementTree as ET
 from supabase import create_client
 from dotenv import load_dotenv
@@ -377,15 +390,9 @@ def poll_news_source(source):
                 article_sector = detect_sector_from_text(full_text)
 
             if not found_tickers:
-                store_news(
-                    source_key=source_key,
-                    ticker="MARKET",
-                    title=title,
-                    summary=summary,
-                    url=article_url,
-                    published_at=published_at,
-                    sector=article_sector
-                )
+                # No ticker found — skip entirely to avoid unnecessary AI pipeline costs
+                logger.debug(f"[NEWS] No ticker found in: {title[:60]} — skipping")
+                continue
             else:
                 for ticker in found_tickers:
                     store_news(

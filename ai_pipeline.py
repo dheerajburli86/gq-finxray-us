@@ -3,6 +3,21 @@ import json
 import re
 import time
 import requests
+import logging
+import logging.handlers
+
+# Rotating logger for AI pipeline — tracks token usage
+logger = logging.getLogger("ai_pipeline")
+if not logger.handlers:
+    import os as _os
+    _os.makedirs("logs", exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        "logs/ai_pipeline.log", maxBytes=5*1024*1024, backupCount=3
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.INFO)
 from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime, timezone
@@ -12,7 +27,7 @@ load_dotenv()
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
 DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
-DEEPINFRA_MODEL = "google/gemini-3.5-flash"
+DEEPINFRA_MODEL = "google/gemini-2.5-flash"
 
 # -- AI Mode disabled for now (DeepInfra key pulled) — using keyword-based RAW mode.
 # Flip back to False once DEEPINFRA_API_KEY is restored in Railway.
@@ -41,12 +56,16 @@ def call_deepinfra(prompt, retries=2, max_tokens=1000):
         try:
             r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=30)
             if r.status_code == 200:
-                text = (r.json()["choices"][0]["message"]["content"] or "").strip()
+                data = r.json()
+                text = (data["choices"][0]["message"]["content"] or "").strip()
                 # Strip <think>...</think> reasoning tokens
                 text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                # Log token usage for cost monitoring
+                usage = data.get("usage", {})
+                logger.info(f"[DEEPINFRA] model={DEEPINFRA_MODEL} prompt_tokens={usage.get('prompt_tokens',0)} completion_tokens={usage.get('completion_tokens',0)} total={usage.get('total_tokens',0)}")
                 return text
             else:
-                print(f"[DEEPINFRA] Attempt {attempt+1} failed: {r.status_code} {r.text[:100]}")
+                logger.warning(f"[DEEPINFRA] Attempt {attempt+1} failed: {r.status_code} {r.text[:100]}")
         except Exception as e:
             print(f"[DEEPINFRA] Attempt {attempt+1} error: {e}")
         time.sleep(2 ** attempt)

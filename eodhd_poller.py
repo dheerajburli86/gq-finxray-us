@@ -269,16 +269,9 @@ def poll_sector_news():
                     )
             else:
                 # Store as sector-level MARKET article
-                store_news(
-                    ticker="MARKET",
-                    title=title,
-                    content=content,
-                    url=url,
-                    published_at=published_at,
-                    source=source,
-                    sector=sector,
-                    sentiment=sentiment
-                )
+                # No ticker found — skip to avoid unnecessary AI pipeline costs
+                print(f"[EODHD NEWS] No ticker found — skipping")
+                continue
             total += 1
             time.sleep(0.05)
 
