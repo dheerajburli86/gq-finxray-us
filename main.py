@@ -32,17 +32,26 @@ from heatmap_generator import run_sector_heatmap_daily, run_sector_heatmap_weekl
 
 # ── TwelveData price fetch ────────────────────────────────────────────────────
 def get_stock_price(ticker: str):
-    """Fetch live price and % change for a ticker from TwelveData."""
+    """Fetch real-time price and % change for a ticker from TwelveData."""
     try:
+        # Use /quote for price + percent_change in one call
         url = f"https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVEDATA_API_KEY}"
         r = requests.get(url, timeout=10)
         data = r.json()
-        if data.get("status") == "error" or "close" not in data:
+        if data.get("status") == "error":
             return None
-        price = float(data.get("close", 0))
-        change_pct = float(data.get("percent_change", 0))
+
+        # Use 'close' for latest price — fallback to 'price' field
+        price = float(data.get("close") or data.get("price") or 0)
+        if price == 0:
+            return None
+
+        # percent_change = today's change vs previous close
+        change_pct = float(data.get("percent_change") or 0)
         arrow = "🟢" if change_pct >= 0 else "🔴"
         sign = "+" if change_pct >= 0 else ""
+
+        # Sanity check — if price looks wrong (>10x typical range) skip it
         return {
             "price": f"${price:,.2f}",
             "change": f"{sign}{change_pct:.2f}%",
@@ -69,7 +78,15 @@ def format_alert(alert):
         "MARKETWATCH": "MarketWatch",
         "EODHD": "EODHD",
         "EODHD_TECHNICAL": "EODHD Technical",
-        "EODHD_IPO": "EODHD IPO Calendar"
+        "EODHD_IPO": "EODHD IPO Calendar",
+        "THESTREET": "TheStreet",
+        "BENZINGA": "Benzinga",
+        "INVESTING_COM": "Investing.com",
+        "AMERICAN_BANKER": "American Banker",
+        "BANKING_DIVE": "Banking Dive",
+        "FIERCE_HEALTHCARE": "Fierce Healthcare",
+        "STAT_NEWS": "STAT News",
+        "FED_RESERVE": "Federal Reserve"
     }
 
     emoji = impact_emoji.get(impact, "🟢")

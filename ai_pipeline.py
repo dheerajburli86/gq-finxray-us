@@ -31,7 +31,7 @@ DEEPINFRA_MODEL = "google/gemini-2.5-flash"
 
 # -- AI Mode disabled for now (DeepInfra key pulled) — using keyword-based RAW mode.
 # Flip back to False once DEEPINFRA_API_KEY is restored in Railway.
-RAW_MODE = True
+RAW_MODE = False
 
 from Prompt_P2_GibberishChecker import get_prompt as gibberish_prompt
 from Prompt_V3_RelevanceCheck import get_prompt as relevance_prompt
