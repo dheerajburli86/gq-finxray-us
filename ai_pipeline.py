@@ -91,6 +91,49 @@ def clean_summary(text):
         text = text[0].upper() + text[1:]
     return text
 
+def standardize_numbers(text):
+    """
+    Standardize large numbers in summary text to readable format.
+    e.g. 1000000000 -> $1B, 50000000 -> $50M, 1500000 -> $1.5M
+    Also standardizes written numbers: "1 billion" -> "$1B"
+    """
+    if not text:
+        return text
+    import re
+
+    # Written forms: "1.5 billion" -> "$1.5B", "500 million" -> "$500M"
+    text = re.sub(
+        r'\$?\s*(\d+(?:\.\d+)?)\s*billion',
+        lambda m: f"${float(m.group(1)):.1f}B".replace('.0B', 'B'),
+        text, flags=re.IGNORECASE
+    )
+    text = re.sub(
+        r'\$?\s*(\d+(?:\.\d+)?)\s*million',
+        lambda m: f"${float(m.group(1)):.0f}M",
+        text, flags=re.IGNORECASE
+    )
+    text = re.sub(
+        r'\$?\s*(\d+(?:\.\d+)?)\s*trillion',
+        lambda m: f"${float(m.group(1)):.1f}T".replace('.0T', 'T'),
+        text, flags=re.IGNORECASE
+    )
+
+    # Raw large numbers: 1000000000 -> $1B etc
+    def replace_large_number(m):
+        n = float(m.group(0).replace(',', ''))
+        if n >= 1_000_000_000:
+            return f"${n/1_000_000_000:.1f}B".replace('.0B', 'B')
+        elif n >= 1_000_000:
+            return f"${n/1_000_000:.0f}M"
+        elif n >= 1_000:
+            return f"${n/1_000:.0f}K"
+        return m.group(0)
+
+    text = re.sub(r'\d{1,3}(?:,\d{3})+(?:\.\d+)?', replace_large_number, text)
+
+    return text
+
+
 def count_words(text):
     return len(text.split()) if text else 0
 
@@ -206,6 +249,7 @@ def summarise(company_name, raw_text, filing_type=""):
         return None
 
     summary = clean_summary(raw)
+    summary = standardize_numbers(summary)
     if count_words(summary) > 75:
         summary = trim_to_word_limit(summary, 75)
         print(f"[SUMMARY] Trimmed to word limit")
@@ -222,6 +266,7 @@ def summarise(company_name, raw_text, filing_type=""):
         return summary if count_words(summary) >= 5 else None
 
     summary_s3 = clean_summary(raw_s3)
+    summary_s3 = standardize_numbers(summary_s3)
     if count_words(summary_s3) > 75:
         summary_s3 = trim_to_word_limit(summary_s3, 75)
 
