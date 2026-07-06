@@ -129,6 +129,18 @@ NEWS_SOURCES = [
         "source_key": "MARKETWATCH",
         "sector": "FINANCE"
     },
+    {
+        "name": "American Banker",
+        "url": "https://www.americanbanker.com/feed",
+        "source_key": "AMERICAN_BANKER",
+        "sector": "FINANCE"
+    },
+    {
+        "name": "Banking Dive",
+        "url": "https://www.bankingdive.com/feeds/news",
+        "source_key": "BANKING_DIVE",
+        "sector": "FINANCE"
+    },
 
     # ── HEALTHCARE & PHARMA ───────────────────────────────────────────────────
     {
@@ -141,6 +153,18 @@ NEWS_SOURCES = [
         "name": "Reuters Health",
         "url": "https://feeds.reuters.com/reuters/healthNews",
         "source_key": "REUTERS",
+        "sector": "HEALTHCARE"
+    },
+    {
+        "name": "Fierce Healthcare",
+        "url": "https://www.fiercehealthcare.com/rss/xml",
+        "source_key": "FIERCE_HEALTHCARE",
+        "sector": "HEALTHCARE"
+    },
+    {
+        "name": "STAT News",
+        "url": "https://www.statnews.com/feed/",
+        "source_key": "STAT_NEWS",
         "sector": "HEALTHCARE"
     },
 
@@ -204,6 +228,30 @@ NEWS_SOURCES = [
         "url": "https://feeds.marketwatch.com/marketwatch/economy-politics",
         "source_key": "MARKETWATCH",
         "sector": "MACRO"
+    },
+    {
+        "name": "Federal Reserve News",
+        "url": "https://www.federalreserve.gov/feeds/press_all.xml",
+        "source_key": "FED_RESERVE",
+        "sector": "MACRO"
+    },
+    {
+        "name": "TheStreet",
+        "url": "https://www.thestreet.com/.rss/full/",
+        "source_key": "THESTREET",
+        "sector": "MARKET"
+    },
+    {
+        "name": "Investing.com News",
+        "url": "https://www.investing.com/rss/news.rss",
+        "source_key": "INVESTING_COM",
+        "sector": "MARKET"
+    },
+    {
+        "name": "Benzinga News",
+        "url": "https://www.benzinga.com/feed",
+        "source_key": "BENZINGA",
+        "sector": "MARKET"
     },
 ]
 
