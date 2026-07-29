@@ -25,7 +25,7 @@ def get_prompt(old_summary, new_summary):
                 Paragraph 1: {old_summary}
 
                 Paragraph 2: {new_summary}
-                
+
                 </INST>"""
-               
+
     return prompt

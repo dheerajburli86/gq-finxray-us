@@ -6,6 +6,7 @@ from datetime import datetime
 import os
 import time
 import re
+import traceback
 
 load_dotenv()
 
@@ -18,25 +19,24 @@ HEADERS = {
 
 CIK_MAP = {}
 
-# ── Watchlist filtering ───────────────────────────────────────────────────────
-_WATCHLIST_CACHE = {"tickers": set(), "loaded_at": 0}
-WATCHLIST_CACHE_TTL_SECONDS = 300  # refresh every 5 minutes
 
-def get_watchlist_tickers() -> set:
-    """Get the current set of watchlisted tickers from Supabase, cached briefly."""
-    now = time.time()
-    if _WATCHLIST_CACHE["tickers"] and (now - _WATCHLIST_CACHE["loaded_at"] < WATCHLIST_CACHE_TTL_SECONDS):
-        return _WATCHLIST_CACHE["tickers"]
+def log_poller_error(job_name, error, context=None):
+    """
+    Persist a poller failure to Supabase (poller_error_log) so it's visible
+    without needing Railway log access. Wrapped in its own try/except —
+    a logging failure here must never crash the poller itself.
+    """
+    print(f"[ERROR] {job_name}: {error}")
     try:
-        result = supabase.table("watchlists").select("ticker").execute()
-        tickers = {r["ticker"].upper() for r in result.data if r.get("ticker")}
-        if tickers:
-            _WATCHLIST_CACHE["tickers"] = tickers
-            _WATCHLIST_CACHE["loaded_at"] = now
-        return _WATCHLIST_CACHE["tickers"]
-    except Exception as e:
-        print(f"[ERROR] Failed to load watchlist tickers: {e}")
-        return _WATCHLIST_CACHE["tickers"]
+        supabase.table("poller_error_log").insert({
+            "poller_name": "edgar_poller",
+            "job_name": job_name,
+            "error_message": str(error)[:2000],
+            "error_traceback": traceback.format_exc()[:8000],
+            "context": context or {}
+        }).execute()
+    except Exception as log_err:
+        print(f"[ERROR] Failed to write to poller_error_log: {log_err}")
 
 EDGAR_8K_URL   = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&search_text=&output=atom"
 EDGAR_FORM4_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=40&search_text=&output=atom"
@@ -57,7 +57,7 @@ def load_cik_map():
             CIK_MAP[cik] = ticker
         print(f"[SETUP] Loaded {len(CIK_MAP):,} ticker mappings")
     except Exception as e:
-        print(f"[ERROR] Failed to load CIK map: {e}")
+        log_poller_error("load_cik_map", e)
 
 def get_ticker_from_cik(cik: str) -> str:
     padded = str(cik).zfill(10)
@@ -289,7 +289,7 @@ def store_filing(filing_type, company_name, ticker, raw_text, filing_url, extra=
         }).execute()
         print(f"[STORED] {filing_type} – {company_name} ({ticker}) → PENDING")
     except Exception as e:
-        print(f"[ERROR] Failed to store filing: {e}")
+        log_poller_error("store_filing", e, {"filing_type": filing_type, "ticker": ticker, "filing_url": filing_url})
 
 # ── Generic EDGAR poller ──────────────────────────────────────────────────────
 def poll_edgar_generic(url, form_type, label):
@@ -298,17 +298,18 @@ def poll_edgar_generic(url, form_type, label):
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
-            print(f"[ERROR] SEC EDGAR returned {r.status_code}")
+            log_poller_error(
+                f"poll_edgar_generic:{label}",
+                f"SEC EDGAR returned HTTP {r.status_code}",
+                {"url": url, "status_code": r.status_code, "response_snippet": r.text[:500]}
+            )
             return
 
         root = ET.fromstring(r.content)
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         entries = root.findall("atom:entry", ns)
 
-        watchlist = get_watchlist_tickers()
-
         new_count = 0
-        skipped_not_watched = 0
         for entry in entries:
             title_elem = entry.find("atom:title", ns)
             link_elem  = entry.find("atom:link", ns)
@@ -329,12 +330,6 @@ def poll_edgar_generic(url, form_type, label):
             company_name = company_match.group(1).strip() if company_match else title
             cik = company_match.group(2) if company_match else ""
             ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
-
-            # Only process filings for tickers on someone's watchlist —
-            # skip everything else before we spend time/LLM calls on it.
-            if ticker not in watchlist:
-                skipped_not_watched += 1
-                continue
 
             filing_text = fetch_filing_text(filing_url)
             if not filing_text or len(filing_text) < 100:
@@ -357,12 +352,12 @@ def poll_edgar_generic(url, form_type, label):
             time.sleep(0.3)
 
         if new_count == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new {label} filings. ({skipped_not_watched} skipped, not watchlisted)")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new {label} filings.")
         else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new {label} filings. ({skipped_not_watched} skipped, not watchlisted)")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new {label} filings.")
 
     except Exception as e:
-        print(f"[ERROR] {label} poll failed: {e}")
+        log_poller_error(f"poll_edgar_generic:{label}", e, {"url": url})
 
 def poll_sec_8k():
     poll_edgar_generic(EDGAR_8K_URL, "8-K", "8-K")
@@ -381,7 +376,11 @@ def poll_sec_form4():
     try:
         r = requests.get(EDGAR_FORM4_URL, headers=HEADERS, timeout=15)
         if r.status_code != 200:
-            print(f"[ERROR] SEC EDGAR returned {r.status_code}")
+            log_poller_error(
+                "poll_sec_form4",
+                f"SEC EDGAR returned HTTP {r.status_code}",
+                {"url": EDGAR_FORM4_URL, "status_code": r.status_code, "response_snippet": r.text[:500]}
+            )
             return
 
         root = ET.fromstring(r.content)
@@ -404,10 +403,7 @@ def poll_sec_form4():
                 accession_map[acc_num] = []
             accession_map[acc_num].append({"title": title, "url": filing_url})
 
-        watchlist = get_watchlist_tickers()
-
         new_count = 0
-        skipped_not_watched = 0
         processed_urls = set()
 
         for acc_num, entries_list in accession_map.items():
@@ -432,11 +428,6 @@ def poll_sec_form4():
             cik = issuer_match.group(2) if issuer_match else ""
             ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
 
-            # Only process insider filings for tickers on someone's watchlist.
-            if ticker not in watchlist:
-                skipped_not_watched += 1
-                continue
-
             insider_name = "Unknown Insider"
             if reporting:
                 rep_match = re.match(r'4\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)', reporting["title"])
@@ -459,12 +450,12 @@ def poll_sec_form4():
             time.sleep(0.3)
 
         if new_count == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new Form 4 filings. ({skipped_not_watched} skipped, not watchlisted)")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new Form 4 filings.")
         else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new Form 4 filings. ({skipped_not_watched} skipped, not watchlisted)")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new Form 4 filings.")
 
     except Exception as e:
-        print(f"[ERROR] Form 4 poll failed: {e}")
+        log_poller_error("poll_sec_form4", e, {"url": EDGAR_FORM4_URL})
 
 if __name__ == "__main__":
     load_cik_map()

@@ -3,7 +3,6 @@ import os
 import time
 import threading
 import schedule
-import requests
 from dotenv import load_dotenv
 from supabase import create_client
 from telegram import Bot
@@ -11,55 +10,45 @@ from datetime import datetime
 
 load_dotenv()
 
-# Ensure logs directory exists for rotating loggers
-import os as _os
-_os.makedirs("logs", exist_ok=True)
-
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+
+import fmp_client
+from feature_map import feature_footer
 
 from edgar_poller import poll_sec_8k, poll_sec_form4, poll_sec_10q, poll_sec_10k, poll_sec_s1, load_cik_map
 from news_poller import poll_all_news
-from eodhd_poller import poll_eodhd_news, poll_eodhd_events
+from fmp_poller import poll_eodhd_news, poll_eodhd_events
 from result_snapshot import process_pending_snapshots
-from eodhd_technical_poller import run_technical_poller
-from eodhd_ipo_poller import run_ipo_poller
+from technical_poller import run_technical_poller
+from ipo_poller import run_ipo_poller
+from earnings_transcript_poller import run_earnings_transcript_poller
 from news_roundup import run_morning_roundup, run_evening_roundup, run_etf_xray
 from etf_flow_poller import run_etf_flow_poller
 from heatmap_generator import run_sector_heatmap_daily, run_sector_heatmap_weekly, run_sector_heatmap_monthly
 
-# ── TwelveData price fetch ────────────────────────────────────────────────────
+
+# ── FMP price fetch (replaces TwelveData) ─────────────────────────────────────
 def get_stock_price(ticker: str):
-    """Fetch real-time price and % change for a ticker from TwelveData."""
+    """Fetch live price and % change for a ticker from FMP."""
     try:
-        # Use /quote for price + percent_change in one call
-        url = f"https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVEDATA_API_KEY}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if data.get("status") == "error":
+        q = fmp_client.get_quote(ticker)
+        if not q or q.get("price") is None:
             return None
-
-        # Use 'close' for latest price — fallback to 'price' field
-        price = float(data.get("close") or data.get("price") or 0)
-        if price == 0:
-            return None
-
-        # percent_change = today's change vs previous close
-        change_pct = float(data.get("percent_change") or 0)
+        price = float(q.get("price", 0))
+        change_pct = float(q.get("changePercentage", 0) or 0)
         arrow = "🟢" if change_pct >= 0 else "🔴"
         sign = "+" if change_pct >= 0 else ""
-
-        # Sanity check — if price looks wrong (>10x typical range) skip it
         return {
             "price": f"${price:,.2f}",
             "change": f"{sign}{change_pct:.2f}%",
             "arrow": arrow
         }
     except Exception as e:
-        print(f"[TWELVEDATA] Price fetch failed for {ticker}: {e}")
+        print(f"[FMP] Price fetch failed for {ticker}: {e}")
         return None
+
 
 # ── Alert formatter ───────────────────────────────────────────────────────────
 def format_alert(alert):
@@ -76,24 +65,22 @@ def format_alert(alert):
         "CNBC": "CNBC",
         "REUTERS": "Reuters",
         "MARKETWATCH": "MarketWatch",
-        "EODHD": "EODHD",
-        "EODHD_TECHNICAL": "EODHD Technical",
-        "EODHD_IPO": "EODHD IPO Calendar",
-        "THESTREET": "TheStreet",
-        "BENZINGA": "Benzinga",
-        "INVESTING_COM": "Investing.com",
-        "AMERICAN_BANKER": "American Banker",
-        "BANKING_DIVE": "Banking Dive",
-        "FIERCE_HEALTHCARE": "Fierce Healthcare",
-        "STAT_NEWS": "STAT News",
-        "FED_RESERVE": "Federal Reserve"
+        "FMP_NEWS": "FMP",
+        "TECHNICAL": "Technical (Massive/FMP)",
+        "FMP_IPO": "FMP IPO Calendar",
+        "FMP_TRANSCRIPT": "FMP Earnings Call Transcript",
+        "ETF_FLOW": "ETF Flow (Massive)",
+        "SECTOR_HEATMAP": "Sector Heatmap",
+        "NEWS_ROUNDUP": "News Roundup",
+        "ETF_XRAY": "ETF Xray",
     }
 
     emoji = impact_emoji.get(impact, "🟢")
     source_name = source_labels.get(source, source)
     time_str = datetime.now().strftime("%I:%M %p EST")
+    footer = f"\n\n{feature_footer(source, filing_type)}"
 
-    # Fetch live price from TwelveData (skip MARKET ticker)
+    # Fetch live price from FMP (skip MARKET ticker)
     price_line = ""
     if ticker and ticker != "MARKET":
         price_data = get_stock_price(ticker)
@@ -114,10 +101,25 @@ def format_alert(alert):
             f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
             f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
+        )
+
+    if filing_type == "EARNINGS_TRANSCRIPT":
+        year = extra.get("year", "")
+        quarter = extra.get("quarter", "")
+        return (
+            f"📞 *Earnings Call Transcript — ${ticker}*"
+            f"{price_line}\n"
+            f"🗓 *Quarter:* Q{quarter} FY{year}\n\n"
+            f"{summary}\n\n"
+            f"📋 FMP Earnings Call Transcript · {time_str}\n\n"
+            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
+            f"_Disclaimer: gquants.com/disclaimer_\n\n"
+            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
         )
 
     if filing_type == "RESULT_SNAPSHOT":
-        metrics = extra.get("metrics", {}) if extra else {}
         period = extra.get("period", "") if extra else ""
         form = extra.get("form_type", "") if extra else ""
         form_label = "Quarterly Results" if form == "10-Q" else "Annual Results"
@@ -127,9 +129,10 @@ def format_alert(alert):
             f"📅 *Period:* {period}\n\n"
             f"{summary}\n\n"
             f"📋 SEC {form} · {time_str}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock\'s news, updates and transactions._\n"
+            f"_You are receiving this notification based on your request to monitor this stock\\'s news, updates and transactions._\n"
             f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
         )
 
     if filing_type == "BULK_DEAL":
@@ -144,10 +147,11 @@ def format_alert(alert):
             f"{summary}\n\n"
             f"💰 Value: {value} · Shares: {shares}\n"
             f"👤 {insider}\n"
-            f"📋 EODHD Insider Data · {time_str}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock\'s news, updates and transactions._\n"
+            f"📋 FMP Insider Data · {time_str}\n\n"
+            f"_You are receiving this notification based on your request to monitor this stock\\'s news, updates and transactions._\n"
             f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
         )
 
     if filing_type == "4":
@@ -163,6 +167,7 @@ def format_alert(alert):
             f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
             f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
         )
 
     if filing_type == "S-1":
@@ -174,6 +179,7 @@ def format_alert(alert):
             f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
             f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
         )
 
     if filing_type == "NEWS":
@@ -185,23 +191,26 @@ def format_alert(alert):
             f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
             f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
         )
 
-    if source == "EODHD_TECHNICAL":
+    if source == "TECHNICAL":
         return (
             f"{summary}\n\n"
             f"{price_line}"
             f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
             f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
         )
 
-    if source == "EODHD_IPO":
+    if source == "FMP_IPO":
         return (
             f"{summary}\n\n"
             f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
             f"_Disclaimer: gquants.com/disclaimer_\n\n"
             f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+            f"{footer}"
         )
 
     item_types = extra.get("item_types", [])
@@ -218,7 +227,9 @@ def format_alert(alert):
         f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
         f"_Disclaimer: gquants.com/disclaimer_\n\n"
         f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
+        f"{footer}"
     )
+
 
 # ── Error alerting ────────────────────────────────────────────────────────────
 async def send_error_alert(message: str):
@@ -229,8 +240,45 @@ async def send_error_alert(message: str):
             text=f"⚠️ *GQ FinXray US — System Alert*\n\n{message}\n\n🕐 {datetime.now().strftime('%I:%M %p IST')}",
             parse_mode="Markdown"
         )
-    except:
+    except Exception:
         pass
+
+
+# ── Run log: one row per alert actually sent to Telegram ─────────────────────
+def log_alert_run(alert, telegram_success, telegram_error=None):
+    """
+    Writes to alert_run_log -- the review/audit trail for every alert this
+    system sends, regardless of whether it went through the AI summarizer
+    (news/filings/transcripts, where summarization_attempts and the token
+    counts are real numbers pulled out of the alert's `extra`) or was a
+    templated alert with no LLM involved at all (technical/IPO/ETF flow/
+    result snapshot/heatmap, where those fields are simply absent from
+    `extra` and land here as None/null -- that's expected, not a bug).
+    Logged for every alert, success or failure, so a failed Telegram send
+    is visible here too rather than just vanishing.
+    """
+    try:
+        extra = alert.get("extra") or {}
+        supabase.table("alert_run_log").insert({
+            "alert_id": alert.get("id"),
+            "ticker": alert.get("ticker", "UNKNOWN"),
+            "source": alert.get("source"),
+            "filing_type": alert.get("filing_type"),
+            "feature_id": extra.get("feature_id"),
+            "feature_name": extra.get("feature_name"),
+            "impact": alert.get("impact"),
+            "summarization_attempts": extra.get("summarization_attempts"),
+            "input_tokens": extra.get("input_tokens"),
+            "output_tokens": extra.get("output_tokens"),
+            "total_tokens": extra.get("total_tokens"),
+            "llm_calls": extra.get("llm_calls"),
+            "telegram_success": telegram_success,
+            "telegram_error": (str(telegram_error)[:500] if telegram_error else None)
+        }).execute()
+    except Exception as e:
+        # A logging failure must never take down real alert delivery.
+        print(f"[ERROR] Failed to write alert_run_log for {alert.get('ticker', 'UNKNOWN')}: {e}")
+
 
 # ── Deliver pending alerts ────────────────────────────────────────────────────
 async def deliver_pending_alerts():
@@ -247,7 +295,6 @@ async def deliver_pending_alerts():
             return
 
         bot = Bot(token=TELEGRAM_TOKEN)
-        impact_order = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
         for alert in alerts:
             ticker = alert.get("ticker", "UNKNOWN")
@@ -263,8 +310,14 @@ async def deliver_pending_alerts():
                         parse_mode="Markdown"
                     )
                     print(f"[CHANNEL] {impact} — ${ticker} sent to channel")
+                    log_alert_run(alert, telegram_success=True)
                 except Exception as e:
                     print(f"[ERROR] Channel post failed for {ticker}: {e}")
+                    log_alert_run(alert, telegram_success=False, telegram_error=e)
+            else:
+                # No channel configured -- nothing was actually sent, but
+                # still log it so the run record isn't silently incomplete.
+                log_alert_run(alert, telegram_success=False, telegram_error="TELEGRAM_CHANNEL_ID not configured")
 
             # Mark delivered
             supabase.table("alerts") \
@@ -276,63 +329,58 @@ async def deliver_pending_alerts():
     except Exception as e:
         print(f"[ERROR] Delivery failed: {e}")
 
-# ── Market report helpers ─────────────────────────────────────────────────────
+
+# ── Market report helpers (FMP replaces TwelveData) ──────────────────────────
 def fetch_index_data():
-    """Fetch S&P 500, NASDAQ, Dow from TwelveData."""
+    """Fetch S&P 500, NASDAQ, Dow from FMP."""
     indices = {"SPY": "S&P 500", "QQQ": "NASDAQ", "DIA": "Dow Jones"}
     lines = []
     for symbol, name in indices.items():
         try:
-            url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            price_val = data.get("close") or data.get("price")
-            if price_val:
-                price = float(price_val)
-                chg = float(data.get("percent_change", 0))
+            q = fmp_client.get_quote(symbol)
+            if q and q.get("price"):
+                price = float(q["price"])
+                chg = float(q.get("changePercentage", 0) or 0)
                 arrow = "🟢" if chg >= 0 else "🔴"
                 sign = "+" if chg >= 0 else ""
                 lines.append(f"{arrow} *{name}:* ${price:,.2f} ({sign}{chg:.2f}%)")
-        except:
+        except Exception:
             pass
     return "\n".join(lines) if lines else "Index data unavailable"
 
+
 def fetch_macro_data():
-    """Fetch DXY, Gold, Crude Oil from TwelveData."""
-    instruments = {"XAU/USD": "Gold", "USOIL": "Crude Oil", "USD/DXY": "DXY (Dollar)"}
+    """Fetch Gold, Crude Oil, Natural Gas from FMP commodities quotes."""
+    instruments = {"GCUSD": "Gold", "CLUSD": "Crude Oil", "NGUSD": "Natural Gas"}
     lines = []
     for symbol, name in instruments.items():
         try:
-            url = f"https://api.twelvedata.com/quote?symbol={symbol}&apikey={TWELVEDATA_API_KEY}"
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            price_val = data.get("close") or data.get("price")
-            if price_val:
-                price = float(price_val)
-                chg = float(data.get("percent_change", 0))
+            q = fmp_client.get_commodity_quote(symbol)
+            if q and q.get("price"):
+                price = float(q["price"])
+                chg = float(q.get("changePercentage", 0) or 0)
                 arrow = "🟢" if chg >= 0 else "🔴"
                 sign = "+" if chg >= 0 else ""
                 lines.append(f"{arrow} *{name}:* ${price:,.2f} ({sign}{chg:.2f}%)")
-        except:
+        except Exception:
             pass
     return "\n".join(lines) if lines else "Macro data unavailable"
 
+
 def fetch_top_movers():
-    """Fetch top 3 gainers and losers from a default watchlist."""
+    """Fetch top 3 gainers and losers from a default watchlist via FMP."""
     tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AMD", "JPM", "BAC"]
     results = []
     for ticker in tickers:
         try:
-            url = f"https://api.twelvedata.com/quote?symbol={ticker}&apikey={TWELVEDATA_API_KEY}"
-            r = requests.get(url, timeout=10)
-            data = r.json()
-            if "close" in data:
+            q = fmp_client.get_quote(ticker)
+            if q and q.get("price"):
                 results.append({
                     "ticker": ticker,
-                    "change": float(data.get("percent_change", 0)),
-                    "price": float(data["close"])
+                    "change": float(q.get("changePercentage", 0) or 0),
+                    "price": float(q["price"])
                 })
-        except:
+        except Exception:
             pass
     if not results:
         return "Movers data unavailable", "Movers data unavailable"
@@ -341,76 +389,54 @@ def fetch_top_movers():
     losers = "\n".join([f"🔴 *{r['ticker']}:* {r['change']:.2f}%" for r in results[-3:]])
     return gainers, losers
 
+
 async def send_market_report(title: str, body: str):
-    """Send a market report to the Telegram channel."""
     if not TELEGRAM_CHANNEL_ID:
         return
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         time_str = datetime.now().strftime("%I:%M %p EST")
         msg = f"📊 *{title}*\n_{time_str}_\n\n{body}\n\n_GQ FinXray US · gquants.com_"
-        await bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            text=msg,
-            parse_mode="Markdown"
-        )
+        await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=msg, parse_mode="Markdown")
         print(f"[REPORT] Sent: {title}")
     except Exception as e:
         print(f"[ERROR] Failed to send market report: {e}")
 
+
 def send_premarket_report():
     indices = fetch_index_data()
     macro = fetch_macro_data()
-    body = (
-        f"*US Futures & Pre-Market Snapshot*\n\n"
-        f"{indices}\n\n"
-        f"*Macro*\n{macro}"
-    )
+    body = f"*US Futures & Pre-Market Snapshot*\n\n{indices}\n\n*Macro*\n{macro}"
     asyncio.run(send_market_report("🌅 Pre-Market Report", body))
+
 
 def send_market_open_report():
     indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = (
-        f"*Markets are now open.*\n\n"
-        f"*Indices at Open*\n{indices}\n\n"
-        f"*Early Gainers*\n{gainers}\n\n"
-        f"*Early Losers*\n{losers}"
-    )
+    body = f"*Markets are now open.*\n\n*Indices at Open*\n{indices}\n\n*Early Gainers*\n{gainers}\n\n*Early Losers*\n{losers}"
     asyncio.run(send_market_report("🔔 Market Open", body))
+
 
 def send_midday_report():
     indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
-    body = (
-        f"*Midday Market Check*\n\n"
-        f"*Indices*\n{indices}\n\n"
-        f"*Top Gainers*\n{gainers}\n\n"
-        f"*Top Losers*\n{losers}"
-    )
+    body = f"*Midday Market Check*\n\n*Indices*\n{indices}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}"
     asyncio.run(send_market_report("⏱ Midday Pulse", body))
+
 
 def send_market_close_report():
     indices = fetch_index_data()
     gainers, losers = fetch_top_movers()
     macro = fetch_macro_data()
-    body = (
-        f"*Markets have closed.*\n\n"
-        f"*Final Index Levels*\n{indices}\n\n"
-        f"*Top Gainers*\n{gainers}\n\n"
-        f"*Top Losers*\n{losers}\n\n"
-        f"*Macro*\n{macro}"
-    )
+    body = f"*Markets have closed.*\n\n*Final Index Levels*\n{indices}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}\n\n*Macro*\n{macro}"
     asyncio.run(send_market_report("📉 Market Close Report", body))
+
 
 def send_afterhours_report():
     gainers, losers = fetch_top_movers()
-    body = (
-        f"*After-Hours Notable Movers*\n\n"
-        f"*Gainers*\n{gainers}\n\n"
-        f"*Losers*\n{losers}"
-    )
+    body = f"*After-Hours Notable Movers*\n\n*Gainers*\n{gainers}\n\n*Losers*\n{losers}"
     asyncio.run(send_market_report("🌙 After-Hours Movers", body))
+
 
 # ── Scheduler thread ──────────────────────────────────────────────────────────
 def run_scheduler():
@@ -428,29 +454,29 @@ def run_scheduler():
     schedule.every(5).minutes.do(poll_sec_10k)
     schedule.every(10).minutes.do(poll_sec_s1)
     schedule.every(30).minutes.do(process_pending_snapshots)
+    schedule.every(30).minutes.do(run_earnings_transcript_poller)
     schedule.every(60).seconds.do(poll_all_news)
 
-    # Market reports — times in EST (adjust if Railway runs UTC: subtract 5hrs)
-    # EODHD pollers
+    # FMP news + events pollers (Features 2, 4, 5)
     poll_eodhd_news()
     poll_eodhd_events()
     schedule.every(10).minutes.do(poll_eodhd_news)
     schedule.every(60).minutes.do(poll_eodhd_events)
 
-    # Round 2 — Technical + IPO pollers
+    # Technical + IPO pollers (Features 6, 8)
     run_technical_poller()
     run_ipo_poller()
     schedule.every(60).minutes.do(run_technical_poller)
     schedule.every().day.at("08:00").do(run_ipo_poller)
 
-    # Round 3 — News Roundup + ETF Xray
+    # News Roundup + ETF Xray + ETF Flow (Features 7, 10)
     schedule.every().day.at("07:00").do(run_morning_roundup)
     schedule.every().day.at("09:00").do(run_etf_xray)
     run_etf_flow_poller()
     schedule.every(60).minutes.do(run_etf_flow_poller)
     schedule.every().day.at("18:00").do(run_evening_roundup)
 
-    # Market reports
+    # Market reports + Sector Heatmap (Feature 9)
     schedule.every().day.at("09:25").do(send_premarket_report)
     schedule.every().day.at("09:30").do(send_market_open_report)
     schedule.every().day.at("09:30").do(run_sector_heatmap_daily)
@@ -466,6 +492,7 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
+
 # ── AI pipeline thread ────────────────────────────────────────────────────────
 def run_pipeline():
     print("[PIPELINE] Starting...")
@@ -478,6 +505,7 @@ def run_pipeline():
             asyncio.run(send_error_alert(f"Pipeline error: {str(e)}"))
         time.sleep(60)
 
+
 # ── Delivery loop ─────────────────────────────────────────────────────────────
 async def delivery_loop():
     print("[DELIVERY] Starting...")
@@ -485,19 +513,21 @@ async def delivery_loop():
         await deliver_pending_alerts()
         await asyncio.sleep(30)
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     print("""
-╔══════════════════════════════════════════╗
-║       GQ FinXray US — Starting Up        ║
-║  SEC EDGAR + EODHD + News + AI + Telegram ║
-╚══════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════╗
+║            GQ FinXray US — Starting Up               ║
+║  SEC EDGAR + FMP + Massive + News + AI + Telegram    ║
+╚══════════════════════════════════════════════════════╝
     """)
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     pipeline_thread = threading.Thread(target=run_pipeline, daemon=True)
     pipeline_thread.start()
     await delivery_loop()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

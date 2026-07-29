@@ -1,5 +1,8 @@
 """
-Shared utilities for all heatmap scrapers.
+Shared utilities for all heatmap/universe scrapers.
+TwelveData (td_time_series/td_quote) removed — replaced with FMP equivalents
+via fmp_client.py. calc_returns/apply_glocom/upsert_* are vendor-agnostic
+and unchanged.
 """
 import os
 import time
@@ -9,11 +12,12 @@ from datetime import datetime, date
 from dotenv import load_dotenv
 from supabase import create_client
 
+import fmp_client
+
 load_dotenv()
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].strip()
 SUPABASE_KEY = (os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]).strip()
-TWELVEDATA_KEY = (os.environ.get("TWELVEDATA_API_KEY") or os.environ.get("TWELVEDATA_KEY", "")).strip()
 
 _sb = None
 
@@ -24,35 +28,23 @@ def supabase():
     return _sb
 
 
-def td_time_series(symbol, outputsize=5000, retries=4):
-    """Fetch daily OHLCV newest→oldest. Returns list or None."""
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": "1day",
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_KEY,
-        "format": "JSON",
-        "order": "DESC",
-    }
+def fmp_time_series(symbol, from_date=None, to_date=None, retries=4):
+    """Fetch daily OHLCV newest->oldest via FMP historical-price-eod/full.
+    Returns list of dicts shaped like {'date':..., 'close':...} (same keys
+    calc_returns() already expects) or None."""
+    if not from_date:
+        from_date = "2014-01-01"
+    if not to_date:
+        to_date = date.today().isoformat()
+
     wait = 5
     for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, timeout=30)
-            data = r.json()
-            if data.get("status") == "error":
-                if data.get("code") == 429:
-                    sleep_s = 60 * (attempt + 1)
-                    print(f"  [rate limit] sleeping {sleep_s}s for {symbol}")
-                    time.sleep(sleep_s)
-                    continue
-                print(f"  [td error] {symbol}: {data.get('message')}")
-                return None
-            values = data.get("values")
-            if not values:
+            data = fmp_client.get_historical_prices(symbol, from_date, to_date)
+            if not data:
                 print(f"  [no data] {symbol}")
                 return None
-            return values
+            return sorted(data, key=lambda r: r.get("date", ""), reverse=True)
         except Exception as e:
             print(f"  [exception] {symbol} attempt {attempt+1}: {e}")
             time.sleep(wait)
@@ -60,15 +52,15 @@ def td_time_series(symbol, outputsize=5000, retries=4):
     return None
 
 
-def td_quote(symbol, retries=3):
-    url = "https://api.twelvedata.com/quote"
+def fmp_quote(symbol, retries=3):
     for _ in range(retries):
         try:
-            r = requests.get(url, params={"symbol": symbol, "apikey": TWELVEDATA_KEY}, timeout=15)
-            d = r.json()
-            return None if d.get("status") == "error" else d
+            q = fmp_client.get_quote(symbol)
+            if q:
+                return q
         except Exception:
-            time.sleep(3)
+            pass
+        time.sleep(3)
     return None
 
 
@@ -121,7 +113,7 @@ def calc_returns(prices):
 
 def apply_glocom(rows):
     """
-    Add glocom_code (1=best…5=worst), glocom_label, sort_score.
+    Add glocom_code (1=best...5=worst), glocom_label, sort_score.
     """
     if not rows:
         return rows
@@ -172,7 +164,7 @@ def upsert_returns(rows, batch=50):
     for i in range(0, len(cleaned), batch):
         sb.table("returns_latest").upsert(cleaned[i:i+batch], on_conflict="instrument_id").execute()
         time.sleep(0.1)
-    print(f"  → {len(cleaned)} rows → returns_latest")
+    print(f"  -> {len(cleaned)} rows -> returns_latest")
 
 
 def upsert_prices(rows, batch=50):
@@ -198,10 +190,10 @@ def upsert_history(rows, batch=200):
                 break
             except Exception as e:
                 wait = 2 ** attempt
-                print(f"  [upsert_history retry {attempt+1}] {e} — sleeping {wait}s")
+                print(f"  [upsert_history retry {attempt+1}] {e} -- sleeping {wait}s")
                 time.sleep(wait)
         time.sleep(0.05)
-    print(f"  → {len(rows)} rows → price_history")
+    print(f"  -> {len(rows)} rows -> price_history")
 
 
 def load_instruments(universe=None):
@@ -222,7 +214,7 @@ def load_instruments(universe=None):
                 if attempt == 4:
                     raise
                 wait = 10 * (attempt + 1)
-                print(f"  [load_instruments retry {attempt+1}] {e} — sleeping {wait}s")
+                print(f"  [load_instruments retry {attempt+1}] {e} -- sleeping {wait}s")
                 time.sleep(wait)
         rows.extend(batch)
         if len(batch) < 1000:

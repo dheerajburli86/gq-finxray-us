@@ -1,25 +1,32 @@
 """
-Result Snapshot — GQ FinXray US
-Triggered when a 10-Q or 10-K lands in raw_filings.
-Fetches structured financial data from EODHD fundamentals API
-and builds a Result Snapshot alert matching India FinXray style.
+result_snapshot.py
+GQ FinXray US — Feature 3. Rewritten on FMP (was EODHD).
+
+Triggered when a 10-Q or 10-K lands in raw_filings. Fetches structured
+quarterly financials from FMP's income-statement endpoint (instead of
+EODHD's monolithic /fundamentals/ payload) and builds a Result Snapshot
+alert matching the original India FinXray style.
+
+FMP returns quarterly statements as a flat list (newest first), each row
+keyed by symbol/date/period/fiscalYear — simpler to walk than EODHD's
+nested {yearly: {...}, quarterly: {...}} dict-of-dicts shape.
 """
 import os
 import time
-import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import create_client
 
+import fmp_client
+from feature_map import tag_extra
+
 load_dotenv()
 
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-EODHD_API_KEY = os.getenv("EODHD_API_KEY")
-BASE_URL = "https://eodhd.com/api"
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def fmt_value(val, prefix="$", suffix=""):
-    """Format large numbers into readable strings."""
     if val is None:
         return "N/A"
     try:
@@ -32,20 +39,11 @@ def fmt_value(val, prefix="$", suffix=""):
             return f"{prefix}{val/1_000:.2f}K{suffix}"
         else:
             return f"{prefix}{val:.2f}{suffix}"
-    except:
+    except Exception:
         return "N/A"
 
-def fmt_pct(val):
-    """Format percentage values."""
-    if val is None:
-        return "N/A"
-    try:
-        return f"{float(val)*100:.1f}%"
-    except:
-        return "N/A"
 
 def change_arrow(current, previous):
-    """Return up/down arrow + percentage change between two values."""
     try:
         curr = float(current)
         prev = float(previous)
@@ -54,11 +52,19 @@ def change_arrow(current, previous):
         pct = ((curr - prev) / abs(prev)) * 100
         arrow = "▲" if pct >= 0 else "▼"
         return f"{arrow} {abs(pct):.1f}%"
-    except:
+    except Exception:
         return "N/A"
 
+
+def g(row, *keys, default=None):
+    """Try several possible key spellings — FMP has renamed fields across versions."""
+    for k in keys:
+        if k in row and row[k] is not None:
+            return row[k]
+    return default
+
+
 def snapshot_already_sent(ticker, period):
-    """Check if we already sent a snapshot for this ticker + period."""
     try:
         result = supabase.table("alerts") \
             .select("id") \
@@ -67,111 +73,78 @@ def snapshot_already_sent(ticker, period):
             .eq("extra->>period", str(period)) \
             .execute()
         return len(result.data) > 0
-    except:
+    except Exception:
         return False
 
-# ── EODHD Fundamentals Fetch ──────────────────────────────────────────────────
-def fetch_fundamentals(ticker):
-    """Fetch full fundamentals from EODHD for a ticker."""
-    try:
-        url = f"{BASE_URL}/fundamentals/{ticker}.US"
-        r = requests.get(url, params={"api_token": EODHD_API_KEY, "fmt": "json"}, timeout=20)
-        if r.status_code == 200:
-            return r.json()
-        else:
-            print(f"[SNAPSHOT] EODHD fundamentals returned {r.status_code} for {ticker}")
-            return None
-    except Exception as e:
-        print(f"[SNAPSHOT] Failed to fetch fundamentals for {ticker}: {e}")
-        return None
 
 # ── Result Snapshot Builder ───────────────────────────────────────────────────
 def build_result_snapshot(ticker, form_type):
-    """
-    Build a Result Snapshot alert from EODHD fundamentals.
-    Covers: Revenue, Gross Profit, Operating Income, EBITDA, Net Income,
-    EPS — with QoQ and YoY comparisons.
-    """
-    data = fetch_fundamentals(ticker)
-    if not data:
+    quarters = fmp_client.get_income_statement(ticker, period="quarter", limit=8)
+    if not quarters or len(quarters) < 2:
+        print(f"[SNAPSHOT] Not enough quarterly data for {ticker}")
         return None
 
-    financials = data.get("Financials", {})
-    income = financials.get("Income_Statement", {})
-    highlights = data.get("Highlights", {})
-    general = data.get("General", {})
+    quarters = sorted(quarters, key=lambda r: r.get("date", ""), reverse=True)
+    latest = quarters[0]
+    prev = quarters[1]
+    yoy = quarters[4] if len(quarters) >= 5 else None
 
-    company_name = general.get("Name", ticker)
-    currency = general.get("CurrencyCode", "USD")
+    profile = fmp_client.get_profile(ticker)
+    company_name = (profile or {}).get("companyName", ticker)
 
-    # Get quarterly data
-    quarterly = income.get("quarterly", {})
-    if not quarterly:
-        print(f"[SNAPSHOT] No quarterly data for {ticker}")
-        return None
-
-    sorted_quarters = sorted(quarterly.keys(), reverse=True)
-    if len(sorted_quarters) < 2:
-        print(f"[SNAPSHOT] Not enough quarters for {ticker}")
-        return None
-
-    # Latest quarter vs previous quarter (QoQ)
-    latest_q = sorted_quarters[0]
-    prev_q = sorted_quarters[1]
-    latest = quarterly[latest_q]
-    prev = quarterly[prev_q]
-
-    # Same quarter last year (YoY) — find it
-    yoy_q = None
-    yoy = None
-    if len(sorted_quarters) >= 5:
-        yoy_q = sorted_quarters[4]
-        yoy = quarterly[yoy_q]
-
-    period = latest_q
+    # g() tries several key spellings since FMP has renamed fields across API
+    # versions (older v3-style responses used all-lowercase keys; current
+    # /stable responses use camelCase) — applied to every financial-statement
+    # field read here, not just EPS, so a version mismatch degrades to "N/A"
+    # instead of a KeyError-shaped None silently propagating into the alert.
+    period = f"{g(latest, 'period', default='')} FY{g(latest, 'fiscalYear', 'calendarYear', default='')}".strip()
+    if not period.strip():
+        period = latest.get("date", "latest quarter")
 
     if snapshot_already_sent(ticker, period):
         print(f"[SNAPSHOT] Already sent for {ticker} {period}")
         return None
 
-    # Extract metrics
-    revenue_latest = latest.get("totalRevenue")
-    revenue_prev = prev.get("totalRevenue")
-    revenue_yoy = yoy.get("totalRevenue") if yoy else None
+    revenue_latest = g(latest, "revenue", "totalRevenue")
+    revenue_prev = g(prev, "revenue", "totalRevenue")
+    revenue_yoy = g(yoy, "revenue", "totalRevenue") if yoy else None
 
-    gross_profit_latest = latest.get("grossProfit")
-    gross_profit_prev = prev.get("grossProfit")
+    gross_profit_latest = g(latest, "grossProfit", "grossprofit")
+    gross_profit_prev = g(prev, "grossProfit", "grossprofit")
 
-    op_income_latest = latest.get("operatingIncome")
-    op_income_prev = prev.get("operatingIncome")
+    op_income_latest = g(latest, "operatingIncome", "operatingincome")
+    op_income_prev = g(prev, "operatingIncome", "operatingincome")
 
-    ebitda_latest = latest.get("ebitda")
-    ebitda_prev = prev.get("ebitda")
+    ebitda_latest = g(latest, "ebitda", "EBITDA")
+    ebitda_prev = g(prev, "ebitda", "EBITDA")
 
-    net_income_latest = latest.get("netIncome")
-    net_income_prev = prev.get("netIncome")
-    net_income_yoy = yoy.get("netIncome") if yoy else None
+    net_income_latest = g(latest, "netIncome", "netincome")
+    net_income_prev = g(prev, "netIncome", "netincome")
+    net_income_yoy = g(yoy, "netIncome", "netincome") if yoy else None
 
-    eps_latest = latest.get("dilutedEPS")
-    eps_prev = prev.get("dilutedEPS")
-    eps_yoy = yoy.get("dilutedEPS") if yoy else None
+    eps_latest = g(latest, "epsDiluted", "epsdiluted", "eps")
+    eps_prev = g(prev, "epsDiluted", "epsdiluted", "eps")
+    eps_yoy = g(yoy, "epsDiluted", "epsdiluted", "eps") if yoy else None
 
-    # Margin calculations
     def margin(income_val, revenue_val):
         try:
             return (float(income_val) / float(revenue_val)) * 100
-        except:
+        except Exception:
             return None
 
     gross_margin = margin(gross_profit_latest, revenue_latest)
     op_margin = margin(op_income_latest, revenue_latest)
     net_margin = margin(net_income_latest, revenue_latest)
+    # EPS is a per-share decimal (e.g. 1.25), not an aggregate dollar amount —
+    # fmt_value()'s B/M/K suffix logic is for totals like revenue/net income,
+    # so it was deliberately not used here. Instead, just guarantee a plain
+    # "N/A" instead of the literal string "None" leaking into a customer-
+    # facing alert when a field name doesn't resolve.
+    try:
+        eps_display = f"${float(eps_latest):.2f}" if eps_latest is not None else "N/A"
+    except Exception:
+        eps_display = "N/A"
 
-    # Get YoY revenue growth from highlights if available
-    rev_growth_yoy = highlights.get("QuarterlyRevenueGrowthYOY")
-    earn_growth_yoy = highlights.get("QuarterlyEarningsGrowthYOY")
-
-    # Build the summary text
     lines = [
         f"{company_name} has published financial results for {period}.",
         "",
@@ -194,13 +167,12 @@ def build_result_snapshot(ticker, form_type):
         f" | QoQ: {change_arrow(net_income_latest, net_income_prev)}" +
         (f" | YoY: {change_arrow(net_income_latest, net_income_yoy)}" if net_income_yoy else ""),
 
-        f"EPS: {eps_latest} | QoQ: {change_arrow(eps_latest, eps_prev)}" +
+        f"EPS: {eps_display} | QoQ: {change_arrow(eps_latest, eps_prev)}" +
         (f" | YoY: {change_arrow(eps_latest, eps_yoy)}" if eps_yoy else ""),
     ]
 
     summary = "\n".join([l for l in lines if l is not None])
 
-    # Determine impact
     try:
         rev_qoq = float(revenue_latest) / float(revenue_prev) - 1 if revenue_latest and revenue_prev else 0
         if abs(rev_qoq) > 0.15:
@@ -209,7 +181,7 @@ def build_result_snapshot(ticker, form_type):
             impact = "MEDIUM"
         else:
             impact = "LOW"
-    except:
+    except Exception:
         impact = "MEDIUM"
 
     return {
@@ -223,41 +195,37 @@ def build_result_snapshot(ticker, form_type):
             "revenue": fmt_value(revenue_latest),
             "gross_profit": fmt_value(gross_profit_latest),
             "net_income": fmt_value(net_income_latest),
-            "eps": str(eps_latest) if eps_latest else "N/A",
+            "eps": eps_display,
             "gross_margin": f"{gross_margin:.1f}%" if gross_margin else "N/A",
             "net_margin": f"{net_margin:.1f}%" if net_margin else "N/A",
             "period": period
         }
     }
 
+
 def store_snapshot_alert(snapshot):
-    """Store Result Snapshot as a direct alert."""
     try:
         supabase.table("alerts").insert({
             "ticker": snapshot["ticker"],
             "summary": snapshot["summary"],
             "impact": snapshot["impact"],
-            "source": "EODHD",
+            "source": "FMP",
             "filing_type": "RESULT_SNAPSHOT",
-            "extra": {
+            "extra": tag_extra({
                 "period": snapshot["period"],
                 "form_type": snapshot["form_type"],
                 "company_name": snapshot["company_name"],
                 "metrics": snapshot["metrics"],
-                "source": "EODHD Fundamentals"
-            },
+                "source": "FMP Income Statement"
+            }, "FMP", "RESULT_SNAPSHOT"),
             "delivered": False
         }).execute()
         print(f"[SNAPSHOT] {snapshot['impact']} — {snapshot['ticker']} {snapshot['period']} stored")
     except Exception as e:
         print(f"[SNAPSHOT] Failed to store: {e}")
 
-# ── Main processor ────────────────────────────────────────────────────────────
+
 def process_pending_snapshots():
-    """
-    Find 10-Q and 10-K filings that need Result Snapshots and process them.
-    Runs every 30 minutes from main.py scheduler.
-    """
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for pending Result Snapshots...")
     try:
         result = supabase.table("raw_filings") \
@@ -270,7 +238,6 @@ def process_pending_snapshots():
 
         filings = result.data
         if not filings:
-            # Also check PENDING ones that haven't been processed yet
             result2 = supabase.table("raw_filings") \
                 .select("*") \
                 .in_("filing_type", ["10-Q", "10-K"]) \
@@ -288,38 +255,32 @@ def process_pending_snapshots():
         for filing in filings:
             ticker = filing.get("ticker", "UNKNOWN")
             form_type = filing.get("filing_type", "10-Q")
-
             if ticker == "UNKNOWN":
                 continue
 
             snapshot = build_result_snapshot(ticker, form_type)
             if snapshot:
                 store_snapshot_alert(snapshot)
-
-                # Mark as snapshot done so we don't re-process
                 try:
                     extra = filing.get("extra") or {}
                     extra["snapshot_done"] = True
-                    supabase.table("raw_filings") \
-                        .update({"extra": extra}) \
-                        .eq("id", filing["id"]) \
-                        .execute()
-                except:
+                    supabase.table("raw_filings").update({"extra": extra}).eq("id", filing["id"]).execute()
+                except Exception:
                     pass
 
-            time.sleep(1)  # Rate limit EODHD calls
+            time.sleep(1)
 
     except Exception as e:
         print(f"[SNAPSHOT] Processing failed: {e}")
 
+
 if __name__ == "__main__":
-    # Test with a known ticker
     print("Testing Result Snapshot with AAPL...")
     snapshot = build_result_snapshot("AAPL", "10-Q")
     if snapshot:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print(snapshot["summary"])
-        print("="*60)
+        print("=" * 60)
         print(f"Impact: {snapshot['impact']}")
     else:
         print("No snapshot generated.")

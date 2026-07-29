@@ -1,17 +1,4 @@
 import requests
-import logging
-import logging.handlers
-
-# Rotating logger — keeps last 5MB of logs, 3 backup files
-logger = logging.getLogger("news_poller")
-if not logger.handlers:
-    handler = logging.handlers.RotatingFileHandler(
-        "logs/news_poller.log", maxBytes=5*1024*1024, backupCount=3
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
-    logger.addHandler(logging.StreamHandler())
-    logger.setLevel(logging.INFO)
 import xml.etree.ElementTree as ET
 from supabase import create_client
 from dotenv import load_dotenv
@@ -129,18 +116,6 @@ NEWS_SOURCES = [
         "source_key": "MARKETWATCH",
         "sector": "FINANCE"
     },
-    {
-        "name": "American Banker",
-        "url": "https://www.americanbanker.com/feed",
-        "source_key": "AMERICAN_BANKER",
-        "sector": "FINANCE"
-    },
-    {
-        "name": "Banking Dive",
-        "url": "https://www.bankingdive.com/feeds/news",
-        "source_key": "BANKING_DIVE",
-        "sector": "FINANCE"
-    },
 
     # ── HEALTHCARE & PHARMA ───────────────────────────────────────────────────
     {
@@ -153,18 +128,6 @@ NEWS_SOURCES = [
         "name": "Reuters Health",
         "url": "https://feeds.reuters.com/reuters/healthNews",
         "source_key": "REUTERS",
-        "sector": "HEALTHCARE"
-    },
-    {
-        "name": "Fierce Healthcare",
-        "url": "https://www.fiercehealthcare.com/rss/xml",
-        "source_key": "FIERCE_HEALTHCARE",
-        "sector": "HEALTHCARE"
-    },
-    {
-        "name": "STAT News",
-        "url": "https://www.statnews.com/feed/",
-        "source_key": "STAT_NEWS",
         "sector": "HEALTHCARE"
     },
 
@@ -228,30 +191,6 @@ NEWS_SOURCES = [
         "url": "https://feeds.marketwatch.com/marketwatch/economy-politics",
         "source_key": "MARKETWATCH",
         "sector": "MACRO"
-    },
-    {
-        "name": "Federal Reserve News",
-        "url": "https://www.federalreserve.gov/feeds/press_all.xml",
-        "source_key": "FED_RESERVE",
-        "sector": "MACRO"
-    },
-    {
-        "name": "TheStreet",
-        "url": "https://www.thestreet.com/.rss/full/",
-        "source_key": "THESTREET",
-        "sector": "MARKET"
-    },
-    {
-        "name": "Investing.com News",
-        "url": "https://www.investing.com/rss/news.rss",
-        "source_key": "INVESTING_COM",
-        "sector": "MARKET"
-    },
-    {
-        "name": "Benzinga News",
-        "url": "https://www.benzinga.com/feed",
-        "source_key": "BENZINGA",
-        "sector": "MARKET"
     },
 ]
 
@@ -438,9 +377,15 @@ def poll_news_source(source):
                 article_sector = detect_sector_from_text(full_text)
 
             if not found_tickers:
-                # No ticker found — skip entirely to avoid unnecessary AI pipeline costs
-                logger.debug(f"[NEWS] No ticker found in: {title[:60]} — skipping")
-                continue
+                store_news(
+                    source_key=source_key,
+                    ticker="MARKET",
+                    title=title,
+                    summary=summary,
+                    url=article_url,
+                    published_at=published_at,
+                    sector=article_sector
+                )
             else:
                 for ticker in found_tickers:
                     store_news(

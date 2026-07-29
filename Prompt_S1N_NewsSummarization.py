@@ -14,16 +14,16 @@ def get_prompt(company_name, sub_summary, content):
 
                     3. Clarity and Length:
 
-                    Keep the summary concise, clear, and strictly under 75 words.
+                    Write the summary using exactly 75 words. If exactly 75 words cannot be achieved while staying strictly accurate to the article, come as close to 75 as possible, but never use fewer than 70 words and never exceed 75 words.
 
                     Write the summary as a single paragraph without line breaks or extra spacing.
-                    
+
                     Don't mention the word count in the summary, and don't include any contact information.
 
                     4. Tone and Style:
 
                     Maintain a neutral, objective, and professional tone throughout the summary.
-                    
+
                     Do not include any salution in the summary.
 
 					Do not address the summary to anyone.
@@ -34,6 +34,8 @@ def get_prompt(company_name, sub_summary, content):
 
                     Avoid adding interpretations, opinions, recommendations, advice or instructions.
 
+                    Do not pad the summary with filler phrases, restated facts, or generic commentary just to reach the word count -- every added word must carry real information from the article.
+
                     6. Review and Verification:
 
                     After generating the summary, carefully verify its accuracy against the original article to ensure all included details are correct.
@@ -43,5 +45,5 @@ def get_prompt(company_name, sub_summary, content):
                     Ensure that the summary is inclusive and does not exclude any important information from the original article. If the name of the person or organisation, sharing the opinion, is mentioned in the article then include it in the summary else ignore this instruction.
 
                     8. News Article to Summarize: {sub_summary} {content}"""
-               
+
     return prompt
