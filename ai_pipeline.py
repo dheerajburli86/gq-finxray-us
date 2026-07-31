@@ -86,8 +86,37 @@ def get_token_usage():
 
 
 # ── DeepInfra caller ─────────────────────────────────────────────────────────
+# Rate-limit pacing: this pipeline calls DeepInfra one at a time on a single
+# thread (see process_filing() below) -- there's no concurrency to cap, so a
+# semaphore wouldn't change anything here. What actually trips DeepInfra's
+# 429 "Resource exhausted" on bursty days (several earnings calls / big news
+# landing close together) is requests arriving too close together in time,
+# which is a pacing problem, not a concurrency problem. MIN_CALL_GAP_SECONDS
+# forces a minimum gap between consecutive DeepInfra calls so normal
+# operation doesn't creep up on the ceiling in the first place.
+MIN_CALL_GAP_SECONDS = 2.0
+MAX_RATE_LIMIT_RETRIES = 5
+_last_call_at = [0.0]
+
+
+def _pace_before_call():
+    elapsed = time.monotonic() - _last_call_at[0]
+    if elapsed < MIN_CALL_GAP_SECONDS:
+        time.sleep(MIN_CALL_GAP_SECONDS - elapsed)
+
+
 def call_deepinfra(prompt, retries=3, max_tokens=1000):
-    """Call DeepInfra API with Gemini 2.5 Flash."""
+    """Call DeepInfra API with Gemini 2.5 Flash.
+
+    A 429 is treated separately from every other failure. It means "you're
+    inside a rate-limit window right now," which is recoverable by waiting
+    long enough for that window to roll over -- the quick 1-2-4 second
+    backoff below is meant for transient network blips, not a per-minute
+    quota, so it's nowhere near long enough to let a 429 clear. A 429 gets
+    its own longer, capped wait (honoring a Retry-After header if DeepInfra
+    sends one) and its own retry budget (MAX_RATE_LIMIT_RETRIES), instead of
+    burning through the same few attempts meant for real errors.
+    """
     headers = {
         "Authorization": f"Bearer {DEEPINFRA_API_KEY}",
         "Content-Type": "application/json"
@@ -97,22 +126,49 @@ def call_deepinfra(prompt, retries=3, max_tokens=1000):
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens
     }
-    for attempt in range(retries):
+
+    normal_attempt = 0
+    rate_limit_attempt = 0
+
+    while True:
+        _pace_before_call()
         try:
             r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=30)
-            if r.status_code == 200:
-                resp = r.json()
-                text = (resp["choices"][0]["message"]["content"] or "").strip()
-                # Strip <think>...</think> reasoning tokens
-                text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-                _record_token_usage(resp.get("usage"))
-                return text
-            else:
-                print(f"[DEEPINFRA] Attempt {attempt+1} failed: {r.status_code} {r.text[:100]}")
         except Exception as e:
-            print(f"[DEEPINFRA] Attempt {attempt+1} error: {e}")
-        time.sleep(2 ** attempt)
-    return None
+            _last_call_at[0] = time.monotonic()
+            normal_attempt += 1
+            print(f"[DEEPINFRA] Attempt {normal_attempt} error: {e}")
+            if normal_attempt >= retries:
+                return None
+            time.sleep(2 ** normal_attempt)
+            continue
+
+        _last_call_at[0] = time.monotonic()
+
+        if r.status_code == 200:
+            resp = r.json()
+            text = (resp["choices"][0]["message"]["content"] or "").strip()
+            # Strip <think>...</think> reasoning tokens
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            _record_token_usage(resp.get("usage"))
+            return text
+
+        if r.status_code == 429:
+            rate_limit_attempt += 1
+            if rate_limit_attempt > MAX_RATE_LIMIT_RETRIES:
+                print(f"[DEEPINFRA] Rate limited (429) persisted after {MAX_RATE_LIMIT_RETRIES} extended waits -- giving up")
+                return None
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after and retry_after.isdigit() else min(15 * rate_limit_attempt, 60)
+            print(f"[DEEPINFRA] Rate limited (429) -- waiting {wait:.0f}s before retry {rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES}")
+            time.sleep(wait)
+            continue
+
+        normal_attempt += 1
+        print(f"[DEEPINFRA] Attempt {normal_attempt} failed: {r.status_code} {r.text[:100]}")
+        if normal_attempt >= retries:
+            return None
+        time.sleep(2 ** normal_attempt)
 
 
 # ── Summary quality helpers ───────────────────────────────────────────────────
