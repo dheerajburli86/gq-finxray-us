@@ -258,31 +258,130 @@ async def send_error_alert(message: str):
         pass
 
 
-def log_alert_run(alert, telegram_success, telegram_error=None):
-    """Audit row per alert sent. Templated alerts legitimately have null
-    token/attempt fields -- they never touch the LLM."""
+VALID_IMPACTS = ("HIGH", "MEDIUM", "LOW")
+
+
+def _as_int(value):
+    """alert_run_log's numeric columns are integer. Anything that isn't
+    cleanly an int becomes NULL rather than poisoning the whole insert."""
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        extra = alert.get("extra") or {}
-        supabase.table("alert_run_log").insert({
-            "alert_id": alert.get("id"),
-            "ticker": alert.get("ticker", "UNKNOWN"),
-            "source": alert.get("source"),
-            "filing_type": alert.get("filing_type"),
-            "feature_id": extra.get("feature_id"),
-            "feature_name": extra.get("feature_name"),
-            "impact": alert.get("impact"),
-            "summarization_attempts": extra.get("summarization_attempts"),
-            "input_tokens": extra.get("input_tokens"),
-            "output_tokens": extra.get("output_tokens"),
-            "total_tokens": extra.get("total_tokens"),
-            "llm_calls": extra.get("llm_calls"),
-            "telegram_success": telegram_success,
-            "telegram_error": (str(telegram_error)[:500] if telegram_error else None),
-        }).execute()
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_log_row(alert, telegram_success, telegram_error=None):
+    """Build one audit row. Templated alerts legitimately have null
+    token/attempt fields -- they never touch the LLM.
+
+    Every value is coerced to the column's type here rather than trusting
+    whatever landed in alerts.extra, because a single bad type rejects the
+    entire insert and the failure is invisible from the delivery loop.
+    """
+    extra = alert.get("extra")
+    if not isinstance(extra, dict):
+        extra = {}
+    impact = alert.get("impact")
+    return {
+        "alert_id": alert.get("id"),
+        "ticker": alert.get("ticker") or "UNKNOWN",
+        "source": alert.get("source"),
+        "filing_type": alert.get("filing_type"),
+        "feature_id": _as_int(extra.get("feature_id")),
+        "feature_name": extra.get("feature_name"),
+        # CHECK constraint allows only HIGH/MEDIUM/LOW (or NULL). An
+        # unexpected value would reject the row, so it is nulled instead.
+        "impact": impact if impact in VALID_IMPACTS else None,
+        "summarization_attempts": _as_int(extra.get("summarization_attempts")),
+        "input_tokens": _as_int(extra.get("input_tokens")),
+        "output_tokens": _as_int(extra.get("output_tokens")),
+        "total_tokens": _as_int(extra.get("total_tokens")),
+        "llm_calls": _as_int(extra.get("llm_calls")),
+        "telegram_success": bool(telegram_success),
+        "telegram_error": (str(telegram_error)[:500] if telegram_error else None),
+    }
+
+
+def log_alert_run(alert, telegram_success, telegram_error=None):
+    try:
+        supabase.table("alert_run_log").insert(
+            _run_log_row(alert, telegram_success, telegram_error)).execute()
     except Exception as e:
+        # Loud, and names the exception class -- an APIError here means
+        # permissions or schema, a plain Exception means the payload.
         print(f"[ERROR] alert_run_log write failed for "
-              f"{alert.get('ticker', 'UNKNOWN')}: {e} "
-              f"(if this is a permissions error, SUPABASE_KEY is still the anon key)")
+              f"{alert.get('ticker', 'UNKNOWN')}: {type(e).__name__}: {e}")
+
+
+def verify_run_log():
+    """Boot self-test for the audit table.
+
+    alert_run_log stayed empty through a full trading session while alerts
+    delivered normally, and nothing in the logs said why. A write that fails
+    where nobody is looking is worse than one that fails loudly, so the very
+    first thing this process does now is try the write once and report the
+    verdict on its own line. The probe row is a legitimate deploy marker and
+    is left in place -- the backend key has no DELETE policy on this table.
+    """
+    try:
+        supabase.table("alert_run_log").insert({
+            "ticker": "__BOOT_PROBE__",
+            "source": "STARTUP",
+            "filing_type": "PROBE",
+            "telegram_success": False,
+            "telegram_error": f"boot probe {et_now():%Y-%m-%d %H:%M:%S ET}",
+        }).execute()
+        print("[RUNLOG] Self-test PASSED — audit writes are landing.")
+        return True
+    except Exception as e:
+        print(f"[RUNLOG] Self-test FAILED — {type(e).__name__}: {e}")
+        print("[RUNLOG] Every alert this process sends will go unlogged. "
+              "If this is a permissions error, SUPABASE_KEY on Railway is the "
+              "anon key, not service_role.")
+        return False
+
+
+def reconcile_run_log():
+    """Backfill audit rows for delivered alerts that never got one.
+
+    Belt and braces for the per-alert write: even if delivery-time logging
+    breaks again, the audit table converges to complete within half an hour.
+
+    The read guard matters. alert_run_log has RLS on with an INSERT-only
+    policy, so under the anon key a SELECT returns zero rows rather than an
+    error -- and a naive "alerts with no log row" query would then look like
+    EVERY alert is missing and insert duplicates on every pass, forever.
+    So: if the table reads as empty while rows are known to exist, the read
+    is untrustworthy and this bails out instead of guessing.
+    """
+    try:
+        logged = supabase.table("alert_run_log").select("alert_id") \
+            .order("sent_at", desc=True).limit(1000).execute().data or []
+
+        recent = supabase.table("alerts").select("*") \
+            .eq("delivered", True).order("created_at", desc=True) \
+            .limit(200).execute().data or []
+        if not recent:
+            return
+
+        if not logged:
+            print("[RUNLOG] Reconcile skipped — audit table reads as empty. "
+                  "Either it genuinely is, or SELECT is blocked by RLS and "
+                  "backfilling now would duplicate. Check the boot self-test.")
+            return
+
+        known = {r["alert_id"] for r in logged if r.get("alert_id")}
+        missing = [a for a in recent if a.get("id") not in known]
+        if not missing:
+            return
+
+        rows = [_run_log_row(a, True, None) for a in missing]
+        supabase.table("alert_run_log").insert(rows).execute()
+        print(f"[RUNLOG] Reconciled {len(rows)} missing audit row(s).")
+    except Exception as e:
+        print(f"[RUNLOG] Reconcile failed: {type(e).__name__}: {e}")
 
 
 # ── Delivery ──────────────────────────────────────────────────────────────────
@@ -421,6 +520,7 @@ def _safe(fn, name):
 def run_scheduler():
     print("[SCHEDULER] Starting...")
     _verify_timezone()
+    verify_run_log()
     load_cik_map()
 
     # ── High-frequency pollers ───────────────────────────────────────────────
@@ -432,6 +532,9 @@ def run_scheduler():
     schedule.every(60).seconds.do(_safe(poll_all_news, "poll_all_news"))
     schedule.every(30).minutes.do(_safe(process_pending_snapshots, "result_snapshot"))
     schedule.every(30).minutes.do(_safe(run_earnings_transcript_poller, "transcripts"))
+
+    # Audit self-heal: catches any alert whose delivery-time log write failed.
+    schedule.every(30).minutes.do(_safe(reconcile_run_log, "reconcile_run_log"))
 
     # ── FMP news + events (Features 2, 4, 5) ─────────────────────────────────
     schedule.every(10).minutes.do(_safe(poll_eodhd_news, "fmp_news"))
