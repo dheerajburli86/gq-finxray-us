@@ -1,14 +1,54 @@
+"""
+news_poller.py
+GQ FinXray US — Feature 2, RSS aggregation layer.
+
+CHANGES 2026-08-03
+------------------
+1. REMOVED ALL 5 REUTERS FEEDS. `feeds.reuters.com` no longer resolves --
+   Reuters retired their public RSS. Every poll cycle was throwing five DNS
+   errors, forever. Removed: Reuters Business, Reuters Markets, Reuters
+   Technology, Reuters Health, Reuters Economy. Source list 25 -> 20.
+
+2. BATCHED THE DEDUP LOOKUP. Previously news_exists() ran ONE Supabase SELECT
+   PER ARTICLE. With 20 feeds x ~30 items that was ~600 sequential round trips
+   every 60 seconds -- visible in the Railway logs as an unbroken wall of HTTP
+   requests, and the single largest source of database load in the system.
+   Now one query per feed covers all its URLs.
+
+WORTH KNOWING ABOUT THIS WHOLE LAYER
+------------------------------------
+Measured across 14 days of live data, RSS is a poor yield source:
+
+    CNBC          362 articles -> 12 with a ticker   (3.3%)
+    Fortune       226 articles ->  7 with a ticker   (3.1%)
+    IBD           175 articles -> 11 with a ticker   (6.3%)
+    MarketWatch   112 articles ->  1 with a ticker   (0.9%)
+    FMP           121 articles -> 92 with a ticker   (76%)
+
+FMP wins because it is fetched per-watchlist-ticker, so it is tickered by
+construction, while RSS casts a wide net and matches against a small watchlist.
+As the watchlist grows RSS yield will improve.
+
+Also note: RSS gives title + description only, averaging ~35 words. That is
+NOT enough source material to summarise -- see the passthrough logic in
+ai_pipeline.py, which now ships short items verbatim rather than asking a
+model to expand 37 words into 90.
+"""
+
 import requests
 import xml.etree.ElementTree as ET
 from supabase import create_client
-from dotenv import load_dotenv
 from datetime import datetime
 import os
 import time
 import schedule
 import re
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
@@ -18,7 +58,6 @@ HEADERS = {
 }
 
 # ── News sources — organised by sector ───────────────────────────────────────
-# Each source has a sector tag so alerts can be routed to sector-relevant users
 NEWS_SOURCES = [
 
     # ── GENERAL MARKET ────────────────────────────────────────────────────────
@@ -40,18 +79,9 @@ NEWS_SOURCES = [
         "source_key": "CNBC",
         "sector": "MARKET"
     },
-    {
-        "name": "Reuters Business",
-        "url": "https://feeds.reuters.com/reuters/businessNews",
-        "source_key": "REUTERS",
-        "sector": "MARKET"
-    },
-    {
-        "name": "Reuters Markets",
-        "url": "https://feeds.reuters.com/reuters/USmarketsnews",
-        "source_key": "REUTERS",
-        "sector": "MARKET"
-    },
+    # REMOVED: "Reuters Business"  -> https://feeds.reuters.com/reuters/businessNews
+    # REMOVED: "Reuters Markets"   -> https://feeds.reuters.com/reuters/USmarketsnews
+    # feeds.reuters.com no longer resolves. Reuters retired public RSS.
     {
         "name": "MarketWatch Top Stories",
         "url": "https://feeds.marketwatch.com/marketwatch/topstories",
@@ -96,12 +126,7 @@ NEWS_SOURCES = [
         "source_key": "CNBC",
         "sector": "TECHNOLOGY"
     },
-    {
-        "name": "Reuters Technology",
-        "url": "https://feeds.reuters.com/reuters/technologyNews",
-        "source_key": "REUTERS",
-        "sector": "TECHNOLOGY"
-    },
+    # REMOVED: "Reuters Technology" -> https://feeds.reuters.com/reuters/technologyNews
 
     # ── FINANCE & BANKING ─────────────────────────────────────────────────────
     {
@@ -124,12 +149,7 @@ NEWS_SOURCES = [
         "source_key": "CNBC",
         "sector": "HEALTHCARE"
     },
-    {
-        "name": "Reuters Health",
-        "url": "https://feeds.reuters.com/reuters/healthNews",
-        "source_key": "REUTERS",
-        "sector": "HEALTHCARE"
-    },
+    # REMOVED: "Reuters Health" -> https://feeds.reuters.com/reuters/healthNews
 
     # ── ENERGY ────────────────────────────────────────────────────────────────
     {
@@ -180,12 +200,7 @@ NEWS_SOURCES = [
     },
 
     # ── ECONOMY & MACRO ───────────────────────────────────────────────────────
-    {
-        "name": "Reuters Economy",
-        "url": "https://feeds.reuters.com/reuters/economicNews",
-        "source_key": "REUTERS",
-        "sector": "MACRO"
-    },
+    # REMOVED: "Reuters Economy" -> https://feeds.reuters.com/reuters/economicNews
     {
         "name": "MarketWatch Economy",
         "url": "https://feeds.marketwatch.com/marketwatch/economy-politics",
@@ -215,7 +230,7 @@ SECTOR_KEYWORDS = {
               "treasury", "recession", "economic", "fiscal policy"],
 }
 
-# US stock tickers to watch for in news articles
+# Fallback universe when the watchlist table is empty or unreachable.
 WATCH_TICKERS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
     "NFLX", "AMD", "INTC", "CRM", "ORCL", "IBM", "UBER", "LYFT",
@@ -224,58 +239,78 @@ WATCH_TICKERS = [
     "XOM", "CVX", "COP", "SLB",
     "WMT", "TGT", "COST", "HD", "LOW",
     "BA", "LMT", "RTX", "NOC", "GE",
-    "NFLX", "DIS", "CMCSA", "T", "VZ",
+    "DIS", "CMCSA", "T", "VZ",
     "SPY", "QQQ", "IWM", "GLD", "SLV"
 ]
 
+# The watchlist changes rarely but was being re-fetched once PER FEED. Cached
+# for the duration of a poll cycle.
+_watchlist_cache = {"at": 0.0, "tickers": []}
+_WATCHLIST_TTL = 300
+
+
 def get_watched_tickers_from_db():
-    """Get all tickers users are subscribed to from the database."""
+    """Tickers users are subscribed to. Cached for 5 minutes."""
+    now = time.time()
+    if _watchlist_cache["tickers"] and (now - _watchlist_cache["at"]) < _WATCHLIST_TTL:
+        return _watchlist_cache["tickers"]
     try:
-        result = supabase.table("watchlists") \
-            .select("ticker") \
-            .execute()
-        tickers = list(set([r["ticker"] for r in result.data if r.get("ticker")]))
-        return tickers if tickers else WATCH_TICKERS
+        result = supabase.table("watchlists").select("ticker").execute()
+        tickers = sorted({r["ticker"] for r in result.data if r.get("ticker")})
+        tickers = tickers or WATCH_TICKERS
     except Exception as e:
         print(f"[ERROR] Failed to get tickers from DB: {e}")
-        return WATCH_TICKERS
+        tickers = WATCH_TICKERS
+    _watchlist_cache.update({"at": now, "tickers": tickers})
+    return tickers
+
 
 def extract_tickers_from_text(text, watched_tickers):
     """Find any watched tickers mentioned in the article text."""
     found = []
     text_upper = text.upper()
     for ticker in watched_tickers:
-        pattern = r'\b' + re.escape(ticker) + r'\b'
-        if re.search(pattern, text_upper):
+        if re.search(r'\b' + re.escape(ticker) + r'\b', text_upper):
             found.append(ticker)
     return found
 
+
 def detect_sector_from_text(text):
-    """Detect sector from article text using keyword matching."""
     text_lower = text.lower()
     scores = {}
     for sector, keywords in SECTOR_KEYWORDS.items():
         score = sum(1 for kw in keywords if kw in text_lower)
         if score > 0:
             scores[sector] = score
-    if scores:
-        return max(scores, key=scores.get)
-    return "MARKET"
+    return max(scores, key=scores.get) if scores else "MARKET"
 
-def news_exists(url):
-    """Check if we already stored this news article."""
-    try:
-        result = supabase.table("raw_filings") \
-            .select("id") \
-            .eq("filing_url", url) \
-            .execute()
-        return len(result.data) > 0
-    except Exception as e:
-        print(f"[ERROR] DB check failed: {e}")
-        return False
+
+def existing_urls(urls):
+    """Which of these URLs are already stored? ONE query for the whole batch.
+
+    Replaces a per-article SELECT that produced ~600 sequential Supabase round
+    trips per 60-second cycle.
+    """
+    if not urls:
+        return set()
+    found = set()
+    CHUNK = 100  # keep the URL filter well inside PostgREST's query-length limit
+    url_list = list(urls)
+    for i in range(0, len(url_list), CHUNK):
+        chunk = url_list[i:i + CHUNK]
+        try:
+            result = supabase.table("raw_filings").select("filing_url") \
+                .in_("filing_url", chunk).execute()
+            found.update(r["filing_url"] for r in result.data if r.get("filing_url"))
+        except Exception as e:
+            print(f"[ERROR] Batch dedup lookup failed: {e}")
+            # Fail closed: treat the chunk as already-seen rather than risk
+            # re-inserting duplicates on a transient DB error.
+            found.update(chunk)
+    return found
+
 
 def store_news(source_key, ticker, title, summary, url, published_at, sector="MARKET"):
-    """Store news article in raw_filings table."""
     try:
         supabase.table("raw_filings").insert({
             "source": source_key,
@@ -294,29 +329,33 @@ def store_news(source_key, ticker, title, summary, url, published_at, sector="MA
         }).execute()
         print(f"[STORED] {source_key} | {sector} | {ticker} | {title[:60]}...")
     except Exception as e:
-        print(f"[ERROR] Failed to store news: {e}")
+        if "duplicate" not in str(e).lower() and "unique" not in str(e).lower():
+            print(f"[ERROR] Failed to store news: {e}")
+
 
 def parse_rss_date(date_str):
-    """Parse RSS date formats into ISO format."""
     if not date_str:
         return datetime.now().isoformat()
-    formats = [
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%a, %d %b %Y %H:%M:%S GMT",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S%z"
-    ]
-    for fmt in formats:
+    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S GMT",
+                "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
         try:
             return datetime.strptime(date_str.strip(), fmt).isoformat()
-        except:
+        except Exception:
             continue
     return datetime.now().isoformat()
 
+
+def _parse_items(root):
+    items = root.findall(".//item")
+    if not items:
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        items = root.findall("atom:entry", ns)
+    return items
+
+
 def poll_news_source(source):
-    """Poll a single news RSS source."""
-    name = source["name"]
-    url = source["url"]
+    """Poll a single RSS source."""
+    name, url = source["name"], source["url"]
     source_key = source["source_key"]
     sector = source.get("sector", "MARKET")
 
@@ -326,20 +365,13 @@ def poll_news_source(source):
             print(f"[ERROR] {name} returned {r.status_code}")
             return 0
 
-        root = ET.fromstring(r.content)
-
-        items = root.findall(".//item")
-        if not items:
-            ns = {"atom": "http://www.w3.org/2005/Atom"}
-            items = root.findall("atom:entry", ns)
-
+        items = _parse_items(ET.fromstring(r.content))
         if not items:
             print(f"[{name}] No items found in feed")
             return 0
 
-        watched_tickers = get_watched_tickers_from_db()
-        new_count = 0
-
+        # Extract everything first, then do ONE dedup query for the batch.
+        parsed = []
         for item in items:
             title_elem = item.find("title")
             title = title_elem.text if title_elem is not None else ""
@@ -351,9 +383,6 @@ def poll_news_source(source):
             if link_elem is not None:
                 article_url = link_elem.text or link_elem.attrib.get("href", "")
             if not article_url:
-                continue
-
-            if news_exists(article_url):
                 continue
 
             desc_elem = item.find("description")
@@ -368,38 +397,32 @@ def poll_news_source(source):
                 date_elem = item.find("updated")
             published_at = parse_rss_date(date_elem.text if date_elem is not None else "")
 
+            parsed.append((article_url, title, summary, published_at))
+
+        if not parsed:
+            return 0
+
+        seen = existing_urls({p[0] for p in parsed})
+        fresh = [p for p in parsed if p[0] not in seen]
+        if not fresh:
+            return 0
+
+        watched_tickers = get_watched_tickers_from_db()
+        new_count = 0
+
+        for article_url, title, summary, published_at in fresh:
             full_text = f"{title} {summary}"
             found_tickers = extract_tickers_from_text(full_text, watched_tickers)
-
-            # If sector is MARKET, try to detect more specific sector
-            article_sector = sector
-            if sector == "MARKET":
-                article_sector = detect_sector_from_text(full_text)
+            article_sector = detect_sector_from_text(full_text) if sector == "MARKET" else sector
 
             if not found_tickers:
-                store_news(
-                    source_key=source_key,
-                    ticker="MARKET",
-                    title=title,
-                    summary=summary,
-                    url=article_url,
-                    published_at=published_at,
-                    sector=article_sector
-                )
+                store_news(source_key, "MARKET", title, summary,
+                           article_url, published_at, article_sector)
             else:
                 for ticker in found_tickers:
-                    store_news(
-                        source_key=source_key,
-                        ticker=ticker,
-                        title=title,
-                        summary=summary,
-                        url=article_url,
-                        published_at=published_at,
-                        sector=article_sector
-                    )
-
+                    store_news(source_key, ticker, title, summary,
+                               article_url, published_at, article_sector)
             new_count += 1
-            time.sleep(0.1)
 
         return new_count
 
@@ -407,16 +430,16 @@ def poll_news_source(source):
         print(f"[ERROR] Failed to poll {name}: {e}")
         return 0
 
+
 def poll_all_news():
-    """Poll all news sources."""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling {len(NEWS_SOURCES)} news sources...")
     total = 0
     sector_counts = {}
     for source in NEWS_SOURCES:
         count = poll_news_source(source)
         if count > 0:
-            sector = source.get("sector", "MARKET")
-            sector_counts[sector] = sector_counts.get(sector, 0) + count
+            sec = source.get("sector", "MARKET")
+            sector_counts[sec] = sector_counts.get(sec, 0) + count
             print(f"  [{source['name']}] {count} new articles")
         total += count
 
@@ -424,16 +447,18 @@ def poll_all_news():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] No new articles.")
     else:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Total: {total} new articles.")
-        for sector, count in sector_counts.items():
-            print(f"  {sector}: {count}")
+        for sec, count in sector_counts.items():
+            print(f"  {sec}: {count}")
+
 
 def run_news_poller():
     poll_all_news()
     schedule.every(60).seconds.do(poll_all_news)
-    print(f"\n[RUNNING] News poller started — {len(NEWS_SOURCES)} sources across all sectors, checking every 60 seconds.\n")
+    print(f"\n[RUNNING] News poller started — {len(NEWS_SOURCES)} sources.\n")
     while True:
         schedule.run_pending()
         time.sleep(1)
+
 
 if __name__ == "__main__":
     run_news_poller()

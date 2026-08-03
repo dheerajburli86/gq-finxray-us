@@ -79,6 +79,44 @@ DEEPINFRA_MODEL = os.getenv("DEEPINFRA_MODEL", "google/gemini-2.5-flash")
 MIN_WORDS = 45
 MAX_WORDS = 120
 
+# ── Adaptive output length ───────────────────────────────────────────────────
+# THE root cause of padded, filler-stuffed alerts. Measured across 3,700 live
+# filings, median INPUT length by type:
+#
+#     8-K            623 words
+#     10-Q           337 words
+#     S-1            916 words
+#     transcript   8,748 words
+#     Form 4          45 words   <-- shorter than the summary we demanded
+#     NEWS            37 words   <-- shorter than the summary we demanded
+#     INSIDER_FMP     18 words   <-- shorter than the summary we demanded
+#
+# ~2,000 of those 3,700 had LESS source material than the 45-120 word summary
+# they were asked to produce. That is not summarisation, it is expansion: the
+# model had no choice but to invent connective filler. "...is truly
+# remarkable.", "What steps should be taken?" and the exclamation marks all
+# come from here, not from the retry ladder (which merely amplified it by
+# pushing the target to 90 then 100).
+#
+# So the target is now derived from what the source actually contains.
+SHORT_INPUT_WORDS = 60      # below this, the source IS the summary -- no LLM call
+SUMMARY_MAX_RATIO = 0.5     # never ask for more than half the input length
+SUMMARY_MIN_RATIO = 0.55    # floor as a fraction of the computed ceiling
+
+
+def target_band(input_words):
+    """(min_words, max_words) appropriate to this source, or None to skip.
+
+    Returning None means the input is too short to summarise meaningfully and
+    should be passed through verbatim -- a 37-word news snippet is already a
+    summary, and running it through an LLM can only add noise.
+    """
+    if input_words < SHORT_INPUT_WORDS:
+        return None
+    hi = min(MAX_WORDS, max(35, int(input_words * SUMMARY_MAX_RATIO)))
+    lo = max(20, int(hi * SUMMARY_MIN_RATIO))
+    return lo, hi
+
 # Content slice sent to the model.
 TRANSCRIPT_CHAR_LIMIT = 12000
 FILING_CHAR_LIMIT = 8000
@@ -313,14 +351,21 @@ def ends_incomplete(text):
     return not text.strip().endswith(SENTENCE_END)
 
 
-def classify_failure(summary):
-    """Reason this summary should be rejected, or None if it's good."""
+def classify_failure(summary, band=None):
+    """Reason this summary should be rejected, or None if it's good.
+
+    `band` is the (min, max) computed from the SOURCE length by target_band().
+    Judging every summary against one fixed global band is what made a
+    perfectly good 79-word summary of an 8-K fail while a padded 90-word
+    summary of a 37-word headline passed.
+    """
+    lo, hi = band if band else (MIN_WORDS, MAX_WORDS)
     if not summary:
         return "empty"
     wc = count_words(summary)
-    if wc < MIN_WORDS:
+    if wc < lo:
         return "too_short"
-    if wc > MAX_WORDS:
+    if wc > hi:
         return "too_long"
     if starts_with_bad_keyword(summary):
         return "bad_start"
@@ -349,10 +394,11 @@ Content:
 {raw_text[:3000]}"""
 
 
-def _style_rules():
+def _style_rules(lo=MIN_WORDS, hi=MAX_WORDS):
     return f"""Rules:
-- Write {MIN_WORDS}-{MAX_WORDS} words as 3-4 complete sentences. Stop as soon as the
-  substance runs out. A shorter accurate summary beats a padded one.
+- Write {lo}-{hi} words. Stop as soon as the substance runs out.
+  A shorter accurate summary beats a padded one. If the source does not
+  contain {lo} words of real information, write less rather than inventing.
 - NEVER pad with filler, restated facts, or generic commentary to reach a length.
   Do not add phrases like "this is significant for investors" or "remains to be seen".
 - The final sentence MUST end with a full stop, question mark or exclamation mark.
@@ -364,7 +410,7 @@ def _style_rules():
 - Do not mention the word count."""
 
 
-def summarise_prompt(company_name, raw_text, filing_type, sub_summary=""):
+def summarise_prompt(company_name, raw_text, filing_type, sub_summary="", band=None):
     """S.1.N / S.1.A / S.1.T + impact, in a single call.
 
     v1 asked for "exactly 75 words" and then made a SEPARATE call to classify
@@ -379,13 +425,14 @@ def summarise_prompt(company_name, raw_text, filing_type, sub_summary=""):
         kind, limit = "regulatory filing", FILING_CHAR_LIMIT
 
     context = f"\nHeadline/context: {sub_summary}\n" if sub_summary else ""
+    lo, hi = band if band else (MIN_WORDS, MAX_WORDS)
 
     return f"""You are a financial analyst writing an alert for investors who follow {company_name}.
 
 Summarise the {kind} below, covering only what matters to someone holding or
 considering this stock.
 
-{_style_rules()}
+{_style_rules(lo, hi)}
 
 Also judge market impact:
 - HIGH: materially moves the stock (earnings surprise, M&A, guidance change,
@@ -401,18 +448,19 @@ Company: {company_name}{context}
 {raw_text[:limit]}"""
 
 
-def retry_prompt(company_name, raw_text, filing_type, previous, failure):
+def retry_prompt(company_name, raw_text, filing_type, previous, failure, band=None):
     """Single corrective retry that tells the model exactly what went wrong.
 
     v1 retried by demanding five more words each time, which made truncation
     and padding worse rather than better. Naming the actual defect works far
     better than moving a numeric target.
     """
+    lo, hi = band if band else (MIN_WORDS, MAX_WORDS)
     diagnosis = {
         "empty": "You returned nothing. Produce a real summary.",
-        "too_short": f"Your summary was too short. It needs at least {MIN_WORDS} words "
+        "too_short": f"Your summary was too short. It needs at least {lo} words "
                      f"of real content from the source -- add substance, not filler.",
-        "too_long": f"Your summary exceeded {MAX_WORDS} words. Tighten it by cutting "
+        "too_long": f"Your summary exceeded {hi} words. Tighten it by cutting "
                     f"the least important detail, not by truncating a sentence.",
         "bad_start": "Your summary opened with a banned phrase. Start directly with the fact.",
         "incomplete": "Your summary stopped mid-sentence. Every sentence must finish, "
@@ -429,7 +477,7 @@ Previous attempt:
 
 Rewrite it correctly for {company_name}.
 
-{_style_rules()}
+{_style_rules(lo, hi)}
 
 Respond with ONLY this JSON, no other text:
 {{"summary": "<corrected summary>", "impact": "HIGH" or "MEDIUM" or "LOW"}}
@@ -567,25 +615,46 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
               filing_id=None, ticker=None, source="SEC_EDGAR"):
     """Returns (summary, impact, attempts). summary is None if it was flagged."""
     attempts_log = []
+    input_words = count_words(raw_text)
+    band = target_band(input_words)
 
-    raw = call_deepinfra(summarise_prompt(company_name, raw_text, filing_type, sub_summary))
+    # ── Passthrough: the source is already shorter than any summary ──────────
+    # Median news item is 37 words and median Form 4 is 45. Asking a model to
+    # write 45-120 words about 37 words of input guarantees invented filler.
+    # These are shipped as-is, cleaned. Zero LLM calls, and the alert reads
+    # better because every word in it came from the source.
+    if band is None:
+        passthrough = standardize_numbers(clean_summary(raw_text.strip()))
+        print(f"[SUMMARY] Source is only {input_words} words -- passing through "
+              f"verbatim, no LLM call (summarising would mean inventing text)")
+        return passthrough, "LOW", 0
+
+    lo, hi = band
+    print(f"[SUMMARY] {input_words} words in -> targeting {lo}-{hi} words out")
+
+    raw = call_deepinfra(summarise_prompt(company_name, raw_text, filing_type,
+                                          sub_summary, band))
     parsed = parse_json_response(raw)
     summary = standardize_numbers(clean_summary(parsed.get("summary", "")))
     impact = str(parsed.get("impact", "LOW")).upper()
-    failure = classify_failure(summary)
-    attempts_log.append({"attempt": 1, "words": count_words(summary), "failure": failure})
+    failure = classify_failure(summary, band)
+    attempts_log.append({"attempt": 1, "words": count_words(summary),
+                         "target": f"{lo}-{hi}", "input_words": input_words,
+                         "failure": failure})
 
     if not failure:
         print(f"[SUMMARY] Passed first attempt ({count_words(summary)} words)")
         return summary, impact, 1
 
     print(f"[SUMMARY] Attempt 1 rejected ({failure}) -- one corrective retry")
-    raw2 = call_deepinfra(retry_prompt(company_name, raw_text, filing_type, summary, failure))
+    raw2 = call_deepinfra(retry_prompt(company_name, raw_text, filing_type,
+                                       summary, failure, band))
     parsed2 = parse_json_response(raw2)
     summary2 = standardize_numbers(clean_summary(parsed2.get("summary", "")))
     impact2 = str(parsed2.get("impact", impact)).upper()
-    failure2 = classify_failure(summary2)
-    attempts_log.append({"attempt": 2, "words": count_words(summary2), "failure": failure2})
+    failure2 = classify_failure(summary2, band)
+    attempts_log.append({"attempt": 2, "words": count_words(summary2),
+                         "target": f"{lo}-{hi}", "failure": failure2})
 
     if not failure2:
         print(f"[SUMMARY] Passed on retry ({count_words(summary2)} words)")
