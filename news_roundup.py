@@ -1,9 +1,7 @@
 """
 news_roundup.py
-GQ FinXray US — Feature 10 (Morning & Evening News Roundup + ETF Xray).
+GQ FinXray US — Feature 10 (ETF Xray only).
 Rewritten on FMP (was EODHD) for the ETF Xray price/fundamentals lookups.
-The DeepInfra AI-digest logic for the news roundup itself is unchanged —
-that part never depended on EODHD.
 """
 
 import logging
@@ -93,24 +91,6 @@ def send_telegram(message):
         return False
 
 
-def roundup_already_sent(roundup_type):
-    sb = get_supabase()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    result = sb.table("alerts").select("id").eq("ticker", "MARKET").eq("source", "NEWS_ROUNDUP") \
-        .eq("filing_type", roundup_type).gte("created_at", f"{today}T00:00:00+00:00").execute()
-    return len(result.data) > 0
-
-
-def save_roundup_alert(roundup_type, summary):
-    sb = get_supabase()
-    sb.table("alerts").insert({
-        "ticker": "MARKET", "summary": summary, "impact": "LOW", "source": "NEWS_ROUNDUP",
-        "filing_type": roundup_type, "delivered": True,
-        "extra": tag_extra({"roundup_type": roundup_type}, "NEWS_ROUNDUP", roundup_type),
-        "filing_url": None
-    }).execute()
-
-
 def etf_xray_already_sent():
     sb = get_supabase()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -126,112 +106,6 @@ def save_etf_xray_alert(summary):
         "filing_type": "ETF_XRAY", "delivered": True,
         "extra": tag_extra({}, "ETF_XRAY", "ETF_XRAY"), "filing_url": None
     }).execute()
-
-
-# ── News Roundup (unchanged — never depended on EODHD) ────────────────────────
-def fetch_recent_news(hours_back):
-    sb = get_supabase()
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
-    try:
-        result = sb.table("raw_filings").select("ticker, raw_text, extra, filed_at, source") \
-            .gte("filed_at", cutoff).eq("filing_type", "NEWS").order("filed_at", desc=True).limit(60).execute()
-        return result.data or []
-    except Exception as e:
-        logger.error(f"[ROUNDUP] Failed to fetch news: {e}")
-        return []
-
-
-def build_news_digest(articles):
-    sector_articles = {}
-    for article in articles:
-        extra = article.get("extra") or {}
-        sector = extra.get("sector", "MARKET")
-        title = extra.get("title", "") or article.get("raw_text", "")[:100]
-        if not title:
-            continue
-        sector_articles.setdefault(sector, []).append(title)
-
-    lines = []
-    for sector, titles in sector_articles.items():
-        lines.append(f"[{sector}]")
-        for t in titles[:8]:
-            lines.append(f"- {t[:120]}")
-    return "\n".join(lines)
-
-
-def generate_ai_roundup(news_text, period_label):
-    prompt = f"""You are a financial news analyst writing a {period_label} briefing for US stock market investors.
-
-Below are news headlines from the past few hours, grouped by sector.
-Write a concise digest of 5-7 bullet points covering the most important market-moving stories.
-Each bullet must be a SHORT, COMPLETE sentence under 20 words. Never cut off mid-sentence.
-Focus on what matters for investors. Use plain English. No fluff. No intro sentence.
-Just the bullets. No reasoning. No explanation. No markdown formatting beyond the bullet character.
-
-Headlines:
-{news_text[:3000]}
-
-Return ONLY the bullet points, each starting with •, each a short complete sentence. Nothing else."""
-
-    result = call_deepinfra(prompt, max_tokens=700)
-    if result:
-        lines = [l.strip() for l in result.split("\n") if l.strip()]
-        if lines:
-            last_line = lines[-1]
-            if last_line and last_line[-1] not in ".!?":
-                lines = lines[:-1]
-            result = "\n".join(lines)
-    return result
-
-
-def run_morning_roundup():
-    logger.info("[ROUNDUP] Starting morning news roundup...")
-    if roundup_already_sent("MORNING_ROUNDUP"):
-        logger.info("[ROUNDUP] Morning roundup already sent today, skipping.")
-        return
-
-    articles = fetch_recent_news(hours_back=8)
-    if not articles:
-        logger.info("[ROUNDUP] No recent articles found for morning roundup.")
-        return
-
-    news_text = build_news_digest(articles)
-    ai_digest = generate_ai_roundup(news_text, "Morning Market Briefing")
-    if not ai_digest:
-        titles = [(a.get("extra") or {}).get("title", a.get("raw_text", "")[:80]) for a in articles[:7] if a]
-        ai_digest = "\n".join([f"• {t}" for t in titles if t])
-
-    time_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    message = f"🌅 *Morning Market Briefing — {time_str}*\n\n{ai_digest}\n\n_GQ FinXray US · gquants.com_"
-
-    if send_telegram(message):
-        save_roundup_alert("MORNING_ROUNDUP", message)
-        logger.info("[ROUNDUP] Morning roundup sent and saved.")
-
-
-def run_evening_roundup():
-    logger.info("[ROUNDUP] Starting evening news roundup...")
-    if roundup_already_sent("EVENING_ROUNDUP"):
-        logger.info("[ROUNDUP] Evening roundup already sent today, skipping.")
-        return
-
-    articles = fetch_recent_news(hours_back=10)
-    if not articles:
-        logger.info("[ROUNDUP] No recent articles found for evening roundup.")
-        return
-
-    news_text = build_news_digest(articles)
-    ai_digest = generate_ai_roundup(news_text, "Evening Market Wrap")
-    if not ai_digest:
-        titles = [(a.get("extra") or {}).get("title", a.get("raw_text", "")[:80]) for a in articles[:7] if a]
-        ai_digest = "\n".join([f"• {t}" for t in titles if t])
-
-    time_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    message = f"🌙 *Evening Market Wrap — {time_str}*\n\n{ai_digest}\n\n_GQ FinXray US · gquants.com_"
-
-    if send_telegram(message):
-        save_roundup_alert("EVENING_ROUNDUP", message)
-        logger.info("[ROUNDUP] Evening roundup sent and saved.")
 
 
 # ── ETF Xray — now on FMP ─────────────────────────────────────────────────────
@@ -317,16 +191,10 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
-        if cmd == "morning":
-            run_morning_roundup()
-        elif cmd == "evening":
-            run_evening_roundup()
-        elif cmd == "etf":
+        if cmd == "etf":
             run_etf_xray()
         else:
-            print("Usage: python news_roundup.py [morning|evening|etf]")
+            print("Usage: python news_roundup.py [etf]")
     else:
-        print("Running all three for testing...")
-        run_morning_roundup()
+        print("Running ETF Xray for testing...")
         run_etf_xray()
-        run_evening_roundup()
