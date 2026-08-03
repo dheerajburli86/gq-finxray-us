@@ -444,13 +444,23 @@ def classify_failure(summary, band=None):
     over-long summary is genuinely harder to read on a phone -- and trimming
     makes that free to fix.
     """
-    _, hi = band if band else (MIN_WORDS, MAX_WORDS)
+    lo, hi = band if band else (MIN_WORDS, MAX_WORDS)
+
+    # The floor can never exceed the ceiling. A 74-word news item gets a band
+    # of 20-37 words; pairing that ceiling with a flat 45-word floor demands a
+    # summary that is simultaneously under 37 and over 45 words, which nothing
+    # can satisfy -- every attempt is rejected as too_short, retried, rejected
+    # again, and the alert is flagged. Seen live on AMZN. Taking min() keeps
+    # the CNA fix intact for long filings (band 66-120 still floors at 45)
+    # while letting genuinely short sources through.
+    floor = min(MIN_WORDS, lo)
+
     if not summary:
         return "empty"
     if says_no_content(summary):
         return "no_content"
     wc = count_words(summary)
-    if wc < MIN_WORDS:
+    if wc < floor:
         return "too_short"
     if wc > hi:
         return "too_long"
