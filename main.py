@@ -29,10 +29,22 @@ TELEGRAM_CHANNEL_ID, FMP_API_KEY, MASSIVE_API_KEY, DEEPINFRA_API_KEY
 """
 
 import asyncio
+import logging
 import os
 import time
 import threading
 from datetime import datetime, timezone
+
+# Silence httpx's per-request INFO logging. Two reasons, and the first is
+# serious: httpx logs the FULL request URL, and the Telegram Bot API puts the
+# bot token in the path. Every send was printing
+# "POST https://api.telegram.org/bot<TOKEN>/sendMessage" into the deploy log,
+# leaking a credential that lets anyone post to the channel. The second reason
+# is readability -- those lines were roughly 95% of the log volume and buried
+# every [CHANNEL], [SUMMARY] and [ERROR] line we actually needed to read.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 import schedule
 from supabase import create_client
@@ -70,7 +82,7 @@ MARKET_TZ = "America/New_York"
 # Bumped on every change that has to be confirmed live. It is written into the
 # boot probe row in the database, so "which build is actually running?" can be
 # answered with a query instead of by scrolling a log.
-BUILD_TAG = "v3-telegram-fix"
+BUILD_TAG = "v4-band-fix"
 
 
 def et_now():
