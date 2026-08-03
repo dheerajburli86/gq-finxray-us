@@ -300,9 +300,23 @@ BAD_START_KEYWORDS = [
 SENTENCE_END = (".", "!", "?", '."', ".'", '.”', ".)", "!\"", "?\"", "…")
 
 
+def strip_invisibles(text):
+    """Remove zero-width and other invisible characters.
+
+    RSS descriptions arrive with zero-width spaces embedded mid-sentence
+    ("the reigning champions and​winner of..."). They survive HTML tag
+    stripping, are invisible in logs, and break word counts and Telegram
+    formatting in ways that are near-impossible to spot by eye.
+    """
+    if not text:
+        return text
+    return re.sub(r"[​‌‍⁠﻿­]", "", text)
+
+
 def clean_summary(text):
     if not text:
         return text
+    text = strip_invisibles(text)
     text = re.sub(r"^summary[\s\-:]+", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\(\d+\s*words?\)", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"word\s*count[\s:]+\d+", "", text, flags=re.IGNORECASE).strip()
@@ -611,6 +625,36 @@ Respond with ONLY: {{"is_duplicate": true or false}}"""
 
 
 # ── Summarisation ─────────────────────────────────────────────────────────────
+def _format_passthrough(raw_text):
+    """Render a short source as an alert without an LLM.
+
+    Pollers store news as "{title}\\n\\n{description}". Running that through
+    clean_summary() collapses the blank line and welds the headline onto the
+    body -- "...partners with Google on AI Paris Saint Germain (PSG) - the
+    reigning..." -- which reads like a typo. Keep the two parts distinct and
+    make sure the headline terminates.
+    """
+    text = strip_invisibles(raw_text or "").strip()
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text, maxsplit=1)]
+
+    if len(parts) == 2 and parts[0] and parts[1]:
+        head, body = parts
+        if not head.endswith((".", "!", "?", ":", "—", "-")):
+            head += "."
+        # Drop a body that just restates the headline.
+        if body.lower().startswith(head.rstrip(".").lower()[:40]):
+            merged = body
+        else:
+            merged = f"{head} {body}"
+    else:
+        merged = parts[0] if parts else ""
+
+    merged = standardize_numbers(clean_summary(merged))
+    if merged and not merged.endswith(SENTENCE_END):
+        merged += "."
+    return merged
+
+
 def summarise(company_name, raw_text, filing_type="", sub_summary="",
               filing_id=None, ticker=None, source="SEC_EDGAR"):
     """Returns (summary, impact, attempts). summary is None if it was flagged."""
@@ -624,7 +668,7 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     # These are shipped as-is, cleaned. Zero LLM calls, and the alert reads
     # better because every word in it came from the source.
     if band is None:
-        passthrough = standardize_numbers(clean_summary(raw_text.strip()))
+        passthrough = _format_passthrough(raw_text)
         print(f"[SUMMARY] Source is only {input_words} words -- passing through "
               f"verbatim, no LLM call (summarising would mean inventing text)")
         return passthrough, "LOW", 0
