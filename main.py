@@ -92,20 +92,57 @@ def _verify_timezone():
               f"but setting TZ={MARKET_TZ} on Railway makes logs easier to read.")
 
 
+def _et_to_server_local(time_str):
+    """Convert an ET wall-clock time to the equivalent server-local time.
+
+    Uses zoneinfo from the stdlib, so it has no third-party dependency. The
+    offset is resolved against TODAY's date, which means DST is correct now
+    and drifts by an hour after a US DST transition until the process
+    restarts -- acceptable for a service that redeploys regularly, and vastly
+    better than being four hours out permanently.
+    """
+    from zoneinfo import ZoneInfo
+    from datetime import time as dtime
+
+    h, m = (int(x) for x in time_str.split(":"))
+    today = datetime.now(ZoneInfo(MARKET_TZ)).date()
+    et_dt = datetime.combine(today, dtime(h, m), tzinfo=ZoneInfo(MARKET_TZ))
+    local_dt = et_dt.astimezone()
+    return local_dt.strftime("%H:%M")
+
+
 def daily_at(time_str):
     """Schedule a daily job in MARKET time, whatever the server's clock says.
 
-    schedule >= 1.2 accepts a timezone on .at(). On older versions we fall
-    back to server-local and warn loudly, because silently drifting four
-    hours is exactly the failure this function exists to prevent.
+    Three tiers, in order of preference:
+      1. schedule >= 1.2 with pytz installed -- native timezone support, and
+         DST is handled on every run.
+      2. pytz missing (schedule imports it lazily inside .at(), so this only
+         blows up at scheduling time, which is exactly what happened on the
+         first Railway boot of v2) -- convert ET to server-local ourselves
+         using the stdlib.
+      3. Everything else -- server-local as-is, with a loud warning.
+
+    Tier 2 exists because a missing optional dependency should never silently
+    put the whole schedule four hours out. That was the original bug.
     """
     try:
         return schedule.every().day.at(time_str, MARKET_TZ)
+    except (ModuleNotFoundError, ImportError):
+        try:
+            converted = _et_to_server_local(time_str)
+            print(f"[TZ] pytz not installed -- converted {time_str} ET "
+                  f"-> {converted} server-local via zoneinfo")
+            return schedule.every().day.at(converted)
+        except Exception as e:
+            print(f"[TZ] WARNING: could not convert {time_str} to server time ({e}). "
+                  f"Job will run in SERVER LOCAL TIME. Set TZ={MARKET_TZ} on Railway.")
+            return schedule.every().day.at(time_str)
     except TypeError:
-        print(f"[TZ] WARNING: installed `schedule` does not support timezones. "
-              f"'{time_str}' will run in SERVER LOCAL TIME. "
-              f"Set TZ={MARKET_TZ} on Railway, or upgrade: pip install -U schedule")
-        return schedule.every().day.at(time_str)
+        converted = _et_to_server_local(time_str)
+        print(f"[TZ] `schedule` too old for tz support -- converted {time_str} ET "
+              f"-> {converted} server-local")
+        return schedule.every().day.at(converted)
 
 
 # ── Price line ────────────────────────────────────────────────────────────────

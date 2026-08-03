@@ -75,3 +75,4 @@ matplotlib
 pillow
 pandas
 tzdata
+pytz
