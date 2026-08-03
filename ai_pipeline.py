@@ -171,7 +171,7 @@ def _pace_before_call():
         time.sleep(MIN_CALL_GAP_SECONDS - elapsed)
 
 
-def call_deepinfra(prompt, retries=2, max_tokens=2000, temperature=0.2):
+def call_deepinfra(prompt, retries=2, max_tokens=4000, temperature=0.2):
     """Call DeepInfra. Returns text or None.
 
     max_tokens defaults to 2000, not 600. Gemini 2.5 Flash reasons before
@@ -346,6 +346,20 @@ def count_words(text):
     return len(text.split()) if text else 0
 
 
+def _oneline(text, limit=100):
+    """Flatten a summary onto a single line for logging.
+
+    Passthrough alerts (Form 4, news) legitimately contain newlines, and
+    printing them raw shredded log entries across multiple interleaved lines
+    -- the XYF Form 4 entry came out with its '[DONE]' line separated from its
+    '[ALERT READY]' line by three unrelated HTTP logs.
+    """
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    return flat[:limit] + ("..." if len(flat) > limit else "")
+
+
 def starts_with_bad_keyword(text):
     if not text:
         return False
@@ -363,6 +377,30 @@ def ends_incomplete(text):
     if not text:
         return True
     return not text.strip().endswith(SENTENCE_END)
+
+
+def trim_to_limit(summary, max_words):
+    """Drop whole trailing sentences until the summary fits.
+
+    A summary that runs 122 words against a 120 ceiling is a GOOD summary two
+    words too long -- rejecting it and burning another LLM call (which then
+    came back empty and got the filing flagged) is absurd. Trimming whole
+    sentences keeps the text well-formed and costs nothing.
+
+    Returns the trimmed text, or the original if trimming can't help.
+    """
+    if not summary or count_words(summary) <= max_words:
+        return summary
+    sentences = re.findall(r"[^.!?]+[.!?]+(?:[\"'”’)]*)?", summary)
+    if not sentences:
+        return summary
+    out = ""
+    for s in sentences:
+        candidate = (out + s).strip()
+        if count_words(candidate) > max_words:
+            break
+        out = candidate
+    return out if out else summary
 
 
 def classify_failure(summary, band=None):
@@ -561,7 +599,7 @@ def store_alert(ticker, summary, impact, source, filing_type="", extra=None, sum
             "source": source, "filing_type": filing_type, "extra": merged,
             "delivered": False, "summary_id": summary_id,
         }).execute()
-        print(f"[ALERT READY] {impact} -- {ticker}: {summary[:80]}... (F{fid}/11 {fname})")
+        print(f"[ALERT READY] {impact} -- {ticker}: {_oneline(summary, 80)} (F{fid}/11 {fname})")
     except Exception as e:
         print(f"[ERROR] Failed to store alert: {e}")
 
@@ -683,6 +721,16 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     parsed = parse_json_response(raw)
     summary = standardize_numbers(clean_summary(parsed.get("summary", "")))
     impact = str(parsed.get("impact", "LOW")).upper()
+
+    # Salvage an over-long summary by dropping trailing sentences before
+    # deciding it failed. Costs nothing and avoids a wasted retry.
+    if summary and count_words(summary) > hi:
+        trimmed = trim_to_limit(summary, hi)
+        if trimmed and count_words(trimmed) >= lo:
+            print(f"[SUMMARY] Trimmed {count_words(summary)} -> "
+                  f"{count_words(trimmed)} words (no extra LLM call)")
+            summary = trimmed
+
     failure = classify_failure(summary, band)
     attempts_log.append({"attempt": 1, "words": count_words(summary),
                          "target": f"{lo}-{hi}", "input_words": input_words,
@@ -698,6 +746,18 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     parsed2 = parse_json_response(raw2)
     summary2 = standardize_numbers(clean_summary(parsed2.get("summary", "")))
     impact2 = str(parsed2.get("impact", impact)).upper()
+    if summary2 and count_words(summary2) > hi:
+        t2 = trim_to_limit(summary2, hi)
+        if t2 and count_words(t2) >= lo:
+            summary2 = t2
+
+    # If the retry came back empty but attempt 1 produced something usable,
+    # keep attempt 1 rather than throwing both away. An empty retry is a
+    # transport/truncation failure, not a judgement that attempt 1 was bad.
+    if not summary2 and summary and not classify_failure(summary, band):
+        print("[SUMMARY] Retry returned nothing -- keeping the valid first attempt")
+        return summary, impact, 2
+
     failure2 = classify_failure(summary2, band)
     attempts_log.append({"attempt": 2, "words": count_words(summary2),
                          "target": f"{lo}-{hi}", "failure": failure2})
@@ -737,15 +797,30 @@ def process_filing(filing):
         update_filing_status(filing_id, "DISCARDED")
         return
 
-    # Call 1 — gibberish + relevance together.
-    # max_tokens=1500, not 300. Gemini 2.5 Flash is a REASONING model: it
-    # thinks before answering and those tokens come out of the same budget.
-    # At 300 the thinking consumed the whole allowance and the response was
-    # cut off at '{"is_gibber' -- unparseable, so the screen silently failed
-    # OPEN on every single filing. A tiny JSON answer still needs room for
-    # the reasoning that precedes it.
-    screen = parse_json_response(call_deepinfra(screen_prompt(company_name, raw_text),
-                                               max_tokens=1500))
+    # Gate 1 — free. Decide the summarisation path BEFORE spending any call.
+    #
+    # If the source is short enough to be passed through verbatim, the screen
+    # cannot change the outcome -- we ship the source text either way. Paying
+    # an LLM call to ask "is this gibberish?" about a 41-word SEC Form 4
+    # (structured data, from EDGAR, with a resolved ticker) and then emitting
+    # that exact text regardless is pure waste. Over the last two weeks that
+    # was ~2,000 filings (999 Form 4 + 996 NEWS) each burning one useless call.
+    will_passthrough = target_band(count_words(raw_text)) is None
+
+    if will_passthrough:
+        screen = {"is_gibberish": False, "is_relevant": True, "reason": "passthrough"}
+        print("[SCREEN] Skipped — source passes through verbatim, "
+              "screening cannot change the output (0 LLM calls)")
+    else:
+        # Call 1 — gibberish + relevance together.
+        # max_tokens=1500, not 300. Gemini 2.5 Flash is a REASONING model: it
+        # thinks before answering and those tokens come out of the same budget.
+        # At 300 the thinking consumed the whole allowance and the response was
+        # cut off at '{"is_gibber' -- unparseable, so the screen silently failed
+        # OPEN on every single filing. A tiny JSON answer still needs room for
+        # the reasoning that precedes it.
+        screen = parse_json_response(call_deepinfra(screen_prompt(company_name, raw_text),
+                                                   max_tokens=1500))
     if as_bool(screen.get("is_gibberish")):
         print(f"[DISCARDED] Unusable text -- {screen.get('reason', '')}")
         update_filing_status(filing_id, "DISCARDED")
@@ -773,7 +848,7 @@ def process_filing(filing):
 
     if impact not in ("HIGH", "MEDIUM", "LOW"):
         impact = "LOW"
-    print(f"[SUMMARY] {summary[:100]}... ({count_words(summary)} words, impact={impact})")
+    print(f"[SUMMARY] {_oneline(summary, 100)} ({count_words(summary)} words, impact={impact})")
 
     # Dedup — usually zero LLM calls.
     if is_duplicate(ticker, summary):
