@@ -618,7 +618,9 @@ EARLIER:
 
 Respond with ONLY: {{"is_duplicate": true or false}}"""
 
-    result = parse_json_response(call_deepinfra(prompt, max_tokens=200))
+    # Same reasoning-token headroom as the screen call -- 200 was nowhere near
+    # enough for the model to think and then emit even a one-field JSON object.
+    result = parse_json_response(call_deepinfra(prompt, max_tokens=1200))
     dup = as_bool(result.get("is_duplicate"), default=False)
     print(f"[DEDUP] Ambiguous ({best_score:.2f}) -> LLM says duplicate={dup}")
     return dup
@@ -736,8 +738,14 @@ def process_filing(filing):
         return
 
     # Call 1 — gibberish + relevance together.
+    # max_tokens=1500, not 300. Gemini 2.5 Flash is a REASONING model: it
+    # thinks before answering and those tokens come out of the same budget.
+    # At 300 the thinking consumed the whole allowance and the response was
+    # cut off at '{"is_gibber' -- unparseable, so the screen silently failed
+    # OPEN on every single filing. A tiny JSON answer still needs room for
+    # the reasoning that precedes it.
     screen = parse_json_response(call_deepinfra(screen_prompt(company_name, raw_text),
-                                               max_tokens=300))
+                                               max_tokens=1500))
     if as_bool(screen.get("is_gibberish")):
         print(f"[DISCARDED] Unusable text -- {screen.get('reason', '')}")
         update_filing_status(filing_id, "DISCARDED")
@@ -746,7 +754,15 @@ def process_filing(filing):
         print(f"[DISCARDED] Not about {company_name} -- {screen.get('reason', '')}")
         update_filing_status(filing_id, "DISCARDED")
         return
-    print("[PASS] Screen (gibberish + relevance, 1 call)")
+
+    if not screen:
+        # Both gates above default to "allow" so a screening failure never
+        # silently drops a real filing. But an empty dict means the check did
+        # not actually RUN, and a clean "[PASS]" line would misrepresent that.
+        print("[SCREEN] WARNING: screen returned no usable JSON -- gates failed "
+              "OPEN, content was not actually checked")
+    else:
+        print("[PASS] Screen (gibberish + relevance, 1 call)")
 
     # Call 2 (+ optional 3) — summary and impact together.
     summary, impact, attempts = summarise(company_name, raw_text, filing_type,
