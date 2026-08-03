@@ -403,19 +403,54 @@ def trim_to_limit(summary, max_words):
     return out if out else summary
 
 
+# Phrases the model produces when the source had nothing in it to summarise --
+# most often a 10-Q whose XBRL extract came through as bare taxonomy tags with
+# no values attached. Retrying cannot help: the input is empty of facts. These
+# are dropped silently rather than retried and flagged.
+NO_CONTENT_MARKERS = (
+    "no specific financial values",
+    "only taxonomy tags",
+    "cannot be generated",
+    "does not contain any",
+    "contains no ",
+    "no quantitative information",
+    "insufficient information",
+    "unable to summarize",
+    "unable to summarise",
+    "no information about",
+)
+
+
+def says_no_content(summary):
+    if not summary:
+        return False
+    low = summary.lower()
+    return any(m in low for m in NO_CONTENT_MARKERS)
+
+
 def classify_failure(summary, band=None):
     """Reason this summary should be rejected, or None if it's good.
 
     `band` is the (min, max) computed from the SOURCE length by target_band().
-    Judging every summary against one fixed global band is what made a
-    perfectly good 79-word summary of an 8-K fail while a padded 90-word
-    summary of a 37-word headline passed.
+
+    THE FLOOR IS NOT THE BAND'S LOWER BOUND. It is MIN_WORDS, the absolute
+    readability floor. The band's `lo` is a TARGET handed to the prompt, not a
+    rejection threshold -- and conflating the two was still costing real
+    alerts. CNA Financial's 8-K summarised to 61 clean words against a 66-word
+    target: five words short, entirely readable, and it was thrown away. The
+    retry then returned empty, so the filing was flagged and no alert went out
+    at all. Loews lost the same way at 51 words. A concise summary is not a
+    defective one; only a stub is. The ceiling stays enforced because an
+    over-long summary is genuinely harder to read on a phone -- and trimming
+    makes that free to fix.
     """
-    lo, hi = band if band else (MIN_WORDS, MAX_WORDS)
+    _, hi = band if band else (MIN_WORDS, MAX_WORDS)
     if not summary:
         return "empty"
+    if says_no_content(summary):
+        return "no_content"
     wc = count_words(summary)
-    if wc < lo:
+    if wc < MIN_WORDS:
         return "too_short"
     if wc > hi:
         return "too_long"
@@ -709,6 +744,15 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     # better because every word in it came from the source.
     if band is None:
         passthrough = _format_passthrough(raw_text)
+        # A passthrough that formats down to nothing means the source was a
+        # bare stub -- a headline row with no body. Ninety-nine of those went
+        # to the LLM in one morning and came back empty twice each; every one
+        # of them was a wasted pair of calls on a record that could never have
+        # produced an alert. Caught here for free.
+        if count_words(passthrough) < 8:
+            print(f"[SUMMARY] Source is an empty stub ({input_words} words in, "
+                  f"{count_words(passthrough)} usable) -- discarding, no LLM call")
+            return None, "DISCARD", 0
         print(f"[SUMMARY] Source is only {input_words} words -- passing through "
               f"verbatim, no LLM call (summarising would mean inventing text)")
         return passthrough, "LOW", 0
@@ -739,6 +783,13 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     if not failure:
         print(f"[SUMMARY] Passed first attempt ({count_words(summary)} words)")
         return summary, impact, 1
+
+    # The source had no facts in it. A retry re-reads the same empty input and
+    # produces the same non-answer, so skip straight to discard.
+    if failure == "no_content":
+        print("[SUMMARY] Source carries no reportable content "
+              "(likely XBRL tags with no values) -- discarding, no retry")
+        return None, "DISCARD", 1
 
     print(f"[SUMMARY] Attempt 1 rejected ({failure}) -- one corrective retry")
     raw2 = call_deepinfra(retry_prompt(company_name, raw_text, filing_type,
@@ -843,7 +894,10 @@ def process_filing(filing):
     summary, impact, attempts = summarise(company_name, raw_text, filing_type,
                                           sub_summary, filing_id, ticker, source)
     if not summary:
-        update_filing_status(filing_id, "FLAGGED_FOR_REVIEW")
+        # DISCARD means the source had nothing in it -- that is not a quality
+        # failure and does not belong in a human review queue.
+        update_filing_status(filing_id,
+                             "DISCARDED" if impact == "DISCARD" else "FLAGGED_FOR_REVIEW")
         return
 
     if impact not in ("HIGH", "MEDIUM", "LOW"):
