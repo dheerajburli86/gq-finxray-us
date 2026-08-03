@@ -247,13 +247,15 @@ def format_alert(alert):
 
 # ── Errors & run log ──────────────────────────────────────────────────────────
 async def send_error_alert(message: str):
+    if not TELEGRAM_CHANNEL_ID:
+        return
     try:
-        bot = Bot(token=TELEGRAM_TOKEN)
-        await bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            text=f"⚠️ *GQ FinXray US — System Alert*\n\n{message}\n\n"
-                 f"🕐 {et_now():%I:%M %p ET}",
-            parse_mode="Markdown")
+        async with Bot(token=TELEGRAM_TOKEN) as bot:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                text=f"⚠️ *GQ FinXray US — System Alert*\n\n{message}\n\n"
+                     f"🕐 {et_now():%I:%M %p ET}",
+                parse_mode="Markdown")
     except Exception:
         pass
 
@@ -385,6 +387,37 @@ def reconcile_run_log():
 
 
 # ── Delivery ──────────────────────────────────────────────────────────────────
+# How many times an alert may fail to send before we stop retrying it. Without
+# this a single un-sendable message would sit at the head of the queue forever
+# and block every alert behind it.
+MAX_SEND_ATTEMPTS = 3
+_send_failures = {}
+
+
+async def send_telegram(bot, text, chat_id=None):
+    """Send one message, and actually get it there.
+
+    Legacy Markdown is unforgiving: one unmatched _ * [ or ` anywhere in the
+    text -- and summaries of SEC filings are full of them -- makes Telegram
+    reject the WHOLE message with 'Can't parse entities'. Losing an alert over
+    a stray underscore is not acceptable, so a parse rejection falls back to
+    plain text. An unformatted alert beats no alert.
+    """
+    chat_id = chat_id or TELEGRAM_CHANNEL_ID
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+        return True, None
+    except Exception as e:
+        if "parse" not in str(e).lower() and "entit" not in str(e).lower():
+            return False, e
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            print("[CHANNEL] Markdown rejected — sent as plain text instead")
+            return True, None
+        except Exception as e2:
+            return False, e2
+
+
 async def deliver_pending_alerts():
     try:
         result = supabase.table("alerts").select("*") \
@@ -393,27 +426,85 @@ async def deliver_pending_alerts():
         if not alerts:
             return
 
-        bot = Bot(token=TELEGRAM_TOKEN)
-        for alert in alerts:
-            ticker = alert.get("ticker", "UNKNOWN")
-            impact = alert.get("impact", "LOW")
-            if TELEGRAM_CHANNEL_ID:
-                try:
-                    await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID,
-                                           text=format_alert(alert),
-                                           parse_mode="Markdown")
+        if not TELEGRAM_CHANNEL_ID:
+            print(f"[ERROR] {len(alerts)} alert(s) waiting but TELEGRAM_CHANNEL_ID "
+                  f"is not set. Leaving them undelivered — they will send as "
+                  f"soon as the variable is configured.")
+            return
+
+        # python-telegram-bot v20+ will not talk to the API on a Bot that was
+        # never initialized -- the underlying HTTPX pool is not started and the
+        # call raises before a single byte goes out. `async with` is the
+        # documented way to do this for a bare Bot; the old code constructed
+        # Bot(token=...) and called send_message on it directly.
+        async with Bot(token=TELEGRAM_TOKEN) as bot:
+            for alert in alerts:
+                alert_id = alert.get("id")
+                ticker = alert.get("ticker", "UNKNOWN")
+                impact = alert.get("impact", "LOW")
+
+                ok, err = await send_telegram(bot, format_alert(alert))
+
+                if ok:
                     print(f"[CHANNEL] {impact} — ${ticker}")
                     log_alert_run(alert, True)
-                except Exception as e:
-                    print(f"[ERROR] Channel post failed for {ticker}: {e}")
-                    log_alert_run(alert, False, e)
-            else:
-                log_alert_run(alert, False, "TELEGRAM_CHANNEL_ID not configured")
+                    _send_failures.pop(alert_id, None)
+                else:
+                    fails = _send_failures.get(alert_id, 0) + 1
+                    _send_failures[alert_id] = fails
+                    print(f"[ERROR] Channel post failed for {ticker} "
+                          f"(attempt {fails}/{MAX_SEND_ATTEMPTS}): "
+                          f"{type(err).__name__}: {err}")
+                    if fails < MAX_SEND_ATTEMPTS:
+                        # Leave delivered=False so the next loop retries it.
+                        continue
+                    print(f"[ERROR] Giving up on {ticker} after "
+                          f"{MAX_SEND_ATTEMPTS} attempts — marking delivered "
+                          f"so it stops blocking the queue.")
+                    log_alert_run(alert, False, err)
+                    _send_failures.pop(alert_id, None)
 
-            supabase.table("alerts").update({"delivered": True}) \
-                .eq("id", alert["id"]).execute()
+                # Only reached on success, or on final give-up. THIS IS THE FIX:
+                # the old code ran this unconditionally, outside the try, so an
+                # alert that Telegram rejected was still stamped delivered and
+                # never retried. That is how a full session's alerts showed
+                # delivered=true in the database while nothing arrived in the
+                # channel -- they were not lost in transit, they were marked
+                # sent without ever having been sent.
+                supabase.table("alerts").update({"delivered": True}) \
+                    .eq("id", alert_id).execute()
     except Exception as e:
-        print(f"[ERROR] Delivery failed: {e}")
+        print(f"[ERROR] Delivery failed: {type(e).__name__}: {e}")
+
+
+async def verify_telegram():
+    """Prove at boot that we can actually post to the channel.
+
+    Everything upstream of this was working -- filings fetched, summaries
+    written, alerts stored -- and the only broken link was the last hop. That
+    hop is now tested explicitly instead of being assumed.
+    """
+    if not TELEGRAM_TOKEN:
+        print("[TELEGRAM] Self-test FAILED — TELEGRAM_TOKEN is not set.")
+        return False
+    if not TELEGRAM_CHANNEL_ID:
+        print("[TELEGRAM] Self-test FAILED — TELEGRAM_CHANNEL_ID is not set.")
+        return False
+    try:
+        async with Bot(token=TELEGRAM_TOKEN) as bot:
+            me = await bot.get_me()
+            await bot.send_message(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                text=f"✅ GQ FinXray US online — {et_now():%d %b %Y, %I:%M %p ET}")
+        print(f"[TELEGRAM] Self-test PASSED — posting as @{me.username} "
+              f"to {TELEGRAM_CHANNEL_ID}")
+        return True
+    except Exception as e:
+        print(f"[TELEGRAM] Self-test FAILED — {type(e).__name__}: {e}")
+        print("[TELEGRAM] Nothing will reach the channel until this is fixed. "
+              "Check: token correct, bot is an ADMIN of the channel, and "
+              "TELEGRAM_CHANNEL_ID is the numeric -100... id or @channelname.")
+        return False
 
 
 # ── Market reports ────────────────────────────────────────────────────────────
@@ -463,13 +554,17 @@ async def send_market_report(title: str, body: str):
     if not TELEGRAM_CHANNEL_ID:
         return
     try:
-        bot = Bot(token=TELEGRAM_TOKEN)
         msg = (f"📊 *{title}*\n_{et_now():%I:%M %p ET}_\n\n{body}\n\n"
                f"_GQ FinXray US · gquants.com_")
-        await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=msg, parse_mode="Markdown")
-        print(f"[REPORT] Sent: {title}")
+        async with Bot(token=TELEGRAM_TOKEN) as bot:
+            ok, err = await send_telegram(bot, msg)
+        if ok:
+            print(f"[REPORT] Sent: {title}")
+        else:
+            print(f"[ERROR] Market report '{title}' failed: "
+                  f"{type(err).__name__}: {err}")
     except Exception as e:
-        print(f"[ERROR] Market report failed: {e}")
+        print(f"[ERROR] Market report failed: {type(e).__name__}: {e}")
 
 
 def send_premarket_report():
@@ -599,6 +694,7 @@ def run_pipeline_loop():
 
 async def delivery_loop():
     print("[DELIVERY] Starting...")
+    await verify_telegram()
     while True:
         await deliver_pending_alerts()
         await asyncio.sleep(30)
