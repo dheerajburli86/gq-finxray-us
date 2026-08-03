@@ -2,16 +2,25 @@
 feature_map.py
 GQ FinXray US — the 11 features, in one place.
 
-Every alert stored in Supabase (`alerts.extra.feature_id` /
-`extra.feature_name`) and every Telegram message gets tagged with exactly
-one of these, so alert performance can be tested/monitored feature-by-
-feature (this is the whole point — requested so testing can tell which of
-the 11 features a given alert came from at a glance).
+Every alert stored in Supabase (`alerts.extra.feature_id` / `extra.feature_name`)
+and every Telegram message gets tagged with exactly one of these, so alert
+performance can be monitored feature-by-feature.
 
-Mapping is keyed by (source, filing_type) since that's what every poller
-already stores. `resolve_feature()` does a best-effort match; if nothing
-matches it falls back to feature 0 ("Unmapped") rather than crashing —
-better to see "Unmapped" in a test channel than lose the alert.
+Mapping is keyed by (source, filing_type). `resolve_feature()` does a
+best-effort match; if nothing matches it falls back to feature 0 ("Unmapped")
+rather than crashing.
+
+CHANGES 2026-08-03
+------------------
+- Feature 5 renamed and rescoped. `BULK_DEAL` is retained ONLY so historical
+  rows keep resolving; it is deprecated for new writes. The US has no bulk or
+  block deal disclosure regime -- that is a SEBI construct -- and labelling
+  FMP insider-trading rows as bulk deals conflated a CFO selling her own
+  shares with an institution crossing size. New large-print detection writes
+  source=LARGE_TRADE off Massive's tick tape instead. See
+  large_trades_poller.py.
+- Feature 10 lost MORNING_ROUNDUP / EVENING_ROUNDUP (removed from the product);
+  it is now ETF Xray only.
 """
 
 FEATURES = {
@@ -24,8 +33,9 @@ FEATURES = {
     2: {
         "name": "Company & Sector News",
         "detail": "Ticker/sector news (FMP) + CNBC/MarketWatch/Bloomberg RSS aggregation.",
-        "sources": {"FMP_NEWS", "CNBC", "REUTERS", "MARKETWATCH", "NASDAQ", "IBD", "FORTUNE", "CNN", "BLOOMBERG"},
-        "filing_types": {"NEWS"},
+        "sources": {"FMP_NEWS", "CNBC", "REUTERS", "MARKETWATCH", "NASDAQ",
+                    "IBD", "FORTUNE", "CNN", "BLOOMBERG", "MASSIVE_NEWS"},
+        "filing_types": {"NEWS", "PRESS_RELEASE"},
     },
     3: {
         "name": "Result Snapshot",
@@ -40,12 +50,15 @@ FEATURES = {
         "filing_types": {"EARNINGS_CALENDAR"},
     },
     5: {
-        "name": "Insider Transactions & Large Deals",
-        "detail": "FMP insider-trading feed (exec/board buy-sell) + bulk/block deal flags ($1M+). "
-                  "Note: raw SEC Form 4 filings themselves resolve under Feature 1 (SEC EDGAR "
-                  "Filings), since they're keyed source=SEC_EDGAR, not source=FMP_NEWS/FMP.",
-        "sources": {"FMP_NEWS", "FMP"},
-        "filing_types": {"INSIDER_FMP", "BULK_DEAL"},
+        "name": "Large Trades & Insider Activity",
+        "detail": "Block-size prints off Massive's tick tape (the US-legal analogue to "
+                  "India's bulk/block deal feed — size and price are public, "
+                  "counterparties are not disclosed under US rules), plus FMP's "
+                  "insider-trading feed for exec/board buy-sell. Note: raw SEC Form 4 "
+                  "filings resolve under Feature 1, since they are keyed "
+                  "source=SEC_EDGAR.",
+        "sources": {"FMP_NEWS", "FMP", "LARGE_TRADE"},
+        "filing_types": {"INSIDER_FMP", "LARGE_TRADE", "BULK_DEAL"},
     },
     6: {
         "name": "Technical Alerts",
@@ -58,7 +71,10 @@ FEATURES = {
     },
     7: {
         "name": "ETF Flow Alerts",
-        "detail": "Institutional inflow/outflow signal from ETF volume + price-move thresholds.",
+        "detail": "Institutional inflow/outflow SIGNAL derived from ETF volume + "
+                  "price-move thresholds. Note: this is a proxy, not true "
+                  "creation/redemption fund-flow data — no vendor at this price "
+                  "point sells that.",
         "sources": {"ETF_FLOW"},
         "filing_types": {"INFLOW", "OUTFLOW"},
     },
@@ -72,17 +88,19 @@ FEATURES = {
         "name": "Sector Heatmap",
         "detail": "Daily/weekly/monthly S&P 500 GICS sector ETF heatmap image.",
         "sources": {"SECTOR_HEATMAP"},
-        "filing_types": {"HEATMAP_DAILY_09", "HEATMAP_DAILY_13", "HEATMAP_WEEKLY", "HEATMAP_MONTHLY"},
+        "filing_types": {"HEATMAP_DAILY_09", "HEATMAP_DAILY_13",
+                         "HEATMAP_WEEKLY", "HEATMAP_MONTHLY"},
     },
     10: {
-        "name": "News Roundup & ETF Xray",
-        "detail": "Morning/evening AI news digest + structured ETF fundamentals snapshot.",
-        "sources": {"NEWS_ROUNDUP", "ETF_XRAY"},
-        "filing_types": {"MORNING_ROUNDUP", "EVENING_ROUNDUP", "ETF_XRAY"},
+        "name": "ETF Xray",
+        "detail": "Structured ETF fundamentals snapshot — price, expense ratio, AUM, "
+                  "volume by category.",
+        "sources": {"ETF_XRAY"},
+        "filing_types": {"ETF_XRAY"},
     },
     11: {
         "name": "Earnings Call Transcripts",
-        "detail": "NEW — full transcript pulled via FMP when EDGAR flags a 10-Q/10-K, "
+        "detail": "Full transcript pulled via FMP when EDGAR flags a 10-Q/10-K, "
                   "AI-summarized through the same S.1/S.3/V.1 pipeline as news & filings.",
         "sources": {"FMP_TRANSCRIPT"},
         "filing_types": {"EARNINGS_TRANSCRIPT"},
@@ -101,11 +119,10 @@ def resolve_feature(source, filing_type):
             return fid, info["name"]
     # Second pass: match on source alone, but ONLY when that source belongs to
     # exactly one feature. Several sources (e.g. "FMP_NEWS", "FMP") are shared
-    # across multiple features distinguished solely by filing_type -- if we
-    # guessed here for a shared source, an unrecognized/typo'd filing_type
-    # would silently resolve to whichever feature happens to iterate first in
-    # dict order, instead of surfacing as "Unmapped" the way this module's own
-    # docstring promises. Only fall back when the source is unambiguous.
+    # across multiple features distinguished solely by filing_type -- guessing
+    # for a shared source would let an unrecognized filing_type silently
+    # resolve to whichever feature iterates first, instead of surfacing as
+    # "Unmapped". Only fall back when the source is unambiguous.
     candidates = [fid for fid, info in FEATURES.items() if source in info["sources"]]
     if len(candidates) == 1:
         fid = candidates[0]
@@ -132,5 +149,7 @@ def feature_footer(source, filing_type):
 
 if __name__ == "__main__":
     for src, ft in [("SEC_EDGAR", "8-K"), ("TECHNICAL", "RSI_OVERBOUGHT"),
-                    ("FMP_TRANSCRIPT", "EARNINGS_TRANSCRIPT"), ("BOGUS", "X")]:
-        print(src, ft, "->", resolve_feature(src, ft))
+                    ("FMP_TRANSCRIPT", "EARNINGS_TRANSCRIPT"),
+                    ("LARGE_TRADE", "LARGE_TRADE"), ("ETF_XRAY", "ETF_XRAY"),
+                    ("BOGUS", "X")]:
+        print(f"{src:<16} {ft:<22} -> {resolve_feature(src, ft)}")

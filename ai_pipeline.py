@@ -1,75 +1,110 @@
+"""
+ai_pipeline.py
+GQ FinXray US — LLM summarisation pipeline. v2.
+
+WHY v1 PRODUCED ZERO ALERTS FOR THREE DAYS
+------------------------------------------
+Measured against the live database, not guessed:
+
+1. THE WORD LADDER COULD NOT PASS. Attempt 1 demanded 70-75 words -- a
+   six-word window. Gemini naturally writes 80-90. Query every summary that
+   ever succeeded: NOT ONE passed on attempt 1. The ones that got through
+   took 2-5 attempts and landed at 70, 72, 77, 79, 80, 82, 83, 85, 86, 90, 91
+   words. So every filing paid 3-6 summarisation calls before it could
+   possibly succeed, and 2,667 SEC filings failed all six and were flagged.
+
+2. FORCING A WORD COUNT MANUFACTURED THE PADDING. The summaries that DID
+   pass ended like "...is truly remarkable.", "...trade disputes!", and
+   "What steps should be taken?" -- that is a model being ordered to stretch
+   an 8-K with 60 words of substance up to a demanded 90.
+
+3. TWENTY LLM CALLS PER FILING CAUSED THE 429. gibberish(1) + relevance(1) +
+   summarise(1-6) + validation(1) + impact(1) + dedup(UP TO 10, one LLM call
+   per recent summary, sequentially). At a 2s minimum gap that is a 40s floor
+   per filing, and each 429 could add 5 x 60s of blocking backoff.
+
+WHAT v2 DOES
+------------
+- Accept-first validation: 45-120 words, judged on whether the sentence
+  actually finishes, not on hitting a number. No ladder.
+- Prompts ask for "3-4 complete sentences, stop when the substance runs out,
+  never pad" instead of an exact count.
+- Gibberish + relevance merged into ONE call.
+- Impact returned by the summarisation call as a second JSON field, not a
+  separate round trip.
+- Dedup does local text similarity first and only escalates to the LLM in the
+  genuinely ambiguous band -- typically zero LLM calls.
+- max_tokens raised 600 -> 2000. Gemini 2.5 Flash is a reasoning model and
+  its thinking tokens come out of the same budget; 600 risked truncating the
+  visible answer mid-sentence, which is exactly the "no full stop, cut off
+  halfway" symptom seen before the ladder was introduced.
+- Booleans normalised. v1 compared LLM output against the STRING "True", so
+  when the model returned JSON `true` the V.1 validation and the dedup check
+  silently never fired at all.
+- 429 responses now log their body, so "rate limited" and "out of credit" are
+  distinguishable.
+
+Typical cost per filing: 2 calls. Worst case 4. Down from 5-20.
+"""
+
 import os
 import json
 import re
 import time
+import difflib
 import requests
-from supabase import create_client
-from dotenv import load_dotenv
 from datetime import datetime, timezone
 
-load_dotenv()
+from supabase import create_client
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+from feature_map import resolve_feature
 
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
 DEEPINFRA_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
-DEEPINFRA_MODEL = "google/gemini-2.5-flash"
+DEEPINFRA_MODEL = os.getenv("DEEPINFRA_MODEL", "google/gemini-2.5-flash")
 
-# -- AI Mode enabled via DeepInfra (paid) -------------------------------------
-RAW_MODE = False
+# ── Summary acceptance band ───────────────────────────────────────────────────
+# Wide on purpose. The job of this gate is to reject summaries that are empty,
+# truncated mid-sentence, or obvious boilerplate -- NOT to enforce a word
+# count. An 8-K announcing a dividend genuinely needs 50 words; an earnings
+# transcript needs 110. Demanding both hit the same narrow band is what broke
+# v1, and what made the model pad.
+MIN_WORDS = 45
+MAX_WORDS = 120
 
-from Prompt_P2_GibberishChecker import get_prompt as gibberish_prompt
-from Prompt_V3_RelevanceCheck import get_prompt as relevance_prompt
-from Prompt_V1_SummaryValidation import get_prompt as validation_prompt
-from Prompt_V2_SimilarityCheck import get_prompt as similarity_prompt
-from Prompt_C1_ImpactClassification import get_prompt as impact_prompt
-from Prompt_S1N_NewsSummarization import get_prompt as s1n_prompt
-from Prompt_S1A_AnnouncementSummarization import get_prompt as s1a_prompt
-from Prompt_S1T_TranscriptSummarization import get_prompt as s1t_prompt
-from feature_map import resolve_feature
-
-
-# ── Word-count escalation ladder ──────────────────────────────────────────────
-# Attempt 1 uses the real S.1.N / S.1.A / S.1.T prompt, asking for EXACTLY 75
-# words (floor 70) — not "under 75", which let short summaries through too
-# easily. Every retry after that goes through S.3 (resummarize) asking for
-# exactly {target} words, with the ceiling raised by 5 each time (80, 85, 90,
-# 95, 100), so the model gets more room to *finish its thought* instead of
-# truncating awkwardly — but the floor stays fixed at MIN_WORDS the whole
-# time, so a summary can never pass by being short. All three prompt files
-# explicitly forbid padding with filler just to hit the count, so a summary
-# that's still short after 6 honest attempts means the source content
-# genuinely can't support 70+ real words — at that point it stops (no
-# infinite loop burning tokens) and gets flagged for manual review instead
-# of silently discarded or sent out as a low-quality alert.
-MIN_WORDS = 70
-STARTING_TARGET = 75
-TARGET_STEP = 5
-MAX_TARGET = 100
-
-# Summary class selection: News uses S.1.N, Announcements/filings use S.1.A,
-# Earnings call transcripts (Feature 11) use S.1.T. Transcripts run several
-# times longer than a filing excerpt, so they get a bigger raw-text slice —
-# still capped, just a higher cap, so the model sees more of the call.
+# Content slice sent to the model.
 TRANSCRIPT_CHAR_LIMIT = 12000
 FILING_CHAR_LIMIT = 8000
 NEWS_CHAR_LIMIT = 6000
 
+# Untickered general news ("ticker": "MARKET") was being fed to a prompt that
+# literally says "summarize focusing on the company: MARKET". 621 of the
+# flagged filings are exactly this. It cannot produce a usable company alert,
+# so it is skipped before any LLM call is made. Set False to let them through
+# to a market-wide summary instead.
+SKIP_UNTICKERED_NEWS = True
+UNTICKERED = {"MARKET", "UNKNOWN", "", None}
 
-# ── Token usage tracking (per filing currently being processed) ──────────────
-# process_filing() runs one filing at a time on a single thread (run_pipeline's
-# for-loop), so a simple module-level accumulator is safe -- reset it at the
-# start of each filing, read it back once at the end to get the TOTAL tokens
-# spent across every DeepInfra call that filing needed (gibberish check,
-# relevance check, every S.1/S.3 summarization attempt, V.1 validation,
-# impact classification, similarity checks) -- not just the final successful
-# summarization call, since that's the true per-alert cost.
+# Local dedup thresholds. Above HIGH we call it a duplicate outright with no
+# LLM involvement; below LOW it is clearly distinct. Only the band between
+# them is worth spending a call on.
+DEDUP_LOCAL_HIGH = 0.82
+DEDUP_LOCAL_LOW = 0.55
+
+
+# ── Token accounting (per filing) ────────────────────────────────────────────
 _token_usage = {"input": 0, "output": 0, "calls": 0}
 
 
 def _reset_token_usage():
-    _token_usage["input"] = 0
-    _token_usage["output"] = 0
-    _token_usage["calls"] = 0
+    _token_usage.update({"input": 0, "output": 0, "calls": 0})
 
 
 def _record_token_usage(usage):
@@ -81,47 +116,151 @@ def _record_token_usage(usage):
 
 
 def get_token_usage():
-    """Snapshot of accumulated tokens since the last _reset_token_usage()."""
     return dict(_token_usage)
 
 
 # ── DeepInfra caller ─────────────────────────────────────────────────────────
-def call_deepinfra(prompt, retries=3, max_tokens=1000):
-    """Call DeepInfra API with Gemini 2.5 Flash."""
-    headers = {
-        "Authorization": f"Bearer {DEEPINFRA_API_KEY}",
-        "Content-Type": "application/json"
-    }
+# With v2 making 2-4 calls per filing instead of up to 20, the pacing gap can
+# come down substantially without going anywhere near the rate limit.
+MIN_CALL_GAP_SECONDS = 0.5
+MAX_RATE_LIMIT_RETRIES = 4
+_last_call_at = [0.0]
+
+
+def _pace_before_call():
+    elapsed = time.monotonic() - _last_call_at[0]
+    if elapsed < MIN_CALL_GAP_SECONDS:
+        time.sleep(MIN_CALL_GAP_SECONDS - elapsed)
+
+
+def call_deepinfra(prompt, retries=2, max_tokens=2000, temperature=0.2):
+    """Call DeepInfra. Returns text or None.
+
+    max_tokens defaults to 2000, not 600. Gemini 2.5 Flash reasons before
+    answering and those tokens are drawn from the same budget -- a tight cap
+    can consume the allowance during thinking and return a visible answer
+    that stops mid-sentence. You only pay for tokens actually generated, so
+    the headroom is nearly free.
+    """
+    if not DEEPINFRA_API_KEY:
+        print("[DEEPINFRA] No API key set -- cannot summarise.")
+        return None
+
+    headers = {"Authorization": f"Bearer {DEEPINFRA_API_KEY}",
+               "Content-Type": "application/json"}
     payload = {
         "model": DEEPINFRA_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }
-    for attempt in range(retries):
+
+    normal_attempt = 0
+    rate_limit_attempt = 0
+
+    while True:
+        _pace_before_call()
         try:
-            r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=30)
-            if r.status_code == 200:
-                resp = r.json()
-                text = (resp["choices"][0]["message"]["content"] or "").strip()
-                # Strip <think>...</think> reasoning tokens
-                text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-                _record_token_usage(resp.get("usage"))
-                return text
-            else:
-                print(f"[DEEPINFRA] Attempt {attempt+1} failed: {r.status_code} {r.text[:100]}")
+            r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=90)
         except Exception as e:
-            print(f"[DEEPINFRA] Attempt {attempt+1} error: {e}")
-        time.sleep(2 ** attempt)
-    return None
+            _last_call_at[0] = time.monotonic()
+            normal_attempt += 1
+            print(f"[DEEPINFRA] Attempt {normal_attempt} network error: {e}")
+            if normal_attempt > retries:
+                return None
+            time.sleep(2 ** normal_attempt)
+            continue
+
+        _last_call_at[0] = time.monotonic()
+
+        if r.status_code == 200:
+            resp = r.json()
+            choice = (resp.get("choices") or [{}])[0]
+            text = ((choice.get("message") or {}).get("content") or "").strip()
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            _record_token_usage(resp.get("usage"))
+            if choice.get("finish_reason") == "length":
+                # The model was cut off by max_tokens. Surfacing this matters:
+                # it is the difference between "the model wrote a bad summary"
+                # and "we didn't give it room to finish".
+                print(f"[DEEPINFRA] WARNING: hit max_tokens ({max_tokens}) -- output truncated")
+            return text
+
+        if r.status_code == 429:
+            rate_limit_attempt += 1
+            # v1 printed r.text for every status EXCEPT 429, so the one error
+            # worth diagnosing was the one we never saw. On DeepInfra a 429
+            # can mean per-minute throttling OR an exhausted balance, and the
+            # body is the only way to tell them apart.
+            print(f"[DEEPINFRA] 429 body: {r.text[:300]}")
+            if rate_limit_attempt > MAX_RATE_LIMIT_RETRIES:
+                print(f"[DEEPINFRA] Rate limited after {MAX_RATE_LIMIT_RETRIES} waits -- giving up")
+                return None
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() \
+                else min(10 * rate_limit_attempt, 45)
+            print(f"[DEEPINFRA] Waiting {wait:.0f}s (retry {rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES})")
+            time.sleep(wait)
+            continue
+
+        normal_attempt += 1
+        print(f"[DEEPINFRA] Attempt {normal_attempt} failed: {r.status_code} {r.text[:200]}")
+        if normal_attempt > retries:
+            return None
+        time.sleep(2 ** normal_attempt)
 
 
-# ── Summary quality helpers ───────────────────────────────────────────────────
+# ── JSON parsing ──────────────────────────────────────────────────────────────
+def parse_json_response(text):
+    """Parse a JSON object out of an LLM response, tolerating fences and prose."""
+    if not text:
+        return {}
+    clean = text.strip()
+    clean = re.sub(r"^```(?:json)?", "", clean).strip()
+    clean = re.sub(r"```$", "", clean).strip()
+    try:
+        return json.loads(clean)
+    except Exception:
+        pass
+    # Fall back to the outermost {...} block -- models like to add a sentence
+    # of commentary either side of the JSON.
+    m = re.search(r"\{.*\}", clean, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    print(f"[WARN] Could not parse JSON from LLM response: {clean[:200]!r}")
+    return {}
+
+
+def as_bool(value, default=False):
+    """Normalise the many shapes an LLM returns a boolean in.
+
+    v1 compared against the string "True" in some places and the bool True in
+    others. When the model returned JSON `true`, `issues_detected == "True"`
+    was False -- so V.1 validation and semantic dedup never ran at all, in
+    production, for the entire life of that code.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("true", "yes", "y", "1")
+
+
+# ── Summary hygiene ───────────────────────────────────────────────────────────
 BAD_START_KEYWORDS = [
     "this content", "the following", "this document", "this filing",
     "this report", "this article", "this press release", "this announcement",
-    "this form", "this exhibit", "this call", "this transcript", "note:", "summary:", "overview:",
-    "the company has filed", "pursuant to", "in accordance with"
+    "this form", "this exhibit", "this call", "this transcript",
+    "note:", "summary:", "overview:", "here is", "here's",
 ]
+
+SENTENCE_END = (".", "!", "?", '."', ".'", '.”', ".)", "!\"", "?\"", "…")
+
 
 def clean_summary(text):
     if not text:
@@ -130,103 +269,178 @@ def clean_summary(text):
     text = re.sub(r"\(\d+\s*words?\)", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"word\s*count[\s:]+\d+", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\s{2,}", " ", text).strip()
+    text = text.strip('"').strip()
     if text and not text[0].isupper():
         text = text[0].upper() + text[1:]
     return text
 
+
 def standardize_numbers(text):
-    """Normalize number formatting so alerts read consistently."""
     if not text:
         return text
-    # No space between $ and the number ($ 150 -> $150)
     text = re.sub(r"\$\s+(\d)", r"$\1", text)
-    # No space before a percent sign (24 % -> 24%)
     text = re.sub(r"(\d)\s+%", r"\1%", text)
-    # Add thousands separators to bare 4+ digit numbers, but leave things that
-    # look like years (1900-2100) or are already part of a decimal untouched.
+
     def add_commas(m):
         num = m.group(0)
         if len(num) == 4 and 1900 <= int(num) <= 2100:
             return num
         return f"{int(num):,}"
-    text = re.sub(r"(?<!\d)(?<!\.)\d{4,}(?!\.\d)", add_commas, text)
-    return text
+
+    return re.sub(r"(?<!\d)(?<!\.)\d{4,}(?!\.\d)", add_commas, text)
+
 
 def count_words(text):
     return len(text.split()) if text else 0
 
+
 def starts_with_bad_keyword(text):
     if not text:
         return False
-    return any(text.lower().strip().startswith(kw) for kw in BAD_START_KEYWORDS)
+    low = text.lower().strip()
+    return any(low.startswith(kw) for kw in BAD_START_KEYWORDS)
 
-def last_sentence_incomplete(text):
+
+def ends_incomplete(text):
+    """True when the summary doesn't finish a sentence.
+
+    This is the check that actually matters -- an abrupt cut-off is what made
+    the old alerts unreadable. Handles closing quotes and brackets, which the
+    v1 version flagged as incomplete.
+    """
     if not text:
-        return False
-    text = text.strip()
-    if text.endswith((".", "!", "?")):
-        return False
-    incomplete_endings = [
-        " and", " or", " but", " with", " for", " of", " to",
-        " in", " on", " at", " by", " from", " as", " the", " a",
-        " an", " its", " their", " this", " that", " which",
-        " including", " such", " while", " after", " before",
-    ]
-    return any(text.lower().endswith(e) for e in incomplete_endings) or text[-1] not in ".!?"
+        return True
+    return not text.strip().endswith(SENTENCE_END)
 
-def classify_failure(summary, max_words):
-    """Returns the failure reason for this attempt, or None if it passes."""
+
+def classify_failure(summary):
+    """Reason this summary should be rejected, or None if it's good."""
     if not summary:
         return "empty"
     wc = count_words(summary)
-    if wc > max_words:
-        return "too_long"
     if wc < MIN_WORDS:
         return "too_short"
+    if wc > MAX_WORDS:
+        return "too_long"
     if starts_with_bad_keyword(summary):
         return "bad_start"
-    if last_sentence_incomplete(summary):
+    if ends_incomplete(summary):
         return "incomplete"
     return None
 
 
-# ── S.1 — Primary summarisation (real S.1.N / S.1.A / S.1.T prompts) ─────────
-def generate_s1(company_name, raw_text, filing_type="", sub_summary=""):
-    if filing_type == "NEWS":
-        prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT])
-    elif filing_type == "EARNINGS_TRANSCRIPT":
-        prompt = s1t_prompt(company_name, sub_summary, raw_text[:TRANSCRIPT_CHAR_LIMIT],
-                             target_word_count=STARTING_TARGET, min_word_count=MIN_WORDS)
-    else:
-        prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
-                             target_word_count=STARTING_TARGET, min_word_count=MIN_WORDS)
-    return call_deepinfra(prompt, max_tokens=600)
+# ── Prompts ───────────────────────────────────────────────────────────────────
+def screen_prompt(company_name, raw_text):
+    """ONE call replacing v1's separate gibberish and relevance round trips."""
+    return f"""You are screening source material before it is summarised for investors.
 
+Company of interest: {company_name}
 
-# ── S.3 — Resummarize at an escalated word target ─────────────────────────────
-def generate_s3(company_name, raw_text, target_words, filing_type=""):
-    char_limit = TRANSCRIPT_CHAR_LIMIT if filing_type == "EARNINGS_TRANSCRIPT" else NEWS_CHAR_LIMIT
-    prompt = f"""You are a financial analyst. Write a summary of the following content using exactly {target_words} words.
+Answer two questions about the content below.
+1. Is the text unusable? Unusable means OCR garbage, broken encoding, navigation
+   boilerplate, a paywall notice, or almost no readable prose.
+2. Is it genuinely about {company_name}? A passing mention in a list of tickers
+   does not count. It must carry real information about this company.
 
-Rules:
-- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {MIN_WORDS} words and never more than {target_words} words.
-- Do not pad the summary with filler phrases, restated facts, or generic commentary just to reach the word count -- every added word must carry real information from the content below.
-- Must end with a complete sentence ending in . ! or ?
-- Do not start with "This", "The following", "Summary:", "Note:" or similar
-- Plain English only, neutral and factual, no first person, no word count mentions
-
-Company: {company_name}
+Respond with ONLY this JSON, no other text:
+{{"is_gibberish": true or false, "is_relevant": true or false, "reason": "<8 words max>"}}
 
 Content:
-{raw_text[:char_limit]}
-
-Return only the summary. Nothing else."""
-    return call_deepinfra(prompt, max_tokens=700)
+{raw_text[:3000]}"""
 
 
-# ── Flagged-for-review sink (replaces "best available" fallback) ─────────────
-def store_flagged_summary(filing_id, ticker, company_name, final_summary, failure_reason, attempts,
-                           source="SEC_EDGAR", filing_type=""):
+def _style_rules():
+    return f"""Rules:
+- Write {MIN_WORDS}-{MAX_WORDS} words as 3-4 complete sentences. Stop as soon as the
+  substance runs out. A shorter accurate summary beats a padded one.
+- NEVER pad with filler, restated facts, or generic commentary to reach a length.
+  Do not add phrases like "this is significant for investors" or "remains to be seen".
+- The final sentence MUST end with a full stop, question mark or exclamation mark.
+  Never stop mid-sentence.
+- Only facts explicitly present in the source. No speculation, no advice, no
+  recommendations, no opinions.
+- Neutral professional tone. Plain English. No first person. No greeting, no sign-off.
+- Do not begin with "This", "The following", "Summary:", "Note:", or "Here is".
+- Do not mention the word count."""
+
+
+def summarise_prompt(company_name, raw_text, filing_type, sub_summary=""):
+    """S.1.N / S.1.A / S.1.T + impact, in a single call.
+
+    v1 asked for "exactly 75 words" and then made a SEPARATE call to classify
+    impact. The word count produced padding and the extra call produced
+    latency and rate-limit pressure for a one-word answer.
+    """
+    if filing_type == "NEWS":
+        kind, limit = "news article", NEWS_CHAR_LIMIT
+    elif filing_type == "EARNINGS_TRANSCRIPT":
+        kind, limit = "earnings call transcript", TRANSCRIPT_CHAR_LIMIT
+    else:
+        kind, limit = "regulatory filing", FILING_CHAR_LIMIT
+
+    context = f"\nHeadline/context: {sub_summary}\n" if sub_summary else ""
+
+    return f"""You are a financial analyst writing an alert for investors who follow {company_name}.
+
+Summarise the {kind} below, covering only what matters to someone holding or
+considering this stock.
+
+{_style_rules()}
+
+Also judge market impact:
+- HIGH: materially moves the stock (earnings surprise, M&A, guidance change,
+  regulatory action, executive departure, major contract)
+- MEDIUM: relevant but not decisive
+- LOW: routine, administrative, or already widely known
+
+Respond with ONLY this JSON, no other text:
+{{"summary": "<your summary>", "impact": "HIGH" or "MEDIUM" or "LOW"}}
+
+Company: {company_name}{context}
+{kind.title()}:
+{raw_text[:limit]}"""
+
+
+def retry_prompt(company_name, raw_text, filing_type, previous, failure):
+    """Single corrective retry that tells the model exactly what went wrong.
+
+    v1 retried by demanding five more words each time, which made truncation
+    and padding worse rather than better. Naming the actual defect works far
+    better than moving a numeric target.
+    """
+    diagnosis = {
+        "empty": "You returned nothing. Produce a real summary.",
+        "too_short": f"Your summary was too short. It needs at least {MIN_WORDS} words "
+                     f"of real content from the source -- add substance, not filler.",
+        "too_long": f"Your summary exceeded {MAX_WORDS} words. Tighten it by cutting "
+                    f"the least important detail, not by truncating a sentence.",
+        "bad_start": "Your summary opened with a banned phrase. Start directly with the fact.",
+        "incomplete": "Your summary stopped mid-sentence. Every sentence must finish, "
+                      "and the last one must end with proper punctuation.",
+    }.get(failure, "Your summary did not meet the quality bar.")
+
+    limit = TRANSCRIPT_CHAR_LIMIT if filing_type == "EARNINGS_TRANSCRIPT" else NEWS_CHAR_LIMIT
+    prev = (previous or "")[:600]
+
+    return f"""Your previous summary was rejected. {diagnosis}
+
+Previous attempt:
+{prev}
+
+Rewrite it correctly for {company_name}.
+
+{_style_rules()}
+
+Respond with ONLY this JSON, no other text:
+{{"summary": "<corrected summary>", "impact": "HIGH" or "MEDIUM" or "LOW"}}
+
+Source:
+{raw_text[:limit]}"""
+
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+def store_flagged_summary(filing_id, ticker, company_name, final_summary,
+                          failure_reason, attempts, source="SEC_EDGAR", filing_type=""):
     try:
         fid, fname = resolve_feature(source, filing_type)
         supabase.table("flagged_summaries").insert({
@@ -235,282 +449,253 @@ def store_flagged_summary(filing_id, ticker, company_name, final_summary, failur
             "company_name": company_name,
             "final_summary": final_summary,
             "final_word_count": count_words(final_summary) if final_summary else 0,
-            "max_target_reached": MAX_TARGET,
+            "max_target_reached": MAX_WORDS,
             "failure_reason": failure_reason,
             "attempts": attempts,
             "feature_id": fid,
             "feature_name": fname,
             "source": source,
-            "filing_type": filing_type
+            "filing_type": filing_type,
         }).execute()
-        print(f"[FLAGGED] {ticker} sent to review queue after exhausting retries ({failure_reason}) — Feature {fid}/11 {fname}")
+        print(f"[FLAGGED] {ticker} -> review queue ({failure_reason})")
     except Exception as e:
+        # If this is failing with a permissions error, SUPABASE_KEY is still
+        # the anon key. flagged_summaries has RLS enabled with an INSERT-only
+        # policy and no SELECT policy, so supabase-py's default
+        # return-the-row behaviour gets denied and the insert rolls back.
+        # Use the service_role key on the backend.
         print(f"[ERROR] Failed to store flagged summary: {e}")
 
 
-# ── Master summarise — retry-until-valid, escalating word budget ─────────────
-def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=None, ticker=None, source="SEC_EDGAR"):
-    """
-    Attempt 1: S.1.N / S.1.A / S.1.T prompt, target 75 words.
-    Each failure retries via S.3 with the ceiling raised by 5 words
-    (80, 85, 90, 95, 100), floor fixed at MIN_WORDS the whole time.
-    If still failing at MAX_TARGET, stop and flag for manual review —
-    never discard silently, never send a summary that failed validation.
-    """
-    attempts_log = []
-    target = STARTING_TARGET
-
-    raw = generate_s1(company_name, raw_text, filing_type, sub_summary)
-    summary = standardize_numbers(clean_summary(raw)) if raw else None
-    failure = classify_failure(summary, target)
-    attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
-
-    while failure and target < MAX_TARGET:
-        target += TARGET_STEP
-        print(f"[SUMMARY] Retry — previous failure: {failure}, new target: {target} words")
-        raw = generate_s3(company_name, raw_text, target, filing_type)
-        summary = standardize_numbers(clean_summary(raw)) if raw else None
-        failure = classify_failure(summary, target)
-        attempts_log.append({"attempt": len(attempts_log) + 1, "target": target, "words": count_words(summary), "failure": failure})
-
-    if not failure:
-        print(f"[SUMMARY] Passed at target={target} ({count_words(summary)} words, {len(attempts_log)} attempt(s))")
-        return summary, len(attempts_log)
-
-    print(f"[SUMMARY] Exhausted ladder at {target} words, still failing ({failure}) — flagging for review, not sending")
-    store_flagged_summary(
-        filing_id=filing_id,
-        ticker=ticker,
-        company_name=company_name,
-        final_summary=summary,
-        failure_reason=failure,
-        attempts=attempts_log,
-        source=source,
-        filing_type=filing_type
-    )
-    return None, len(attempts_log)
-
-
-# ── Other pipeline helpers ────────────────────────────────────────────────────
-def parse_json_response(text):
-    if not text:
-        return {}
-    try:
-        clean = text.strip().replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
-    except Exception as e:
-        # NOTE: every caller treats {} the same as "check didn't fire" (a
-        # missing key reads as None, which fails every downstream equality
-        # check). That means malformed JSON from the LLM silently fails
-        # OPEN -- gibberish passes, irrelevant content passes, V.1 validation
-        # is skipped, dedup doesn't dedupe -- with no signal that the check
-        # never actually ran. Log loudly so this shows up in monitoring
-        # instead of looking like a clean pass.
-        print(f"[WARN] parse_json_response: malformed LLM JSON, check fails OPEN -- {e} | raw={text[:200]!r}")
-        return {}
-
 def get_recent_summaries(ticker, limit=10):
     try:
-        result = supabase.table("ai_summaries") \
-            .select("summary") \
-            .eq("ticker", ticker) \
-            .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
+        result = supabase.table("ai_summaries").select("summary") \
+            .eq("ticker", ticker).order("created_at", desc=True).limit(limit).execute()
         return [r["summary"] for r in result.data if r.get("summary")]
     except Exception:
         return []
 
+
 def store_summary(filing_id, ticker, summary, impact, event_type):
     try:
         result = supabase.table("ai_summaries").insert({
-            "filing_id": filing_id,
-            "ticker": ticker,
-            "summary": summary,
-            "impact": impact,
-            "event_type": event_type
+            "filing_id": filing_id, "ticker": ticker, "summary": summary,
+            "impact": impact, "event_type": event_type,
         }).execute()
         return result.data[0]["id"] if result.data else None
     except Exception as e:
         print(f"[ERROR] Failed to store summary: {e}")
         return None
 
+
 def store_alert(ticker, summary, impact, source, filing_type="", extra=None, summary_id=None):
     try:
         fid, fname = resolve_feature(source, filing_type)
-        merged_extra = dict(extra or {})
-        merged_extra["feature_id"] = fid
-        merged_extra["feature_name"] = fname
+        merged = dict(extra or {})
+        merged["feature_id"] = fid
+        merged["feature_name"] = fname
         supabase.table("alerts").insert({
-            "ticker": ticker,
-            "summary": summary,
-            "impact": impact,
-            "source": source,
-            "filing_type": filing_type,
-            "extra": merged_extra,
-            "delivered": False,
-            "summary_id": summary_id
+            "ticker": ticker, "summary": summary, "impact": impact,
+            "source": source, "filing_type": filing_type, "extra": merged,
+            "delivered": False, "summary_id": summary_id,
         }).execute()
-        print(f"[ALERT READY] {impact} -- {ticker}: {summary[:80]}... (Feature {fid}/11 {fname})")
+        print(f"[ALERT READY] {impact} -- {ticker}: {summary[:80]}... (F{fid}/11 {fname})")
     except Exception as e:
         print(f"[ERROR] Failed to store alert: {e}")
 
+
 def update_filing_status(filing_id, status):
     try:
-        supabase.table("raw_filings") \
-            .update({"status": status}) \
-            .eq("id", filing_id) \
-            .execute()
+        supabase.table("raw_filings").update({"status": status}).eq("id", filing_id).execute()
     except Exception as e:
         print(f"[ERROR] Failed to update status: {e}")
 
 
-# ── AI MODE processor ─────────────────────────────────────────────────────────
+# ── Deduplication ─────────────────────────────────────────────────────────────
+def _similarity(a, b):
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def is_duplicate(ticker, summary):
+    """Local-first dedup.
+
+    v1 made ONE LLM CALL PER RECENT SUMMARY -- up to ten sequential calls per
+    filing, purely to ask "are these the same story?" -- and then compared the
+    answer against the string "True", so with a JSON boolean it never matched
+    and nothing was ever actually deduplicated. Ten calls, zero effect.
+
+    Text similarity settles the clear cases for free. Only the ambiguous
+    middle band costs a call, and it's a single call covering all candidates.
+    """
+    recent = get_recent_summaries(ticker)
+    if not recent:
+        return False
+
+    scored = sorted(((_similarity(summary, old), old) for old in recent),
+                    key=lambda x: x[0], reverse=True)
+    best_score, best_match = scored[0]
+
+    if best_score >= DEDUP_LOCAL_HIGH:
+        print(f"[DEDUP] Local match {best_score:.2f} -- duplicate, no LLM call needed")
+        return True
+    if best_score < DEDUP_LOCAL_LOW:
+        return False
+
+    candidates = [old for score, old in scored if score >= DEDUP_LOCAL_LOW][:3]
+    listed = "\n".join(f"{i + 1}. {c[:300]}" for i, c in enumerate(candidates))
+    prompt = f"""Does the NEW summary describe the same underlying event as any EARLIER one?
+
+Same event = same announcement or story, even if worded differently.
+Different events on the same company are NOT duplicates.
+
+NEW:
+{summary}
+
+EARLIER:
+{listed}
+
+Respond with ONLY: {{"is_duplicate": true or false}}"""
+
+    result = parse_json_response(call_deepinfra(prompt, max_tokens=200))
+    dup = as_bool(result.get("is_duplicate"), default=False)
+    print(f"[DEDUP] Ambiguous ({best_score:.2f}) -> LLM says duplicate={dup}")
+    return dup
+
+
+# ── Summarisation ─────────────────────────────────────────────────────────────
+def summarise(company_name, raw_text, filing_type="", sub_summary="",
+              filing_id=None, ticker=None, source="SEC_EDGAR"):
+    """Returns (summary, impact, attempts). summary is None if it was flagged."""
+    attempts_log = []
+
+    raw = call_deepinfra(summarise_prompt(company_name, raw_text, filing_type, sub_summary))
+    parsed = parse_json_response(raw)
+    summary = standardize_numbers(clean_summary(parsed.get("summary", "")))
+    impact = str(parsed.get("impact", "LOW")).upper()
+    failure = classify_failure(summary)
+    attempts_log.append({"attempt": 1, "words": count_words(summary), "failure": failure})
+
+    if not failure:
+        print(f"[SUMMARY] Passed first attempt ({count_words(summary)} words)")
+        return summary, impact, 1
+
+    print(f"[SUMMARY] Attempt 1 rejected ({failure}) -- one corrective retry")
+    raw2 = call_deepinfra(retry_prompt(company_name, raw_text, filing_type, summary, failure))
+    parsed2 = parse_json_response(raw2)
+    summary2 = standardize_numbers(clean_summary(parsed2.get("summary", "")))
+    impact2 = str(parsed2.get("impact", impact)).upper()
+    failure2 = classify_failure(summary2)
+    attempts_log.append({"attempt": 2, "words": count_words(summary2), "failure": failure2})
+
+    if not failure2:
+        print(f"[SUMMARY] Passed on retry ({count_words(summary2)} words)")
+        return summary2, impact2, 2
+
+    print(f"[SUMMARY] Retry also failed ({failure2}) -- flagging for review")
+    store_flagged_summary(filing_id, ticker, company_name,
+                          summary2 or summary, failure2, attempts_log, source, filing_type)
+    return None, None, 2
+
+
+# ── Per-filing processor ──────────────────────────────────────────────────────
 def process_filing(filing):
-    filing_id    = filing["id"]
-    ticker       = filing.get("ticker", "UNKNOWN")
-    company_name = filing.get("company_name", "UNKNOWN")
-    raw_text     = filing.get("raw_text", "")
-    filing_type  = filing.get("filing_type", "")
-    source       = filing.get("source", "SEC_EDGAR")
-    extra        = filing.get("extra") or {}
-    sub_summary  = extra.get("title", "")
+    filing_id = filing["id"]
+    ticker = filing.get("ticker", "UNKNOWN")
+    company_name = filing.get("company_name") or ticker
+    raw_text = filing.get("raw_text", "") or ""
+    filing_type = filing.get("filing_type", "")
+    source = filing.get("source", "SEC_EDGAR")
+    extra = filing.get("extra") or {}
+    sub_summary = extra.get("title", "")
 
-    print(f"\n[PROCESSING] {filing_type} -- {company_name} ({ticker}) [source={source}]")
-
-    # Reset the per-filing token accumulator so get_token_usage() at the end
-    # of this function reflects only what THIS filing's checks/summarization
-    # cost, not a running total across every filing the pipeline has ever
-    # processed since the process started.
+    print(f"\n[PROCESSING] {filing_type} -- {company_name} ({ticker}) [{source}]")
     _reset_token_usage()
 
-    # Step 1: Gibberish check
-    gibberish_result = parse_json_response(call_deepinfra(gibberish_prompt(raw_text[:3000])))
-    if gibberish_result.get("is_gibberish") == True:
-        print(f"[DISCARDED] Gibberish -- {ticker}")
+    # Gate 0 — free. No LLM call.
+    if SKIP_UNTICKERED_NEWS and ticker in UNTICKERED:
+        print(f"[SKIP] No ticker matched -- not a company alert. Zero LLM cost.")
         update_filing_status(filing_id, "DISCARDED")
         return
-    print(f"[PASS] Gibberish check")
 
-    # Step 2: Relevance check
-    relevance_result = parse_json_response(call_deepinfra(relevance_prompt(company_name, raw_text[:3000])))
-    if relevance_result.get("is_relevant") in ("False", False):
-        print(f"[DISCARDED] Not relevant to {company_name}")
+    if len(raw_text.strip()) < 120:
+        print(f"[SKIP] Source text too short to summarise ({len(raw_text)} chars)")
         update_filing_status(filing_id, "DISCARDED")
         return
-    print(f"[PASS] Relevance check")
 
-    # Step 3: Summarisation — retry-until-valid, escalating word budget.
-    # Returns None only if it exhausted the ladder up to MAX_TARGET; in that
-    # case it has already been written to flagged_summaries for review.
-    summary, summarization_attempts = summarise(company_name, raw_text, filing_type, sub_summary,
-                                                 filing_id=filing_id, ticker=ticker, source=source)
+    # Call 1 — gibberish + relevance together.
+    screen = parse_json_response(call_deepinfra(screen_prompt(company_name, raw_text),
+                                               max_tokens=300))
+    if as_bool(screen.get("is_gibberish")):
+        print(f"[DISCARDED] Unusable text -- {screen.get('reason', '')}")
+        update_filing_status(filing_id, "DISCARDED")
+        return
+    if not as_bool(screen.get("is_relevant"), default=True):
+        print(f"[DISCARDED] Not about {company_name} -- {screen.get('reason', '')}")
+        update_filing_status(filing_id, "DISCARDED")
+        return
+    print("[PASS] Screen (gibberish + relevance, 1 call)")
+
+    # Call 2 (+ optional 3) — summary and impact together.
+    summary, impact, attempts = summarise(company_name, raw_text, filing_type,
+                                          sub_summary, filing_id, ticker, source)
     if not summary:
-        print(f"[FLAGGED, NOT SENT] {ticker} -- see flagged_summaries for review")
         update_filing_status(filing_id, "FLAGGED_FOR_REVIEW")
         return
-    print(f"[SUMMARY] {summary[:100]}... ({count_words(summary)} words)")
 
-    # Step 4: Summary validation (V.1) — a corrected summary must still pass
-    # the same word-count/quality checks; if it doesn't, flag it too rather
-    # than blindly trusting the correction.
-    validation_result = parse_json_response(call_deepinfra(validation_prompt(summary)))
-    if validation_result.get("issues_detected") == "True":
-        corrected = validation_result.get("corrected_summary", "").strip()
-        if not corrected:
-            # V.1 flagged real problems with a summary that had already passed
-            # the full S.1/S.3 quality gate, but didn't give us a usable fix.
-            # Previously this just discarded the summary with a console print
-            # and no database record -- a summary that made it through the
-            # entire retry ladder would vanish with zero trace. Flag it for
-            # review instead, same as every other "couldn't produce something
-            # trustworthy" path in this pipeline.
-            print(f"[FLAGGED] V.1 detected issues with no correction provided -- {ticker}")
-            store_flagged_summary(
-                filing_id=filing_id, ticker=ticker, company_name=company_name,
-                final_summary=summary, failure_reason="v1_issues_no_correction",
-                attempts=[{"target": None, "summary": summary, "failure": "v1_issues_no_correction"}],
-                source=source, filing_type=filing_type
-            )
-            update_filing_status(filing_id, "FLAGGED_FOR_REVIEW")
-            return
-        corrected = standardize_numbers(clean_summary(corrected))
-        failure = classify_failure(corrected, MAX_TARGET)
-        if failure:
-            print(f"[FLAGGED] V.1-corrected summary still fails ({failure}) -- {ticker}")
-            store_flagged_summary(
-                filing_id=filing_id, ticker=ticker, company_name=company_name,
-                final_summary=corrected, failure_reason=f"v1_correction_{failure}",
-                attempts=[{"stage": "v1_correction", "words": count_words(corrected), "failure": failure}],
-                source=source, filing_type=filing_type
-            )
-            update_filing_status(filing_id, "FLAGGED_FOR_REVIEW")
-            return
-        summary = corrected
-        print(f"[CORRECTED] Summary fixed by V.1 ({count_words(summary)} words)")
-    print(f"[PASS] Validation check")
-
-    # Step 5: Impact classification
-    cur_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    impact_result = parse_json_response(call_deepinfra(impact_prompt(company_name, summary, cur_date)))
-    impact = impact_result.get("impact", "LOW").upper()
     if impact not in ("HIGH", "MEDIUM", "LOW"):
         impact = "LOW"
-    print(f"[IMPACT] {impact}")
+    print(f"[SUMMARY] {summary[:100]}... ({count_words(summary)} words, impact={impact})")
 
-    # Step 6: Semantic deduplication
-    for old_summary in get_recent_summaries(ticker):
-        sim_result = parse_json_response(call_deepinfra(similarity_prompt(old_summary, summary)))
-        if sim_result.get("is_similar") == "True":
-            print(f"[DISCARDED] Duplicate -- {ticker}")
-            update_filing_status(filing_id, "DISCARDED")
-            return
-    print(f"[PASS] Deduplication check")
+    # Dedup — usually zero LLM calls.
+    if is_duplicate(ticker, summary):
+        print(f"[DISCARDED] Duplicate -- {ticker}")
+        update_filing_status(filing_id, "DISCARDED")
+        return
+    print("[PASS] Deduplication")
 
-    # Record what it cost to produce this alert -- how many summarization
-    # attempts the retry ladder needed, and total input/output tokens across
-    # EVERY DeepInfra call this filing triggered (gibberish/relevance/S.1-S.3
-    # attempts/validation/impact/similarity), not just the final summary
-    # call. main.py's delivery loop reads these back out of `extra` when it
-    # writes the alert_run_log row at the moment the alert actually goes out.
     usage = get_token_usage()
-    extra = dict(extra or {})
-    extra["summarization_attempts"] = summarization_attempts
-    extra["input_tokens"] = usage["input"]
-    extra["output_tokens"] = usage["output"]
-    extra["total_tokens"] = usage["input"] + usage["output"]
-    extra["llm_calls"] = usage["calls"]
+    extra = dict(extra)
+    extra.update({
+        "summarization_attempts": attempts,
+        "input_tokens": usage["input"],
+        "output_tokens": usage["output"],
+        "total_tokens": usage["input"] + usage["output"],
+        "llm_calls": usage["calls"],
+    })
 
-    summary_id = store_summary(filing_id=filing_id, ticker=ticker, summary=summary,
-                                impact=impact, event_type=filing_type)
-    store_alert(ticker=ticker, summary=summary, impact=impact, source=source,
-                filing_type=filing_type, extra=extra, summary_id=summary_id)
+    summary_id = store_summary(filing_id, ticker, summary, impact, filing_type)
+    store_alert(ticker, summary, impact, source, filing_type, extra, summary_id)
     update_filing_status(filing_id, "PROCESSED")
-    print(f"[DONE] {ticker} -- {impact} alert stored ({summarization_attempts} attempt(s), "
-          f"{usage['input']}+{usage['output']} tokens in+out)")
+    print(f"[DONE] {ticker} -- {impact} | {usage['calls']} LLM call(s), "
+          f"{usage['input'] + usage['output']} tokens")
 
 
-# ── Main pipeline runner ──────────────────────────────────────────────────────
-def run_pipeline():
-    mode = f"AI (DeepInfra - {DEEPINFRA_MODEL})"
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for PENDING filings... [{mode} MODE]")
+# ── Runner ────────────────────────────────────────────────────────────────────
+def run_pipeline(batch_size=10):
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking PENDING filings "
+          f"[{DEEPINFRA_MODEL}]")
     try:
-        result = supabase.table("raw_filings") \
-            .select("*") \
-            .eq("status", "PENDING") \
-            .order("created_at") \
-            .limit(10) \
-            .execute()
-
+        result = supabase.table("raw_filings").select("*") \
+            .eq("status", "PENDING").order("created_at").limit(batch_size).execute()
         filings = result.data
         if not filings:
-            print("No PENDING filings found.")
+            print("No PENDING filings.")
             return
 
-        print(f"Found {len(filings)} PENDING filings -- processing...")
+        print(f"Processing {len(filings)} filing(s)...")
+        started = time.time()
         for filing in filings:
-            process_filing(filing)
-            time.sleep(1)
+            try:
+                process_filing(filing)
+            except Exception as e:
+                # One bad filing must never stop the batch. v1 let an
+                # exception here escape to the caller, ending the run.
+                print(f"[ERROR] {filing.get('ticker', '?')}: {e}")
+                try:
+                    update_filing_status(filing["id"], "FLAGGED_FOR_REVIEW")
+                except Exception:
+                    pass
+        print(f"[BATCH] {len(filings)} filing(s) in {time.time() - started:.0f}s")
 
     except Exception as e:
         print(f"[ERROR] Pipeline failed: {e}")

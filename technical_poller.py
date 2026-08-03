@@ -1,45 +1,54 @@
 """
 technical_poller.py
-GQ FinXray US — replaces eodhd_technical_poller.py. Feature 6.
+GQ FinXray US — Feature 6. v2, rewired onto market_data.
 
-ARCHITECTURE CHANGE FROM THE EODHD VERSION:
-- EODHD's broad-market coverage depended on its custom Screener API, which
-  the old code's own comments say had produced ZERO alerts for 14+ days
-  (RSI/52w/volume checks silently broken) while the per-ticker SMA200 path
-  kept working. That is a strong signal the screener primitive itself was
-  the weak link, not any one indicator.
-- Massive's full-market snapshot (ONE call, https://massive.com/docs ->
-  /v2/snapshot/locale/us/markets/stocks/tickers) returns day + prevDay OHLCV
-  for ~10,000+ tickers in a single response. Volume-spike detection is now
-  computed locally from that single payload instead of depending on a
-  server-side screener filter — removes the failure mode entirely.
-- RSI and SMA200 now come from Massive's purpose-built indicator endpoints
-  (/v1/indicators/rsi, /v1/indicators/sma) which return values already
-  computed server-side, same idea as EODHD's /technical/ endpoint.
-- 52-week high/low has no equivalent field in Massive's snapshot, so it's
-  checked per watchlist ticker via FMP's quote endpoint (yearHigh/yearLow
-  are native fields there) — this used to be a "fallback"; here it's simply
-  the primary path since it's the accurate source for that specific field.
+WHAT CHANGED IN v2 (2026-08-03)
+-------------------------------
+1. STOPPED RE-FETCHING DATA IT ALREADY HAD.
+   v1 pulled the full-market snapshot (day + prevDay OHLCV for ~10,000
+   tickers, one call) and then called massive_client.get_snapshot(ticker)
+   TWICE MORE for every watchlist ticker -- once inside the RSI loop and once
+   inside the SMA loop -- for price and previous close that were already
+   sitting in the snapshot it had just downloaded. For N watchlisted tickers
+   that was 1 + 5N calls where 1 + 2N does the same work.
 
-Every failure path still writes to Supabase `poller_error_log` so a silent
-break is visible without needing Railway log access (this pattern is kept
-unchanged from the EODHD version, it earned its keep).
+2. MARKET HOURS NOW COME FROM THE EXCHANGE.
+   v1 hardcoded "09:00-17:30 ET, Mon-Fri". That has no idea about
+   Thanksgiving, Good Friday, half-days, or an unscheduled close -- so on a
+   market holiday it would happily fire "crossover" alerts computed off a
+   stale snapshot of the last real session. Now asks Massive for actual
+   exchange status. Also note v1's window was wrong on both ends: the US cash
+   session is 09:30-16:00 ET, not 09:00-17:30 (that was the Indian NSE window
+   carried over from the India codebase).
 
-Runs every 60 minutes via scheduler in main.py.
+3. 52-WEEK LEVELS ARE CACHED.
+   These move at most once a day. v1 burned a fresh FMP quote per ticker per
+   hourly run to re-read a number that hadn't changed. market_data caches
+   them for six hours.
+
+4. FAILOVER. Price lookups now go through market_data, which prefers the
+   shared Massive snapshot, falls back to a Massive single-ticker call, then
+   to FMP. Previously an FMP hiccup took 52-week alerts offline entirely.
+
+Every failure path still writes to Supabase `poller_error_log`.
 """
 
 import os
 import logging
 import traceback
-from datetime import date
+from datetime import date, datetime, timezone
+
 from supabase import create_client
-from dotenv import load_dotenv
 
-import fmp_client
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import massive_client
+import market_data
 from feature_map import tag_extra
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +69,7 @@ def get_supabase():
 def log_poller_error(job_name, error, context=None):
     logger.error(f"[TECHNICAL] {job_name}: {error}")
     try:
-        sb = get_supabase()
-        sb.table("poller_error_log").insert({
+        get_supabase().table("poller_error_log").insert({
             "poller_name": "technical_poller",
             "job_name": job_name,
             "error_message": str(error)[:2000],
@@ -74,9 +82,8 @@ def log_poller_error(job_name, error, context=None):
 
 def get_watchlist_tickers():
     try:
-        sb = get_supabase()
-        result = sb.table("watchlists").select("ticker").execute()
-        return list(set(row["ticker"] for row in result.data))
+        result = get_supabase().table("watchlists").select("ticker").execute()
+        return sorted({row["ticker"] for row in result.data if row.get("ticker")})
     except Exception as e:
         log_poller_error("get_watchlist_tickers", e)
         return []
@@ -84,9 +91,8 @@ def get_watchlist_tickers():
 
 def already_sent_today(ticker, alert_type):
     try:
-        sb = get_supabase()
         today = date.today().isoformat()
-        result = sb.table("alerts") \
+        result = get_supabase().table("alerts") \
             .select("id") \
             .eq("ticker", ticker) \
             .eq("source", "TECHNICAL") \
@@ -100,8 +106,7 @@ def already_sent_today(ticker, alert_type):
 
 def save_alert(ticker, alert_type, summary, impact, extra=None):
     try:
-        sb = get_supabase()
-        sb.table("alerts").insert({
+        get_supabase().table("alerts").insert({
             "ticker": ticker,
             "summary": summary,
             "impact": impact,
@@ -117,55 +122,20 @@ def save_alert(ticker, alert_type, summary, impact, extra=None):
 
 
 def now_utc():
-    from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def is_market_hours():
-    """
-    Alerts are only meaningful 09:00-17:30 US Eastern, Monday-Friday -- outside
-    that window Massive's snapshot is just yesterday's closing data repeated,
-    and firing "crossover"/"overbought" alerts off a stale, closed-market
-    snapshot (e.g. right after a Saturday process restart) would be actively
-    misleading. Mirrors the market-window guard the India system's alert
-    checker already used (09:00-17:30 local).
-    """
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
-        return False
-    open_t = now_et.replace(hour=9, minute=0, second=0, microsecond=0)
-    close_t = now_et.replace(hour=17, minute=30, second=0, microsecond=0)
-    return open_t <= now_et <= close_t
-
-
-# ── Volume spike — whole market, ONE Massive call ─────────────────────────────
-def run_volume_spike_snapshot(watchlist_set):
-    logger.info("[TECHNICAL] Running whole-market volume spike check via Massive snapshot...")
+# ── Volume spike — whole market, from the shared snapshot ────────────────────
+def run_volume_spike(watchlist_set, snapshot):
+    logger.info("[TECHNICAL] Volume spike check across shared market snapshot...")
     alerts = 0
-    try:
-        tickers = massive_client.get_full_market_snapshot()
-    except Exception as e:
-        log_poller_error("run_volume_spike_snapshot:fetch", e)
-        return 0
-
-    if not tickers:
-        log_poller_error("run_volume_spike_snapshot:empty", "Massive full snapshot returned no tickers")
-        return 0
-
-    for t in tickers:
+    for symbol in watchlist_set:
         try:
-            symbol = t.get("ticker")
-            # The whole point of pulling the FULL market snapshot in one call
-            # is efficiency (vs. one call per watchlisted ticker) -- but that
-            # doesn't mean every qualifying ticker should alert. Without this
-            # filter, a volume spike in a stock nobody follows still gets
-            # broadcast to every subscriber on the shared Telegram channel.
-            if not symbol or symbol not in watchlist_set:
+            row = snapshot.get(symbol)
+            if not row:
                 continue
-            day = t.get("day", {}) or {}
-            prev = t.get("prevDay", {}) or {}
+            day = row.get("day") or {}
+            prev = row.get("prevDay") or {}
             price = day.get("c") or prev.get("c")
             volume = day.get("v")
             prev_volume = prev.get("v")
@@ -173,7 +143,7 @@ def run_volume_spike_snapshot(watchlist_set):
                 continue
             if price < MIN_PRICE or volume < MIN_VOLUME:
                 continue
-            ratio = volume / prev_volume if prev_volume else 0
+            ratio = volume / prev_volume
             if ratio < VOLUME_SPIKE_MULT:
                 continue
             if already_sent_today(symbol, "VOLUME_SPIKE"):
@@ -185,32 +155,39 @@ def run_volume_spike_snapshot(watchlist_set):
                 f"*Price:* ${float(price):.2f}\n"
                 f"*Volume:* {int(volume):,} ({ratio:.1f}x prior session)\n"
                 f"*Signal:* Unusual trading volume — potential significant move ahead.\n"
-                f"_Source: Massive Full-Market Snapshot | {now_utc()}_"
+                f"_Source: Massive full-market snapshot | {now_utc()}_"
             )
             save_alert(symbol, "VOLUME_SPIKE", summary, "MEDIUM", {
-                "price": price, "volume": volume, "prev_volume": prev_volume, "ratio": round(ratio, 2)
+                "price": price, "volume": volume,
+                "prev_volume": prev_volume, "ratio": round(ratio, 2)
             })
             alerts += 1
         except Exception as e:
-            log_poller_error("run_volume_spike_snapshot:row", e, {"row": t})
+            log_poller_error("run_volume_spike", e, {"ticker": symbol})
 
-    logger.info(f"[TECHNICAL] Volume spike: {alerts} alerts from {len(tickers)} tickers scanned")
+    logger.info(f"[TECHNICAL] Volume spike: {alerts} alert(s)")
     return alerts
 
 
-# ── RSI — per watchlist ticker via Massive indicator endpoint ────────────────
-def run_rsi_watchlist(tickers):
-    logger.info(f"[TECHNICAL] Running RSI for {len(tickers)} watchlisted tickers...")
+# ── RSI — indicator call per ticker, price from the shared snapshot ──────────
+def run_rsi(tickers, snapshot):
+    logger.info(f"[TECHNICAL] RSI for {len(tickers)} ticker(s)...")
     alerts = 0
     for ticker in tickers:
         try:
             values = massive_client.get_rsi(ticker, window=14)
-            snapshot = massive_client.get_snapshot(ticker)
-            if not values or not snapshot:
+            if not values:
                 continue
             rsi = values[0].get("value")
-            price = (snapshot.get("day") or {}).get("c") or (snapshot.get("prevDay") or {}).get("c")
-            if rsi is None or price is None:
+            if rsi is None:
+                continue
+
+            row = snapshot.get(ticker) or {}
+            price = (row.get("day") or {}).get("c") or (row.get("prevDay") or {}).get("c")
+            if price is None:
+                q = market_data.quote(ticker)
+                price = q["price"] if q else None
+            if price is None:
                 continue
 
             if rsi >= RSI_OVERBOUGHT and not already_sent_today(ticker, "RSI_OVERBOUGHT"):
@@ -219,7 +196,7 @@ def run_rsi_watchlist(tickers):
                     f"*Ticker:* ${ticker}\n*Price:* ${price:.2f}\n"
                     f"*RSI(14):* {rsi:.1f} (above {RSI_OVERBOUGHT})\n"
                     f"*Signal:* Stock may be overbought — potential pullback zone.\n"
-                    f"_Source: Massive Technical Indicators | {now_utc()}_"
+                    f"_Source: Massive technical indicators | {now_utc()}_"
                 )
                 save_alert(ticker, "RSI_OVERBOUGHT", summary, "MEDIUM", {"rsi": rsi, "price": price})
                 alerts += 1
@@ -229,29 +206,32 @@ def run_rsi_watchlist(tickers):
                     f"*Ticker:* ${ticker}\n*Price:* ${price:.2f}\n"
                     f"*RSI(14):* {rsi:.1f} (below {RSI_OVERSOLD})\n"
                     f"*Signal:* Stock may be oversold — potential bounce zone.\n"
-                    f"_Source: Massive Technical Indicators | {now_utc()}_"
+                    f"_Source: Massive technical indicators | {now_utc()}_"
                 )
                 save_alert(ticker, "RSI_OVERSOLD", summary, "MEDIUM", {"rsi": rsi, "price": price})
                 alerts += 1
         except Exception as e:
-            log_poller_error("run_rsi_watchlist", e, {"ticker": ticker})
+            log_poller_error("run_rsi", e, {"ticker": ticker})
 
-    logger.info(f"[TECHNICAL] RSI: {alerts} alerts")
+    logger.info(f"[TECHNICAL] RSI: {alerts} alert(s)")
     return alerts
 
 
-# ── 52-week high/low — per watchlist ticker via FMP quote ────────────────────
-def run_52week_watchlist(tickers):
-    logger.info(f"[TECHNICAL] Running 52-week high/low for {len(tickers)} watchlisted tickers...")
+# ── 52-week high/low — cached FMP levels, live price from the snapshot ───────
+def run_52week(tickers, snapshot):
+    logger.info(f"[TECHNICAL] 52-week levels for {len(tickers)} ticker(s)...")
     alerts = 0
     for ticker in tickers:
         try:
-            quote = fmp_client.get_quote(ticker)
-            if not quote:
+            high_52, low_52 = market_data.year_high_low(ticker)
+            if high_52 is None and low_52 is None:
                 continue
-            price = quote.get("price")
-            high_52 = quote.get("yearHigh")
-            low_52 = quote.get("yearLow")
+
+            row = snapshot.get(ticker) or {}
+            price = (row.get("day") or {}).get("c")
+            if price is None:
+                q = market_data.quote(ticker)
+                price = q["price"] if q else None
             if price is None:
                 continue
 
@@ -260,8 +240,8 @@ def run_52week_watchlist(tickers):
                     f"🚀 *Technical Alert — 52-Week High*\n\n"
                     f"*Ticker:* ${ticker}\n*Price:* ${price:.2f}\n"
                     f"*52-Week High:* ${high_52:.2f}\n"
-                    f"*Signal:* Stock is at/above its 52-week high — strong bullish momentum.\n"
-                    f"_Source: FMP Quote | {now_utc()}_"
+                    f"*Signal:* Trading at or above its 52-week high — strong bullish momentum.\n"
+                    f"_Source: FMP levels + Massive price | {now_utc()}_"
                 )
                 save_alert(ticker, "52W_HIGH", summary, "HIGH", {"price": price, "high_52w": high_52})
                 alerts += 1
@@ -270,81 +250,99 @@ def run_52week_watchlist(tickers):
                     f"⚠️ *Technical Alert — 52-Week Low*\n\n"
                     f"*Ticker:* ${ticker}\n*Price:* ${price:.2f}\n"
                     f"*52-Week Low:* ${low_52:.2f}\n"
-                    f"*Signal:* Stock is at/below its 52-week low — watch for further downside.\n"
-                    f"_Source: FMP Quote | {now_utc()}_"
+                    f"*Signal:* Trading at or below its 52-week low — watch for further downside.\n"
+                    f"_Source: FMP levels + Massive price | {now_utc()}_"
                 )
                 save_alert(ticker, "52W_LOW", summary, "HIGH", {"price": price, "low_52w": low_52})
                 alerts += 1
         except Exception as e:
-            log_poller_error("run_52week_watchlist", e, {"ticker": ticker})
+            log_poller_error("run_52week", e, {"ticker": ticker})
 
-    logger.info(f"[TECHNICAL] 52-week: {alerts} alerts")
+    logger.info(f"[TECHNICAL] 52-week: {alerts} alert(s)")
     return alerts
 
 
-# ── SMA200 crossover — per watchlist ticker via Massive ───────────────────────
-def run_sma200_crossover(tickers):
-    logger.info(f"[TECHNICAL] Running SMA200 crossover for {len(tickers)} watchlisted tickers...")
+# ── SMA200 crossover — indicator per ticker, prices from the shared snapshot ─
+def run_sma200(tickers, snapshot):
+    logger.info(f"[TECHNICAL] SMA200 crossover for {len(tickers)} ticker(s)...")
     alerts = 0
     for ticker in tickers:
         try:
             sma_values = massive_client.get_sma(ticker, window=200)
-            snapshot = massive_client.get_snapshot(ticker)
-            if not sma_values or not snapshot:
+            if not sma_values:
                 continue
-
             sma200 = sma_values[0].get("value")
-            price = (snapshot.get("day") or {}).get("c")
-            prev_close = (snapshot.get("prevDay") or {}).get("c")
-            if not all([sma200, price, prev_close]):
+            if sma200 is None:
                 continue
 
-            if prev_close < sma200 and price > sma200 and not already_sent_today(ticker, "SMA200_CROSSOVER_UP"):
+            row = snapshot.get(ticker) or {}
+            price = (row.get("day") or {}).get("c")
+            prev_close = (row.get("prevDay") or {}).get("c")
+            if price is None or prev_close is None:
+                q = market_data.quote(ticker)
+                if not q:
+                    continue
+                price = price if price is not None else q["price"]
+                prev_close = prev_close if prev_close is not None else q.get("prev_close")
+            if price is None or prev_close is None:
+                continue
+
+            if prev_close < sma200 <= price and not already_sent_today(ticker, "SMA200_CROSSOVER_UP"):
                 summary = (
                     f"🟢 *Technical Alert — 200-SMA Breakout*\n\n"
                     f"*Ticker:* ${ticker}\n*Price:* ${price:.2f} (crossed above 200-SMA)\n"
                     f"*200-SMA:* ${sma200:.2f}\n"
                     f"*Signal:* Bullish crossover — price moved above long-term trend.\n"
-                    f"_Source: Massive Technical Indicators | {now_utc()}_"
+                    f"_Source: Massive technical indicators | {now_utc()}_"
                 )
                 save_alert(ticker, "SMA200_CROSSOVER_UP", summary, "HIGH",
                            {"price": price, "sma200": sma200, "prev_close": prev_close})
                 alerts += 1
-            elif prev_close > sma200 and price < sma200 and not already_sent_today(ticker, "SMA200_CROSSOVER_DOWN"):
+            elif prev_close > sma200 >= price and not already_sent_today(ticker, "SMA200_CROSSOVER_DOWN"):
                 summary = (
                     f"🔴 *Technical Alert — 200-SMA Breakdown*\n\n"
                     f"*Ticker:* ${ticker}\n*Price:* ${price:.2f} (crossed below 200-SMA)\n"
                     f"*200-SMA:* ${sma200:.2f}\n"
                     f"*Signal:* Bearish crossover — price dropped below long-term trend.\n"
-                    f"_Source: Massive Technical Indicators | {now_utc()}_"
+                    f"_Source: Massive technical indicators | {now_utc()}_"
                 )
                 save_alert(ticker, "SMA200_CROSSOVER_DOWN", summary, "HIGH",
                            {"price": price, "sma200": sma200, "prev_close": prev_close})
                 alerts += 1
         except Exception as e:
-            log_poller_error("run_sma200_crossover", e, {"ticker": ticker})
+            log_poller_error("run_sma200", e, {"ticker": ticker})
 
-    logger.info(f"[TECHNICAL] SMA200 crossover: {alerts} alerts")
+    logger.info(f"[TECHNICAL] SMA200: {alerts} alert(s)")
     return alerts
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 def run_technical_poller():
-    if not is_market_hours():
-        logger.info("[TECHNICAL] Outside market hours (09:00-17:30 ET, Mon-Fri) — skipping this run.")
+    if not market_data.market_open():
+        logger.info("[TECHNICAL] Exchange reports market closed — skipping this run.")
         return
 
-    logger.info("[TECHNICAL] ===== Starting Technical Alerts Poller (FMP + Massive) =====")
-    total = 0
+    logger.info("[TECHNICAL] ===== Technical Alerts Poller (Massive + FMP) =====")
     watchlist = get_watchlist_tickers()
-    total += run_volume_spike_snapshot(set(watchlist))
+    if not watchlist:
+        logger.info("[TECHNICAL] Watchlist empty — nothing to scan.")
+        return
 
-    if watchlist:
-        total += run_rsi_watchlist(watchlist)
-        total += run_52week_watchlist(watchlist)
-        total += run_sma200_crossover(watchlist)
+    # ONE snapshot for the whole run. Every price and previous close below
+    # comes out of this rather than from a per-ticker call.
+    snapshot = market_data.snapshot_all(force=True)
+    if not snapshot:
+        log_poller_error("run_technical_poller", "Market snapshot unavailable — "
+                         "per-ticker fallbacks will be used, expect a slower run")
 
-    logger.info(f"[TECHNICAL] ===== Done. Total alerts generated: {total} =====")
+    total = 0
+    total += run_volume_spike(set(watchlist), snapshot)
+    total += run_rsi(watchlist, snapshot)
+    total += run_52week(watchlist, snapshot)
+    total += run_sma200(watchlist, snapshot)
+
+    logger.info(f"[TECHNICAL] ===== Done. {total} alert(s). "
+                f"Provider stats: {market_data.get_stats()} =====")
 
 
 if __name__ == "__main__":
