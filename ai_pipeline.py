@@ -171,7 +171,7 @@ def _pace_before_call():
         time.sleep(MIN_CALL_GAP_SECONDS - elapsed)
 
 
-def call_deepinfra(prompt, retries=2, max_tokens=2000, temperature=0.2):
+def call_deepinfra(prompt, retries=2, max_tokens=4000, temperature=0.2):
     """Call DeepInfra. Returns text or None.
 
     max_tokens defaults to 2000, not 600. Gemini 2.5 Flash reasons before
@@ -300,9 +300,23 @@ BAD_START_KEYWORDS = [
 SENTENCE_END = (".", "!", "?", '."', ".'", '.”', ".)", "!\"", "?\"", "…")
 
 
+def strip_invisibles(text):
+    """Remove zero-width and other invisible characters.
+
+    RSS descriptions arrive with zero-width spaces embedded mid-sentence
+    ("the reigning champions and​winner of..."). They survive HTML tag
+    stripping, are invisible in logs, and break word counts and Telegram
+    formatting in ways that are near-impossible to spot by eye.
+    """
+    if not text:
+        return text
+    return re.sub(r"[​‌‍⁠﻿­]", "", text)
+
+
 def clean_summary(text):
     if not text:
         return text
+    text = strip_invisibles(text)
     text = re.sub(r"^summary[\s\-:]+", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\(\d+\s*words?\)", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"word\s*count[\s:]+\d+", "", text, flags=re.IGNORECASE).strip()
@@ -332,6 +346,20 @@ def count_words(text):
     return len(text.split()) if text else 0
 
 
+def _oneline(text, limit=100):
+    """Flatten a summary onto a single line for logging.
+
+    Passthrough alerts (Form 4, news) legitimately contain newlines, and
+    printing them raw shredded log entries across multiple interleaved lines
+    -- the XYF Form 4 entry came out with its '[DONE]' line separated from its
+    '[ALERT READY]' line by three unrelated HTTP logs.
+    """
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    return flat[:limit] + ("..." if len(flat) > limit else "")
+
+
 def starts_with_bad_keyword(text):
     if not text:
         return False
@@ -351,19 +379,88 @@ def ends_incomplete(text):
     return not text.strip().endswith(SENTENCE_END)
 
 
+def trim_to_limit(summary, max_words):
+    """Drop whole trailing sentences until the summary fits.
+
+    A summary that runs 122 words against a 120 ceiling is a GOOD summary two
+    words too long -- rejecting it and burning another LLM call (which then
+    came back empty and got the filing flagged) is absurd. Trimming whole
+    sentences keeps the text well-formed and costs nothing.
+
+    Returns the trimmed text, or the original if trimming can't help.
+    """
+    if not summary or count_words(summary) <= max_words:
+        return summary
+    sentences = re.findall(r"[^.!?]+[.!?]+(?:[\"'”’)]*)?", summary)
+    if not sentences:
+        return summary
+    out = ""
+    for s in sentences:
+        candidate = (out + s).strip()
+        if count_words(candidate) > max_words:
+            break
+        out = candidate
+    return out if out else summary
+
+
+# Phrases the model produces when the source had nothing in it to summarise --
+# most often a 10-Q whose XBRL extract came through as bare taxonomy tags with
+# no values attached. Retrying cannot help: the input is empty of facts. These
+# are dropped silently rather than retried and flagged.
+NO_CONTENT_MARKERS = (
+    "no specific financial values",
+    "only taxonomy tags",
+    "cannot be generated",
+    "does not contain any",
+    "contains no ",
+    "no quantitative information",
+    "insufficient information",
+    "unable to summarize",
+    "unable to summarise",
+    "no information about",
+)
+
+
+def says_no_content(summary):
+    if not summary:
+        return False
+    low = summary.lower()
+    return any(m in low for m in NO_CONTENT_MARKERS)
+
+
 def classify_failure(summary, band=None):
     """Reason this summary should be rejected, or None if it's good.
 
     `band` is the (min, max) computed from the SOURCE length by target_band().
-    Judging every summary against one fixed global band is what made a
-    perfectly good 79-word summary of an 8-K fail while a padded 90-word
-    summary of a 37-word headline passed.
+
+    THE FLOOR IS NOT THE BAND'S LOWER BOUND. It is MIN_WORDS, the absolute
+    readability floor. The band's `lo` is a TARGET handed to the prompt, not a
+    rejection threshold -- and conflating the two was still costing real
+    alerts. CNA Financial's 8-K summarised to 61 clean words against a 66-word
+    target: five words short, entirely readable, and it was thrown away. The
+    retry then returned empty, so the filing was flagged and no alert went out
+    at all. Loews lost the same way at 51 words. A concise summary is not a
+    defective one; only a stub is. The ceiling stays enforced because an
+    over-long summary is genuinely harder to read on a phone -- and trimming
+    makes that free to fix.
     """
     lo, hi = band if band else (MIN_WORDS, MAX_WORDS)
+
+    # The floor can never exceed the ceiling. A 74-word news item gets a band
+    # of 20-37 words; pairing that ceiling with a flat 45-word floor demands a
+    # summary that is simultaneously under 37 and over 45 words, which nothing
+    # can satisfy -- every attempt is rejected as too_short, retried, rejected
+    # again, and the alert is flagged. Seen live on AMZN. Taking min() keeps
+    # the CNA fix intact for long filings (band 66-120 still floors at 45)
+    # while letting genuinely short sources through.
+    floor = min(MIN_WORDS, lo)
+
     if not summary:
         return "empty"
+    if says_no_content(summary):
+        return "no_content"
     wc = count_words(summary)
-    if wc < lo:
+    if wc < floor:
         return "too_short"
     if wc > hi:
         return "too_long"
@@ -547,7 +644,7 @@ def store_alert(ticker, summary, impact, source, filing_type="", extra=None, sum
             "source": source, "filing_type": filing_type, "extra": merged,
             "delivered": False, "summary_id": summary_id,
         }).execute()
-        print(f"[ALERT READY] {impact} -- {ticker}: {summary[:80]}... (F{fid}/11 {fname})")
+        print(f"[ALERT READY] {impact} -- {ticker}: {_oneline(summary, 80)} (F{fid}/11 {fname})")
     except Exception as e:
         print(f"[ERROR] Failed to store alert: {e}")
 
@@ -604,13 +701,45 @@ EARLIER:
 
 Respond with ONLY: {{"is_duplicate": true or false}}"""
 
-    result = parse_json_response(call_deepinfra(prompt, max_tokens=200))
+    # Same reasoning-token headroom as the screen call -- 200 was nowhere near
+    # enough for the model to think and then emit even a one-field JSON object.
+    result = parse_json_response(call_deepinfra(prompt, max_tokens=1200))
     dup = as_bool(result.get("is_duplicate"), default=False)
     print(f"[DEDUP] Ambiguous ({best_score:.2f}) -> LLM says duplicate={dup}")
     return dup
 
 
 # ── Summarisation ─────────────────────────────────────────────────────────────
+def _format_passthrough(raw_text):
+    """Render a short source as an alert without an LLM.
+
+    Pollers store news as "{title}\\n\\n{description}". Running that through
+    clean_summary() collapses the blank line and welds the headline onto the
+    body -- "...partners with Google on AI Paris Saint Germain (PSG) - the
+    reigning..." -- which reads like a typo. Keep the two parts distinct and
+    make sure the headline terminates.
+    """
+    text = strip_invisibles(raw_text or "").strip()
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text, maxsplit=1)]
+
+    if len(parts) == 2 and parts[0] and parts[1]:
+        head, body = parts
+        if not head.endswith((".", "!", "?", ":", "—", "-")):
+            head += "."
+        # Drop a body that just restates the headline.
+        if body.lower().startswith(head.rstrip(".").lower()[:40]):
+            merged = body
+        else:
+            merged = f"{head} {body}"
+    else:
+        merged = parts[0] if parts else ""
+
+    merged = standardize_numbers(clean_summary(merged))
+    if merged and not merged.endswith(SENTENCE_END):
+        merged += "."
+    return merged
+
+
 def summarise(company_name, raw_text, filing_type="", sub_summary="",
               filing_id=None, ticker=None, source="SEC_EDGAR"):
     """Returns (summary, impact, attempts). summary is None if it was flagged."""
@@ -624,7 +753,16 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     # These are shipped as-is, cleaned. Zero LLM calls, and the alert reads
     # better because every word in it came from the source.
     if band is None:
-        passthrough = standardize_numbers(clean_summary(raw_text.strip()))
+        passthrough = _format_passthrough(raw_text)
+        # A passthrough that formats down to nothing means the source was a
+        # bare stub -- a headline row with no body. Ninety-nine of those went
+        # to the LLM in one morning and came back empty twice each; every one
+        # of them was a wasted pair of calls on a record that could never have
+        # produced an alert. Caught here for free.
+        if count_words(passthrough) < 8:
+            print(f"[SUMMARY] Source is an empty stub ({input_words} words in, "
+                  f"{count_words(passthrough)} usable) -- discarding, no LLM call")
+            return None, "DISCARD", 0
         print(f"[SUMMARY] Source is only {input_words} words -- passing through "
               f"verbatim, no LLM call (summarising would mean inventing text)")
         return passthrough, "LOW", 0
@@ -637,6 +775,16 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     parsed = parse_json_response(raw)
     summary = standardize_numbers(clean_summary(parsed.get("summary", "")))
     impact = str(parsed.get("impact", "LOW")).upper()
+
+    # Salvage an over-long summary by dropping trailing sentences before
+    # deciding it failed. Costs nothing and avoids a wasted retry.
+    if summary and count_words(summary) > hi:
+        trimmed = trim_to_limit(summary, hi)
+        if trimmed and count_words(trimmed) >= lo:
+            print(f"[SUMMARY] Trimmed {count_words(summary)} -> "
+                  f"{count_words(trimmed)} words (no extra LLM call)")
+            summary = trimmed
+
     failure = classify_failure(summary, band)
     attempts_log.append({"attempt": 1, "words": count_words(summary),
                          "target": f"{lo}-{hi}", "input_words": input_words,
@@ -646,12 +794,31 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
         print(f"[SUMMARY] Passed first attempt ({count_words(summary)} words)")
         return summary, impact, 1
 
+    # The source had no facts in it. A retry re-reads the same empty input and
+    # produces the same non-answer, so skip straight to discard.
+    if failure == "no_content":
+        print("[SUMMARY] Source carries no reportable content "
+              "(likely XBRL tags with no values) -- discarding, no retry")
+        return None, "DISCARD", 1
+
     print(f"[SUMMARY] Attempt 1 rejected ({failure}) -- one corrective retry")
     raw2 = call_deepinfra(retry_prompt(company_name, raw_text, filing_type,
                                        summary, failure, band))
     parsed2 = parse_json_response(raw2)
     summary2 = standardize_numbers(clean_summary(parsed2.get("summary", "")))
     impact2 = str(parsed2.get("impact", impact)).upper()
+    if summary2 and count_words(summary2) > hi:
+        t2 = trim_to_limit(summary2, hi)
+        if t2 and count_words(t2) >= lo:
+            summary2 = t2
+
+    # If the retry came back empty but attempt 1 produced something usable,
+    # keep attempt 1 rather than throwing both away. An empty retry is a
+    # transport/truncation failure, not a judgement that attempt 1 was bad.
+    if not summary2 and summary and not classify_failure(summary, band):
+        print("[SUMMARY] Retry returned nothing -- keeping the valid first attempt")
+        return summary, impact, 2
+
     failure2 = classify_failure(summary2, band)
     attempts_log.append({"attempt": 2, "words": count_words(summary2),
                          "target": f"{lo}-{hi}", "failure": failure2})
@@ -691,9 +858,30 @@ def process_filing(filing):
         update_filing_status(filing_id, "DISCARDED")
         return
 
-    # Call 1 — gibberish + relevance together.
-    screen = parse_json_response(call_deepinfra(screen_prompt(company_name, raw_text),
-                                               max_tokens=300))
+    # Gate 1 — free. Decide the summarisation path BEFORE spending any call.
+    #
+    # If the source is short enough to be passed through verbatim, the screen
+    # cannot change the outcome -- we ship the source text either way. Paying
+    # an LLM call to ask "is this gibberish?" about a 41-word SEC Form 4
+    # (structured data, from EDGAR, with a resolved ticker) and then emitting
+    # that exact text regardless is pure waste. Over the last two weeks that
+    # was ~2,000 filings (999 Form 4 + 996 NEWS) each burning one useless call.
+    will_passthrough = target_band(count_words(raw_text)) is None
+
+    if will_passthrough:
+        screen = {"is_gibberish": False, "is_relevant": True, "reason": "passthrough"}
+        print("[SCREEN] Skipped — source passes through verbatim, "
+              "screening cannot change the output (0 LLM calls)")
+    else:
+        # Call 1 — gibberish + relevance together.
+        # max_tokens=1500, not 300. Gemini 2.5 Flash is a REASONING model: it
+        # thinks before answering and those tokens come out of the same budget.
+        # At 300 the thinking consumed the whole allowance and the response was
+        # cut off at '{"is_gibber' -- unparseable, so the screen silently failed
+        # OPEN on every single filing. A tiny JSON answer still needs room for
+        # the reasoning that precedes it.
+        screen = parse_json_response(call_deepinfra(screen_prompt(company_name, raw_text),
+                                                   max_tokens=1500))
     if as_bool(screen.get("is_gibberish")):
         print(f"[DISCARDED] Unusable text -- {screen.get('reason', '')}")
         update_filing_status(filing_id, "DISCARDED")
@@ -702,18 +890,29 @@ def process_filing(filing):
         print(f"[DISCARDED] Not about {company_name} -- {screen.get('reason', '')}")
         update_filing_status(filing_id, "DISCARDED")
         return
-    print("[PASS] Screen (gibberish + relevance, 1 call)")
+
+    if not screen:
+        # Both gates above default to "allow" so a screening failure never
+        # silently drops a real filing. But an empty dict means the check did
+        # not actually RUN, and a clean "[PASS]" line would misrepresent that.
+        print("[SCREEN] WARNING: screen returned no usable JSON -- gates failed "
+              "OPEN, content was not actually checked")
+    else:
+        print("[PASS] Screen (gibberish + relevance, 1 call)")
 
     # Call 2 (+ optional 3) — summary and impact together.
     summary, impact, attempts = summarise(company_name, raw_text, filing_type,
                                           sub_summary, filing_id, ticker, source)
     if not summary:
-        update_filing_status(filing_id, "FLAGGED_FOR_REVIEW")
+        # DISCARD means the source had nothing in it -- that is not a quality
+        # failure and does not belong in a human review queue.
+        update_filing_status(filing_id,
+                             "DISCARDED" if impact == "DISCARD" else "FLAGGED_FOR_REVIEW")
         return
 
     if impact not in ("HIGH", "MEDIUM", "LOW"):
         impact = "LOW"
-    print(f"[SUMMARY] {summary[:100]}... ({count_words(summary)} words, impact={impact})")
+    print(f"[SUMMARY] {_oneline(summary, 100)} ({count_words(summary)} words, impact={impact})")
 
     # Dedup — usually zero LLM calls.
     if is_duplicate(ticker, summary):
