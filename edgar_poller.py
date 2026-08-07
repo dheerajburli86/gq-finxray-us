@@ -7,6 +7,7 @@ import os
 import time
 import re
 import traceback
+from watchlist_util import get_watched_tickers
 
 load_dotenv()
 
@@ -294,6 +295,11 @@ def store_filing(filing_type, company_name, ticker, raw_text, filing_url, extra=
 # ── Generic EDGAR poller ──────────────────────────────────────────────────────
 def poll_edgar_generic(url, form_type, label):
     """Generic EDGAR RSS poller — works for 8-K, 10-Q, 10-K, S-1."""
+    watched = get_watched_tickers()
+    if not watched:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] No watched tickers — skipping {label}")
+        return
+
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling SEC EDGAR for {label}...")
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
@@ -330,6 +336,10 @@ def poll_edgar_generic(url, form_type, label):
             company_name = company_match.group(1).strip() if company_match else title
             cik = company_match.group(2) if company_match else ""
             ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
+
+            # Skip if not in watchlist
+            if ticker not in watched:
+                continue
 
             filing_text = fetch_filing_text(filing_url)
             if not filing_text or len(filing_text) < 100:
@@ -372,6 +382,11 @@ def poll_sec_s1():
     poll_edgar_generic(EDGAR_S1_URL, "S-1", "S-1 (IPO Filing)")
 
 def poll_sec_form4():
+    watched = get_watched_tickers()
+    if not watched:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] No watched tickers — skipping Form 4")
+        return
+
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling SEC EDGAR for Form 4...")
     try:
         r = requests.get(EDGAR_FORM4_URL, headers=HEADERS, timeout=15)
@@ -427,6 +442,10 @@ def poll_sec_form4():
             company_name = issuer_match.group(1).strip() if issuer_match else issuer["title"]
             cik = issuer_match.group(2) if issuer_match else ""
             ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
+
+            # Skip if not in watchlist
+            if ticker not in watched:
+                continue
 
             insider_name = "Unknown Insider"
             if reporting:
