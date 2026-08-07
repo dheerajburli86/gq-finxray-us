@@ -1,20 +1,16 @@
 """
 fmp_poller.py
-GQ FinXray US — replaces eodhd_poller.py.
+GQ FinXray US — FMP integration for news, earnings, and insider data.
 
 Covers Features 2 (Company & Sector News), 4 (Earnings Calendar Heads-Up),
-and 5 (Insider Transactions & Large Deals) on FMP instead of EODHD.
+and 5 (Insider Transactions & Large Deals) via FMP API.
 
-Mechanical differences from the old EODHD version, worth knowing:
-  - EODHD tagged articles with a sector via `tags`; FMP's stock-news/general-news
-    endpoints don't carry that same sector taxonomy, so per-ticker news stays
-    ticker-tagged and the broad sweep is stored as sector="MARKET" (detection-
-    by-keyword, same approach news_poller.py already uses for its RSS sources,
-    could be layered on here later if sector-tagged alerts turn out to matter).
-  - Earnings calendar: FMP's /stable/earnings-calendar returns date + epsEstimated
-    but not a before/after-market flag as cleanly as EODHD did; falls back to
-    "Market Hours" when absent rather than guessing.
-  - Insider transactions: FMP's transactionType is a compact code like
+FMP API notes:
+  - Stock-specific news and general news are fetched separately; both stored
+    with sector="MARKET" (keyword-matched against per-ticker news).
+  - Earnings calendar returns date + epsEstimated; timing defaults to
+    "Market Hours" when absent.
+  - Insider transactions: transactionType is a compact code like
     "S-Sale" / "P-Purchase" — parsed accordingly.
 """
 
@@ -33,12 +29,13 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def get_watched_tickers():
+def get_all_stocks():
+    """Fetch all US stocks (NYSE + NASDAQ) from the stocks table."""
     try:
-        result = supabase.table("watchlists").select("ticker").execute()
-        return list(set(r["ticker"] for r in result.data if r.get("ticker")))
+        result = supabase.table("stocks").select("ticker").execute()
+        return [row["ticker"] for row in result.data if row.get("ticker")]
     except Exception as e:
-        print(f"[FMP] Failed to get watchlist tickers: {e}")
+        print(f"[FMP] Failed to fetch stocks list: {e}")
         return []
 
 
@@ -120,8 +117,7 @@ def insider_already_stored(ticker, transaction_date, insider_name, shares):
 
 
 def bulk_deal_already_sent(ticker, insider_name, transaction_date):
-    """
-    Keyed on (ticker, insider, transaction_date), not just (ticker, day-sent).
+    """\n    Keyed on (ticker, insider, transaction_date), not just (ticker, day-sent).
     A ticker-only/day-only check would drop a second, genuinely distinct
     large transaction on the same stock the same day -- e.g. one insider
     selling $2M in the morning and a different insider selling $5M that
@@ -163,7 +159,7 @@ def poll_ticker_news(tickers):
     return total
 
 
-# ── 2. Broad market news sweep (replaces EODHD sector news) ──────────────────
+# ── 2. Broad market news sweep ────────────────────────────────────────────────
 def poll_market_news():
     total = 0
     articles = fmp_client.get_general_news(limit=25)
@@ -324,28 +320,28 @@ def poll_insider_transactions(tickers):
     return total
 
 
-# ── Master poll functions (same entry points main.py already imports) ────────
-def poll_eodhd_news():
-    """Kept name for drop-in compatibility with main.py's scheduler wiring."""
+# ── Master poll functions ────────────────────────────────────────────────────
+def poll_fmp_news():
+    """Poll stock-specific and market-wide news from FMP."""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] FMP — Polling news...")
-    tickers = get_watched_tickers()
+    tickers = get_all_stocks()
     ticker_count = poll_ticker_news(tickers)
     market_count = poll_market_news()
     print(f"[FMP NEWS] Ticker articles: {ticker_count} | Market sweep: {market_count}")
 
 
-def poll_eodhd_events():
-    """Kept name for drop-in compatibility with main.py's scheduler wiring."""
+def poll_fmp_events():
+    """Poll earnings calendar and insider transactions from FMP."""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] FMP — Polling events...")
-    tickers = get_watched_tickers()
+    tickers = get_all_stocks()
     earnings_count = poll_earnings_calendar(tickers)
     insider_count = poll_insider_transactions(tickers)
     print(f"[FMP EVENTS] Earnings alerts: {earnings_count} | Insider transactions: {insider_count}")
 
 
 def run_fmp_poller():
-    poll_eodhd_news()
-    poll_eodhd_events()
+    poll_fmp_news()
+    poll_fmp_events()
 
 
 if __name__ == "__main__":
