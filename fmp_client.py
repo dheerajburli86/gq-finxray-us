@@ -7,8 +7,9 @@ Replaces EODHD across the codebase. All endpoints below are the current
 against FMP's own developer docs on 2026-07-27:
 
   quote                      -> /stable/quote
-  stock news                 -> /stable/stock-news
-  general news                -> /stable/general-news
+  stock news                 -> /stable/news/stock
+  stock news latest          -> /stable/news/stock-latest
+  general news               -> /stable/news/general-latest
   company screener            -> /stable/company-screener
   ipo calendar                -> /stable/ipos-calendar
   insider trading             -> /stable/insider-trading/search
@@ -132,12 +133,20 @@ def get_commodity_quote(commodity_symbol):
 
 # ── News ──────────────────────────────────────────────────────────────────────
 def get_stock_news(ticker, limit=10):
-    data = _get("stock-news", {"symbols": ticker, "limit": limit})
+    """Ticker-specific news. symbols can be comma-separated for batch."""
+    data = _get("news/stock", {"symbols": ticker, "limit": limit})
+    return data if isinstance(data, list) else []
+
+
+def get_stock_news_latest(limit=250, page=0):
+    """Latest stock market news feed (no ticker filter)."""
+    data = _get("news/stock-latest", {"limit": limit, "page": page})
     return data if isinstance(data, list) else []
 
 
 def get_general_news(limit=25, page=0):
-    data = _get("general-news", {"limit": limit, "page": page})
+    """General market news (no ticker filter)."""
+    data = _get("news/general-latest", {"limit": limit, "page": page})
     return data if isinstance(data, list) else []
 
 
