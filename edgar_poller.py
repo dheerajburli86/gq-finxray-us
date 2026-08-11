@@ -1,487 +1,747 @@
-import requests
-import xml.etree.ElementTree as ET
-from supabase import create_client
-from dotenv import load_dotenv
-from datetime import datetime
+"""
+edgar_poller.py
+GQ FinXray US — Feature 1. SEC EDGAR real-time filing ingestion.
+
+Polls EDGAR's "current filings" Atom feeds for 8-K, Form 4, 10-Q, 10-K and S-1,
+resolves each filer's CIK to a ticker, and — only for tickers somebody is
+watching — downloads the filing text and stores it in `raw_filings` with
+status='PENDING'. ai_pipeline.py does the rest. Nothing here writes to `alerts`
+and nothing here sends a message.
+
+WHAT CHANGED, AND WHY IT MATTERED
+---------------------------------
+* **SEC rate limiting is now enforced, not hoped for.** SEC's fair-access policy
+  is 10 requests/second per client and requires a User-Agent that identifies the
+  requester with contact details; exceeding it earns a 403 block on the whole IP
+  for ten minutes. The old code issued unbounded parallel-ish bursts (one index
+  fetch, one document fetch and often one submissions fetch per entry, times five
+  feeds) and, on a 403, simply logged and returned — so the next cycle 30 seconds
+  later walked straight back into the block. There is now a process-wide throttle
+  at ~5 req/s and a shared backoff window that every SEC request respects.
+
+* **Watchlist gating happens BEFORE the document is fetched.** This is the whole
+  point of the rewrite. ai_pipeline gates at Stage 0, so an unwatched filing
+  never costs an LLM call — but it was still costing two or three SEC requests
+  and a megabyte of HTML per filing first. The CIK is resolved from the locally
+  cached ticker map (no network), and unwatched filers are dropped there.
+
+* **`filed_at` was `datetime.now()`** — the moment we polled, not the moment the
+  company filed. Alerts and ordering were therefore all stamped with poll time.
+  The Atom entry's `<updated>` element is the filing timestamp; it is parsed and
+  used, timezone-aware.
+
+* **Dedup was one SELECT per RSS entry** — roughly 200 round trips per cycle
+  across the five feeds. It is one batched `.in_()` query per feed now, and it
+  runs only over the handful of entries that survived the watchlist gate.
+
+* **`filing_exists()` failed OPEN.** A transient database error returned False,
+  which reads as "never seen this" — so an outage caused the whole feed to be
+  re-ingested and re-summarised. Dedup now fails CLOSED: if we cannot confirm a
+  filing is new, we skip it and pick it up next cycle.
+
+* `content_hash` is computed on the extracted text, and the new
+  UNIQUE(filing_url, COALESCE(ticker,'')) index is treated as "already seen"
+  rather than allowed to crash the poller.
+"""
+
 import os
-import time
 import re
-import traceback
-from watchlist_util import get_watched_tickers
+import time
+import hashlib
+import logging
+import threading
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+import requests
+from dotenv import load_dotenv
+from supabase import create_client
+
+from feature_map import tag_extra
+from watchlist_util import get_watched_tickers, log_poller_error
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
+POLLER_NAME = "edgar_poller"
+SOURCE = "SEC_EDGAR"
+
+# SEC requires a User-Agent naming the requester with working contact details.
+# A generic or absent UA is grounds for an immediate block.
 HEADERS = {
-    "User-Agent": "GQFinXray/1.0 dheerajburli86@gmail.com",
-    "Accept-Encoding": "gzip, deflate"
+    "User-Agent": os.getenv(
+        "SEC_USER_AGENT",
+        "GQ FinXray (GQuants) dheeraj.burli@gquants.com",
+    ),
+    "Accept-Encoding": "gzip, deflate",
 }
 
+EDGAR_8K_URL    = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_FORM4_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_10Q_URL   = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-Q&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_10K_URL   = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-K&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_S1_URL    = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-1&dateb=&owner=include&count=40&search_text=&output=atom"
+EDGAR_CIK_URL   = "https://www.sec.gov/files/company_tickers.json"
+
+MAX_FILING_CHARS = 6000
 CIK_MAP = {}
 
+ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
-def log_poller_error(job_name, error, context=None):
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEC request throttle
+#
+# The published limit is 10 requests/second. We target 5 so a burst that
+# overlaps with another process on the same egress IP still lands inside the
+# limit. `_blocked_until` is a shared penalty box: when any request comes back
+# 403/429/503, every subsequent SEC request in the process waits it out, which
+# is what stops the poller from hammering an IP that SEC has already throttled.
+# ══════════════════════════════════════════════════════════════════════════════
+SEC_MIN_GAP_SECONDS = 0.2
+SEC_MAX_BACKOFF_SECONDS = 120.0
+
+_sec_lock = threading.Lock()
+_sec_state = {"last_at": 0.0, "blocked_until": 0.0}
+_session = requests.Session()
+
+
+def _sec_throttle():
+    """Block until it is this caller's turn to talk to sec.gov."""
+    while True:
+        with _sec_lock:
+            now = time.monotonic()
+            if now >= _sec_state["blocked_until"] and (now - _sec_state["last_at"]) >= SEC_MIN_GAP_SECONDS:
+                _sec_state["last_at"] = now
+                return
+            wait = max(_sec_state["blocked_until"] - now,
+                       SEC_MIN_GAP_SECONDS - (now - _sec_state["last_at"]))
+        time.sleep(min(max(wait, 0.01), 5.0))
+
+
+def _apply_backoff(seconds, reason):
+    with _sec_lock:
+        until = time.monotonic() + seconds
+        if until > _sec_state["blocked_until"]:
+            _sec_state["blocked_until"] = until
+    logger.warning("[EDGAR] Backing off SEC requests for %.0fs (%s)", seconds, reason)
+
+
+def sec_get(url, timeout=20, retries=3):
     """
-    Persist a poller failure to Supabase (poller_error_log) so it's visible
-    without needing Railway log access. Wrapped in its own try/except —
-    a logging failure here must never crash the poller itself.
+    Throttled, backoff-aware GET against sec.gov. Returns a Response or None.
+
+    403/429/503 are treated as rate limiting: the whole process pauses for an
+    exponentially growing window before retrying, rather than the old behaviour
+    of logging and returning immediately into the next 30-second cycle.
     """
-    print(f"[ERROR] {job_name}: {error}")
-    try:
-        supabase.table("poller_error_log").insert({
-            "poller_name": "edgar_poller",
-            "job_name": job_name,
-            "error_message": str(error)[:2000],
-            "error_traceback": traceback.format_exc()[:8000],
-            "context": context or {}
-        }).execute()
-    except Exception as log_err:
-        print(f"[ERROR] Failed to write to poller_error_log: {log_err}")
+    backoff = 5.0
+    for attempt in range(1, retries + 1):
+        _sec_throttle()
+        try:
+            r = _session.get(url, headers=HEADERS, timeout=timeout)
+        except Exception as e:
+            if attempt == retries:
+                logger.warning("[EDGAR] GET %s failed after %d attempts: %s", url, retries, e)
+                return None
+            time.sleep(min(backoff, SEC_MAX_BACKOFF_SECONDS))
+            backoff *= 2
+            continue
 
-EDGAR_8K_URL   = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&search_text=&output=atom"
-EDGAR_FORM4_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=40&search_text=&output=atom"
-EDGAR_10Q_URL  = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-Q&dateb=&owner=include&count=40&search_text=&output=atom"
-EDGAR_10K_URL  = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-K&dateb=&owner=include&count=40&search_text=&output=atom"
-EDGAR_S1_URL   = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-1&dateb=&owner=include&count=40&search_text=&output=atom"
-EDGAR_CIK_URL  = "https://www.sec.gov/files/company_tickers.json"
+        if r.status_code == 200:
+            return r
 
+        if r.status_code in (403, 429, 503):
+            retry_after = (r.headers.get("Retry-After") or "").strip()
+            wait = float(retry_after) if retry_after.isdigit() else backoff
+            wait = min(wait, SEC_MAX_BACKOFF_SECONDS)
+            _apply_backoff(wait, f"HTTP {r.status_code}")
+            backoff = min(backoff * 2, SEC_MAX_BACKOFF_SECONDS)
+            if attempt == retries:
+                log_poller_error(POLLER_NAME, "sec_get", f"HTTP {r.status_code} after {retries} attempts",
+                                 {"url": url, "status_code": r.status_code,
+                                  "body": r.text[:300]})
+                return None
+            continue
+
+        if r.status_code == 404:
+            return None
+
+        logger.warning("[EDGAR] %s returned HTTP %s", url, r.status_code)
+        if attempt == retries:
+            return None
+        time.sleep(min(backoff, SEC_MAX_BACKOFF_SECONDS))
+        backoff *= 2
+    return None
+
+
+# ── CIK → ticker ──────────────────────────────────────────────────────────────
 def load_cik_map():
+    """Load SEC's full CIK↔ticker file. Called once at startup by main.py."""
     global CIK_MAP
-    print("[SETUP] Loading SEC CIK-to-ticker mapping...")
     try:
-        r = requests.get(EDGAR_CIK_URL, headers=HEADERS, timeout=30)
+        r = sec_get(EDGAR_CIK_URL, timeout=30)
+        if r is None:
+            logger.error("[EDGAR] Could not download the CIK map; keeping %d cached entries",
+                         len(CIK_MAP))
+            return
         data = r.json()
-        for key, val in data.items():
-            cik = str(val["cik_str"]).zfill(10)
-            ticker = val["ticker"].upper()
-            CIK_MAP[cik] = ticker
-        print(f"[SETUP] Loaded {len(CIK_MAP):,} ticker mappings")
+        mapping = {}
+        for val in data.values():
+            try:
+                cik = str(val["cik_str"]).zfill(10)
+                ticker = str(val["ticker"]).upper().strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ticker and cik not in mapping:
+                # SEC lists multiple share classes against one CIK; the first is
+                # the primary listing, which is what a watchlist will hold.
+                mapping[cik] = ticker
+        if mapping:
+            CIK_MAP = mapping
+            logger.info("[EDGAR] Loaded %d CIK→ticker mappings", len(CIK_MAP))
     except Exception as e:
-        log_poller_error("load_cik_map", e)
+        logger.error("[EDGAR] load_cik_map failed: %s", e)
+        log_poller_error(POLLER_NAME, "load_cik_map", e)
 
-def get_ticker_from_cik(cik: str) -> str:
-    padded = str(cik).zfill(10)
-    if padded in CIK_MAP:
-        return CIK_MAP[padded]
-    try:
-        url = f"https://data.sec.gov/submissions/CIK{padded}.json"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            tickers = data.get("tickers", [])
-            if tickers:
-                return tickers[0].upper()
-    except:
-        pass
-    return "UNKNOWN"
 
-def clean_html_text(html: str) -> str:
-    text = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'&nbsp;', ' ', text)
-    text = re.sub(r'&amp;', '&', text)
-    text = re.sub(r'&lt;', '<', text)
-    text = re.sub(r'&gt;', '>', text)
-    text = re.sub(r'&reg;', '®', text)
-    text = re.sub(r'&#\d+;', ' ', text)
-    text = re.sub(r'&[a-zA-Z]+;', ' ', text)
-    text = re.sub(r'This page uses Javascript.*?Javascript enabled browser\.', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def get_ticker_from_cik(cik):
+    """
+    Ticker for a CIK, from the local map only — no network call.
 
-def fetch_filing_text(index_url: str) -> str:
-    try:
-        acc_match = re.search(r'(\d{10}-\d{2}-\d{6})', index_url)
-        if not acc_match:
-            return ""
-        accession = acc_match.group(1)
-        accession_nodash = accession.replace("-", "")
+    The old version fell back to data.sec.gov/submissions/CIK*.json on a miss,
+    one extra SEC request per unmapped filer. EDGAR's current-filings feed is
+    dominated by funds, trusts and private filers that have no ticker at all, so
+    that fallback spent most of the poller's rate-limit budget confirming that
+    companies nobody can watch are, in fact, unwatchable. A miss here means "not
+    a listed common-stock filer", which is exactly the case we want to drop.
+    """
+    if not cik:
+        return None
+    return CIK_MAP.get(str(cik).zfill(10))
 
-        cik_match = re.search(r'/data/(\d+)/', index_url)
-        if not cik_match:
-            return ""
-        cik = cik_match.group(1)
 
-        index_json_url = f"https://data.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{accession}-index.json"
-        r = requests.get(index_json_url, headers=HEADERS, timeout=15)
+# ── Text extraction ───────────────────────────────────────────────────────────
+def clean_html_text(html):
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = (text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<")
+                .replace("&gt;", ">").replace("&reg;", "®").replace("&quot;", '"'))
+    text = re.sub(r"&#\d+;", " ", text)
+    text = re.sub(r"&[a-zA-Z]+;", " ", text)
+    text = re.sub(r"This page uses Javascript.*?Javascript enabled browser\.", "", text,
+                  flags=re.DOTALL | re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
 
-        primary_doc = None
-        if r.status_code == 200:
+
+def _accession_and_cik(index_url):
+    acc = re.search(r"(\d{10}-\d{2}-\d{6})", index_url or "")
+    cik = re.search(r"/data/(\d+)/", index_url or "")
+    if not acc or not cik:
+        return None, None
+    return acc.group(1), cik.group(1)
+
+
+def fetch_filing_text(index_url, form_type=""):
+    """
+    Pull the primary document out of a filing. Two SEC requests in the good case
+    (the accession index, then the document), three in the fallback.
+    """
+    accession, cik = _accession_and_cik(index_url)
+    if not accession:
+        return ""
+    acc_nodash = accession.replace("-", "")
+
+    primary_doc = None
+    r = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}-index.json",
+                timeout=15)
+    if r is not None:
+        try:
             files = r.json().get("directory", {}).get("item", [])
+        except ValueError:
+            files = []
+
+        def _pick(predicate):
             for f in files:
-                name = f.get("name", "").lower()
-                doc_type = f.get("type", "")
+                name = (f.get("name") or "").lower()
                 if "index" in name:
                     continue
-                if (name.endswith(".htm") or name.endswith(".html")) and doc_type in ("8-K", "S-1", "10-Q", "10-K"):
-                    primary_doc = f.get("name", "")
-                    break
-            if not primary_doc:
-                for f in files:
-                    name = f.get("name", "").lower()
-                    if (name.endswith(".htm") or name.endswith(".html")) and "index" not in name:
-                        primary_doc = f.get("name", "")
-                        break
-            if not primary_doc:
-                for f in files:
-                    name = f.get("name", "").lower()
-                    if any(x in name for x in ["ex99", "ex-99", "exhibit99", "exhibit-99"]):
-                        primary_doc = f.get("name", "")
-                        break
+                if predicate(f, name):
+                    return f.get("name")
+            return None
 
-        if primary_doc:
-            doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{primary_doc}"
-            r2 = requests.get(doc_url, headers=HEADERS, timeout=15)
-            if r2.status_code == 200:
-                text = clean_html_text(r2.text)
-                if len(text) > 300:
-                    return text[:6000]
+        primary_doc = (
+            _pick(lambda f, n: n.endswith((".htm", ".html")) and f.get("type") == form_type)
+            or _pick(lambda f, n: n.endswith((".htm", ".html")) and f.get("type") in ("8-K", "S-1", "10-Q", "10-K"))
+            or _pick(lambda f, n: n.endswith((".htm", ".html")))
+            or _pick(lambda f, n: any(x in n for x in ("ex99", "ex-99", "exhibit99", "exhibit-99")))
+        )
 
-        txt_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{accession}.txt"
-        r3 = requests.get(txt_url, headers=HEADERS, timeout=15)
-        if r3.status_code == 200:
-            raw = r3.text
-            text_tag_pos = raw.find("<TEXT>")
-            if text_tag_pos != -1:
-                raw = raw[text_tag_pos + 6:]
-                end_pos = raw.find("</TEXT>")
-                if end_pos != -1:
-                    raw = raw[:end_pos]
-            elif "</SEC-HEADER>" in raw:
-                raw = raw[raw.find("</SEC-HEADER>") + 13:]
-            text = clean_html_text(raw)
-            text = re.sub(r'<[A-Z][A-Z\-]*>', ' ', text)
-            text = re.sub(r'</[A-Z][A-Z\-]*>', ' ', text)
-            text = re.sub(r'\s+', ' ', text).strip()
+    if primary_doc:
+        r2 = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{primary_doc}",
+                     timeout=20)
+        if r2 is not None:
+            text = clean_html_text(r2.text)
             if len(text) > 300:
-                return text[:6000]
+                return text[:MAX_FILING_CHARS]
 
+    # Fallback: the complete submission text file.
+    r3 = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}.txt",
+                 timeout=25)
+    if r3 is None:
         return ""
-    except Exception as e:
+    raw = r3.text
+    pos = raw.find("<TEXT>")
+    if pos != -1:
+        raw = raw[pos + 6:]
+        end = raw.find("</TEXT>")
+        if end != -1:
+            raw = raw[:end]
+    elif "</SEC-HEADER>" in raw:
+        raw = raw[raw.find("</SEC-HEADER>") + 13:]
+    text = clean_html_text(raw)
+    text = re.sub(r"</?[A-Z][A-Z\-]*>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:MAX_FILING_CHARS] if len(text) > 300 else ""
+
+
+def _f(elem, path):
+    """First matching child's stripped text, or ''."""
+    node = elem.find(path) if elem is not None else None
+    return (node.text or "").strip() if node is not None and node.text else ""
+
+
+def fetch_form4_text(index_url, company_name, insider_name):
+    """Render a Form 4's ownershipDocument XML into readable prose."""
+    accession, cik = _accession_and_cik(index_url)
+    if not accession:
+        return ""
+    acc_nodash = accession.replace("-", "")
+
+    r = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}.txt",
+                timeout=20)
+    if r is None:
         return ""
 
-def fetch_form4_text(index_url: str, company_name: str, insider_name: str) -> str:
+    content = r.text
+    start = content.find("<ownershipDocument>")
+    end = content.find("</ownershipDocument>")
+    if start == -1 or end == -1:
+        return ""
+
     try:
-        acc_match = re.search(r'(\d{10}-\d{2}-\d{6})', index_url)
-        if not acc_match:
-            return ""
-        accession = acc_match.group(1)
-        cik_match = re.search(r'/data/(\d+)/', index_url)
-        if not cik_match:
-            return ""
-        cik = cik_match.group(1)
-        acc_nodash = accession.replace("-", "")
-        txt_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}.txt"
-        r = requests.get(txt_url, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            return ""
-        content = r.text
-        xml_start = content.find("<ownershipDocument>")
-        xml_end = content.find("</ownershipDocument>")
-        if xml_start == -1 or xml_end == -1:
-            return ""
-        xml_text = content[xml_start:xml_end + len("</ownershipDocument>")]
-        root = ET.fromstring(xml_text)
-        issuer_name = company_name
-        issuer_ticker = ""
-        issuer_elem = root.find(".//issuer")
-        if issuer_elem is not None:
-            name_elem = issuer_elem.find("issuerName")
-            tick_elem = issuer_elem.find("issuerTradingSymbol")
-            if name_elem is not None and name_elem.text:
-                issuer_name = name_elem.text.strip()
-            if tick_elem is not None and tick_elem.text:
-                issuer_ticker = tick_elem.text.strip()
-        reporter_name = insider_name
-        reporter_title = ""
-        reporting_owner = root.find(".//reportingOwner")
-        if reporting_owner is not None:
-            rp_name = reporting_owner.find(".//rptOwnerName")
-            if rp_name is not None and rp_name.text:
-                reporter_name = rp_name.text.strip()
-            rel_elem = reporting_owner.find(".//officerTitle")
-            if rel_elem is not None and rel_elem.text:
-                reporter_title = rel_elem.text.strip()
-            if not reporter_title:
-                is_director = reporting_owner.find(".//isDirector")
-                is_ten_pct = reporting_owner.find(".//isTenPercentOwner")
-                if is_director is not None and is_director.text == "1":
-                    reporter_title = "Director"
-                elif is_ten_pct is not None and is_ten_pct.text == "1":
-                    reporter_title = "10% Owner"
-        transactions = []
-        for trans in root.findall(".//nonDerivativeTransaction"):
-            security = trans.find(".//securityTitle/value")
-            trans_date = trans.find(".//transactionDate/value")
-            trans_code = trans.find(".//transactionCode")
-            shares = trans.find(".//transactionShares/value")
-            price = trans.find(".//transactionPricePerShare/value")
-            shares_owned = trans.find(".//sharesOwnedFollowingTransaction/value")
-            acquired_disposed = trans.find(".//transactionAcquiredDisposedCode/value")
-            if shares is not None and trans_code is not None:
-                direction = acquired_disposed.text.strip() if acquired_disposed is not None and acquired_disposed.text else ""
-                action = "purchased" if direction == "A" else "sold" if direction == "D" else "transacted"
-                try:
-                    share_count = float(shares.text.replace(",", "")) if shares.text else 0
-                    price_val = float(price.text.replace(",", "")) if price is not None and price.text and price.text not in ("0", "") else 0
-                    total_val = share_count * price_val if price_val > 0 else 0
-                    owned_after = float(shares_owned.text.replace(",", "")) if shares_owned is not None and shares_owned.text else 0
-                    date_str = trans_date.text.strip() if trans_date is not None and trans_date.text else ""
-                    security_name = security.text.strip() if security is not None and security.text else "Common Stock"
-                    transactions.append({"action": action, "shares": share_count, "price": price_val, "total": total_val, "owned_after": owned_after, "date": date_str, "security": security_name})
-                except:
-                    pass
-        for trans in root.findall(".//derivativeTransaction"):
-            security = trans.find(".//securityTitle/value")
-            trans_date = trans.find(".//transactionDate/value")
-            shares = trans.find(".//transactionShares/value")
-            price = trans.find(".//transactionPricePerShare/value")
-            acquired_disposed = trans.find(".//transactionAcquiredDisposedCode/value")
-            if shares is not None:
-                direction = acquired_disposed.text.strip() if acquired_disposed is not None and acquired_disposed.text else ""
-                action = "acquired" if direction == "A" else "disposed" if direction == "D" else "exercised"
-                try:
-                    share_count = float(shares.text.replace(",", "")) if shares.text else 0
-                    price_val = float(price.text.replace(",", "")) if price is not None and price.text and price.text not in ("0", "") else 0
-                    total_val = share_count * price_val if price_val > 0 else 0
-                    date_str = trans_date.text.strip() if trans_date is not None and trans_date.text else ""
-                    security_name = security.text.strip() if security is not None and security.text else "Derivative Security"
-                    transactions.append({"action": action, "shares": share_count, "price": price_val, "total": total_val, "owned_after": 0, "date": date_str, "security": security_name})
-                except:
-                    pass
-        if not transactions:
-            return f"{issuer_name} insider {reporter_name} ({reporter_title}) filed Form 4 disclosing changes in ownership of {issuer_name} shares."
-        lines = [f"Company: {issuer_name} ({issuer_ticker})", f"Insider: {reporter_name}, {reporter_title or 'Insider'}", f"Filing: Form 4 – Insider Transaction Report", ""]
-        for t in transactions:
-            share_str = f"{t['shares']:,.0f} shares"
-            price_str = f"at ${t['price']:.2f} per share" if t['price'] > 0 else "at undisclosed price"
-            total_str = f"(total value ${t['total']:,.0f})" if t['total'] > 0 else ""
-            owned_str = f"Total shares owned after transaction: {t['owned_after']:,.0f}" if t['owned_after'] > 0 else ""
-            date_str = f"on {t['date']}" if t['date'] else ""
-            lines.append(f"{reporter_name} {t['action']} {share_str} of {t['security']} {price_str} {total_str} {date_str}.")
-            if owned_str:
-                lines.append(owned_str)
-        return "\n".join(lines)
+        root = ET.fromstring(content[start:end + len("</ownershipDocument>")])
+    except ET.ParseError as e:
+        logger.debug("[EDGAR] Form 4 XML unparseable for %s: %s", index_url, e)
+        return ""
+
+    issuer_name = _f(root, ".//issuer/issuerName") or company_name
+    issuer_ticker = _f(root, ".//issuer/issuerTradingSymbol")
+
+    owner = root.find(".//reportingOwner")
+    reporter_name = _f(owner, ".//rptOwnerName") or insider_name
+    reporter_title = _f(owner, ".//officerTitle")
+    if not reporter_title and owner is not None:
+        if _f(owner, ".//isDirector") == "1":
+            reporter_title = "Director"
+        elif _f(owner, ".//isTenPercentOwner") == "1":
+            reporter_title = "10% Owner"
+
+    def _num(node_text):
+        try:
+            return float((node_text or "").replace(",", ""))
+        except ValueError:
+            return 0.0
+
+    transactions = []
+    for tag, verbs in (("nonDerivativeTransaction", ("purchased", "sold", "transacted")),
+                       ("derivativeTransaction", ("acquired", "disposed", "exercised"))):
+        for trans in root.findall(f".//{tag}"):
+            shares = _num(_f(trans, ".//transactionShares/value"))
+            if not shares:
+                continue
+            direction = _f(trans, ".//transactionAcquiredDisposedCode/value")
+            action = verbs[0] if direction == "A" else verbs[1] if direction == "D" else verbs[2]
+            price = _num(_f(trans, ".//transactionPricePerShare/value"))
+            transactions.append({
+                "action": action,
+                "shares": shares,
+                "price": price,
+                "total": shares * price if price else 0.0,
+                "owned_after": _num(_f(trans, ".//sharesOwnedFollowingTransaction/value")),
+                "date": _f(trans, ".//transactionDate/value"),
+                "security": _f(trans, ".//securityTitle/value") or "Common Stock",
+            })
+
+    if not transactions:
+        return (f"{issuer_name} insider {reporter_name} "
+                f"({reporter_title or 'Insider'}) filed a Form 4 disclosing a change "
+                f"in beneficial ownership of {issuer_name} securities.")
+
+    lines = [
+        f"Company: {issuer_name} ({issuer_ticker})".strip(),
+        f"Insider: {reporter_name}, {reporter_title or 'Insider'}",
+        "Filing: Form 4 - Statement of Changes in Beneficial Ownership",
+        "",
+    ]
+    for t in transactions:
+        price_str = f"at ${t['price']:.2f} per share" if t["price"] else "at an undisclosed price"
+        total_str = f" (total value ${t['total']:,.0f})" if t["total"] else ""
+        date_str = f" on {t['date']}" if t["date"] else ""
+        lines.append(f"{reporter_name} {t['action']} {t['shares']:,.0f} shares of "
+                     f"{t['security']} {price_str}{total_str}{date_str}.")
+        if t["owned_after"]:
+            lines.append(f"Shares beneficially owned following the transaction: {t['owned_after']:,.0f}.")
+    return "\n".join(lines)
+
+
+# ── Dates and hashing ─────────────────────────────────────────────────────────
+def parse_atom_date(value):
+    """EDGAR's <updated> is ISO 8601 with an offset. Returns aware UTC or None."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def content_hash(text):
+    norm = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    return hashlib.sha256(norm.encode("utf-8", "ignore")).hexdigest()
+
+
+# ── Supabase ──────────────────────────────────────────────────────────────────
+def _chunked(seq, size):
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def existing_filing_urls(urls):
+    """
+    Batched dedup for one cycle's worth of candidate URLs.
+
+    Raises on a database error rather than returning an empty set. The caller
+    must treat that as "skip this cycle": returning "nothing exists" on an error
+    is what caused whole feeds to be re-ingested during a Supabase blip.
+    """
+    found = set()
+    for chunk in _chunked(urls, 50):
+        rows = (supabase.table("raw_filings")
+                .select("filing_url, ticker")
+                .in_("filing_url", chunk).execute()).data or []
+        for r in rows:
+            found.add((r.get("filing_url"), (r.get("ticker") or "").upper()))
+    return found
+
+
+def filing_exists(filing_url, ticker=None):
+    """
+    Single-URL dedup. Fails CLOSED — returns True (treat as seen) on error.
+
+    Retained for callers outside the batched path; the feed pollers use
+    existing_filing_urls() instead.
+    """
+    try:
+        q = supabase.table("raw_filings").select("id").eq("filing_url", filing_url)
+        if ticker:
+            q = q.eq("ticker", ticker)
+        return bool(q.limit(1).execute().data)
     except Exception as e:
-        print(f"[FORM4] Parse error: {e}")
-        return f"{company_name} insider {insider_name} filed Form 4 disclosing changes in ownership."
+        logger.error("[EDGAR] Dedup check failed for %s: %s", filing_url, e)
+        return True
 
-def filing_exists(filing_url: str) -> bool:
-    try:
-        result = supabase.table("raw_filings").select("id").eq("filing_url", filing_url).execute()
-        return len(result.data) > 0
-    except:
-        return False
 
-def store_filing(filing_type, company_name, ticker, raw_text, filing_url, extra=None):
+def store_filing(filing_type, company_name, ticker, raw_text, filing_url,
+                 filed_at, cik=None, extra=None):
+    """Insert one PENDING row. Returns True when a row was actually created."""
+    payload = dict(extra or {})
+    payload.setdefault("cik", cik)
+    payload.setdefault("form_type", filing_type)
+    payload.setdefault("url", filing_url)
     try:
         supabase.table("raw_filings").insert({
-            "source": "SEC_EDGAR",
+            "source": SOURCE,
             "filing_type": filing_type,
             "company_name": company_name,
             "ticker": ticker,
+            "cik": cik,
             "raw_text": raw_text,
             "filing_url": filing_url,
-            "filed_at": datetime.now().isoformat(),
+            "filed_at": filed_at,
             "status": "PENDING",
-            "extra": extra or {}
+            "content_hash": content_hash(raw_text),
+            "extra": tag_extra(payload, SOURCE, filing_type),
         }).execute()
-        print(f"[STORED] {filing_type} – {company_name} ({ticker}) → PENDING")
+        logger.info("[EDGAR] Stored %s — %s (%s)", filing_type, company_name, ticker)
+        return True
     except Exception as e:
-        log_poller_error("store_filing", e, {"filing_type": filing_type, "ticker": ticker, "filing_url": filing_url})
+        msg = str(e).lower()
+        if "duplicate" in msg or "unique" in msg or "23505" in msg:
+            logger.debug("[EDGAR] Already ingested: %s (%s)", filing_url, ticker)
+            return False
+        logger.error("[EDGAR] Insert failed for %s (%s): %s", ticker, filing_url, e)
+        log_poller_error(POLLER_NAME, "store_filing", e,
+                         {"filing_type": filing_type, "ticker": ticker, "filing_url": filing_url})
+        return False
+
+
+# ── Feed parsing ──────────────────────────────────────────────────────────────
+def _entry_link(entry):
+    for link in entry.findall("atom:link", ATOM_NS):
+        href = (link.attrib.get("href") or "").strip()
+        if href:
+            return href
+    return ""
+
+
+def _entry_text(entry, tag):
+    node = entry.find(f"atom:{tag}", ATOM_NS)
+    return (node.text or "").strip() if node is not None and node.text else ""
+
+
+def _parse_title(title, form_type):
+    """'8-K - ACME CORP (0000012345) (Filer)' -> ('ACME CORP', '0000012345')."""
+    m = re.match(rf"{re.escape(form_type)}\s*-\s*(.+?)\s*\((\d+)\)", title or "")
+    if m:
+        return m.group(1).strip(), m.group(2)
+    return (title or "").strip(), ""
+
 
 # ── Generic EDGAR poller ──────────────────────────────────────────────────────
 def poll_edgar_generic(url, form_type, label):
-    """Generic EDGAR RSS poller — works for 8-K, 10-Q, 10-K, S-1."""
-    watched = get_watched_tickers()
-    if not watched:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] No watched tickers — skipping {label}")
-        return
+    """
+    One pass over one EDGAR current-filings feed. Never raises.
 
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling SEC EDGAR for {label}...")
+    Order of operations is deliberate and is the cost control for this poller:
+    parse -> resolve ticker from the local CIK map -> watchlist gate -> batched
+    dedup -> only then fetch the filing body.
+    """
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            log_poller_error(
-                f"poll_edgar_generic:{label}",
-                f"SEC EDGAR returned HTTP {r.status_code}",
-                {"url": url, "status_code": r.status_code, "response_snippet": r.text[:500]}
-            )
+        watched = get_watched_tickers()
+        if not watched:
+            logger.info("[EDGAR] %s: no watchlisted tickers; skipping.", label)
             return
 
-        root = ET.fromstring(r.content)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        entries = root.findall("atom:entry", ns)
+        if not CIK_MAP:
+            logger.warning("[EDGAR] CIK map empty — reloading before %s poll", label)
+            load_cik_map()
+            if not CIK_MAP:
+                logger.error("[EDGAR] %s: cannot resolve tickers without a CIK map; skipping.", label)
+                return
 
-        new_count = 0
+        r = sec_get(url, timeout=20)
+        if r is None:
+            return
+
+        try:
+            root = ET.fromstring(r.content)
+        except ET.ParseError as e:
+            log_poller_error(POLLER_NAME, f"parse:{label}", e, {"url": url})
+            return
+
+        entries = root.findall("atom:entry", ATOM_NS)
+        candidates = []
         for entry in entries:
-            title_elem = entry.find("atom:title", ns)
-            link_elem  = entry.find("atom:link", ns)
-            summary_elem = entry.find("atom:summary", ns)
-
-            if title_elem is None or link_elem is None:
+            title = _entry_text(entry, "title")
+            filing_url = _entry_link(entry)
+            if not title or not filing_url:
                 continue
 
-            title = title_elem.text or ""
-            filing_url = link_elem.attrib.get("href", "")
-            summary_text = summary_elem.text if summary_elem is not None else ""
+            company_name, cik = _parse_title(title, form_type)
+            ticker = get_ticker_from_cik(cik)
+            if not ticker or ticker not in watched:
+                continue  # gate BEFORE spending SEC bandwidth on the document
 
-            if not filing_url or filing_exists(filing_url):
+            filed = parse_atom_date(_entry_text(entry, "updated"))
+            candidates.append({
+                "title": title,
+                "url": filing_url,
+                "summary": _entry_text(entry, "summary"),
+                "company_name": company_name,
+                "cik": cik,
+                "ticker": ticker,
+                "filed_at": (filed or datetime.now(timezone.utc)).isoformat(),
+            })
+
+        if not candidates:
+            logger.info("[EDGAR] %s: %d entries, none watchlisted.", label, len(entries))
+            return
+
+        try:
+            seen = existing_filing_urls({c["url"] for c in candidates})
+        except Exception as e:
+            logger.error("[EDGAR] %s: dedup query failed, skipping cycle: %s", label, e)
+            log_poller_error(POLLER_NAME, f"dedup:{label}", e, {"url": url})
+            return
+
+        stored = 0
+        for c in candidates:
+            if (c["url"], c["ticker"]) in seen:
                 continue
 
-            pattern = rf'{re.escape(form_type)}\s*-\s*(.+?)\s*\((\d+)\)'
-            company_match = re.match(pattern, title)
-            company_name = company_match.group(1).strip() if company_match else title
-            cik = company_match.group(2) if company_match else ""
-            ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
-
-            # Skip if not in watchlist
-            if ticker not in watched:
-                continue
-
-            filing_text = fetch_filing_text(filing_url)
+            filing_text = fetch_filing_text(c["url"], form_type)
             if not filing_text or len(filing_text) < 100:
-                filing_text = f"{company_name}\n\n{title}\n\n{summary_text}"
+                filing_text = f"{c['company_name']}\n\n{c['title']}\n\n{c['summary']}".strip()
 
-            # Tag 10-Q and 10-K for Result Snapshot processing
-            extra = {"cik": cik, "form_type": form_type}
+            extra = {"cik": c["cik"], "form_type": form_type, "title": c["title"]}
             if form_type in ("10-Q", "10-K"):
+                # Consumed by result_snapshot.py, which clears the flag when done.
                 extra["needs_result_snapshot"] = True
 
-            store_filing(
-                filing_type=form_type,
-                company_name=company_name,
-                ticker=ticker,
-                raw_text=filing_text,
-                filing_url=filing_url,
-                extra=extra
-            )
-            new_count += 1
-            time.sleep(0.3)
+            if store_filing(form_type, c["company_name"], c["ticker"], filing_text,
+                            c["url"], c["filed_at"], cik=c["cik"], extra=extra):
+                stored += 1
+                seen.add((c["url"], c["ticker"]))
 
-        if new_count == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new {label} filings.")
-        else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new {label} filings.")
+        logger.info("[EDGAR] %s: %d entries, %d watchlisted, %d stored.",
+                    label, len(entries), len(candidates), stored)
 
     except Exception as e:
-        log_poller_error(f"poll_edgar_generic:{label}", e, {"url": url})
+        logger.exception("[EDGAR] %s poll failed: %s", label, e)
+        log_poller_error(POLLER_NAME, f"poll_edgar_generic:{label}", e, {"url": url})
+
 
 def poll_sec_8k():
     poll_edgar_generic(EDGAR_8K_URL, "8-K", "8-K")
 
+
 def poll_sec_10q():
-    poll_edgar_generic(EDGAR_10Q_URL, "10-Q", "10-Q (Quarterly Results)")
+    poll_edgar_generic(EDGAR_10Q_URL, "10-Q", "10-Q (Quarterly Report)")
+
 
 def poll_sec_10k():
-    poll_edgar_generic(EDGAR_10K_URL, "10-K", "10-K (Annual Results)")
+    poll_edgar_generic(EDGAR_10K_URL, "10-K", "10-K (Annual Report)")
+
 
 def poll_sec_s1():
-    poll_edgar_generic(EDGAR_S1_URL, "S-1", "S-1 (IPO Filing)")
+    poll_edgar_generic(EDGAR_S1_URL, "S-1", "S-1 (Registration)")
 
+
+# ── Form 4 ────────────────────────────────────────────────────────────────────
 def poll_sec_form4():
-    watched = get_watched_tickers()
-    if not watched:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] No watched tickers — skipping Form 4")
-        return
-
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Polling SEC EDGAR for Form 4...")
+    """
+    Form 4 needs its own pass because EDGAR emits one entry per party — an
+    (Issuer) entry and a (Reporting) entry sharing an accession number. The
+    issuer entry carries the company CIK we gate on; the reporting entry carries
+    the insider's name. Never raises.
+    """
     try:
-        r = requests.get(EDGAR_FORM4_URL, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            log_poller_error(
-                "poll_sec_form4",
-                f"SEC EDGAR returned HTTP {r.status_code}",
-                {"url": EDGAR_FORM4_URL, "status_code": r.status_code, "response_snippet": r.text[:500]}
-            )
+        watched = get_watched_tickers()
+        if not watched:
+            logger.info("[EDGAR] Form 4: no watchlisted tickers; skipping.")
             return
 
-        root = ET.fromstring(r.content)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        entries = root.findall("atom:entry", ns)
+        if not CIK_MAP:
+            load_cik_map()
+            if not CIK_MAP:
+                logger.error("[EDGAR] Form 4: cannot resolve tickers without a CIK map; skipping.")
+                return
 
-        accession_map = {}
-        for entry in entries:
-            title_elem = entry.find("atom:title", ns)
-            link_elem  = entry.find("atom:link", ns)
-            if title_elem is None or link_elem is None:
+        r = sec_get(EDGAR_FORM4_URL, timeout=20)
+        if r is None:
+            return
+
+        try:
+            root = ET.fromstring(r.content)
+        except ET.ParseError as e:
+            log_poller_error(POLLER_NAME, "parse:form4", e, {"url": EDGAR_FORM4_URL})
+            return
+
+        by_accession = {}
+        for entry in root.findall("atom:entry", ATOM_NS):
+            title = _entry_text(entry, "title")
+            filing_url = _entry_link(entry)
+            if not title or not filing_url:
                 continue
-            title = title_elem.text or ""
-            filing_url = link_elem.attrib.get("href", "")
-            acc_match = re.search(r'(\d{10}-\d{2}-\d{6})', filing_url)
-            if not acc_match:
+            acc = re.search(r"(\d{10}-\d{2}-\d{6})", filing_url)
+            if not acc:
                 continue
-            acc_num = acc_match.group(1)
-            if acc_num not in accession_map:
-                accession_map[acc_num] = []
-            accession_map[acc_num].append({"title": title, "url": filing_url})
+            by_accession.setdefault(acc.group(1), []).append({
+                "title": title,
+                "url": filing_url,
+                "updated": _entry_text(entry, "updated"),
+            })
 
-        new_count = 0
-        processed_urls = set()
-
-        for acc_num, entries_list in accession_map.items():
-            issuer = None
-            reporting = None
-            for e in entries_list:
-                if "(Issuer)" in e["title"]:
-                    issuer = e
-                elif "(Reporting)" in e["title"]:
-                    reporting = e
-
+        candidates = []
+        for acc_num, group in by_accession.items():
+            issuer = next((e for e in group if "(Issuer)" in e["title"]), None)
+            reporting = next((e for e in group if "(Reporting)" in e["title"]), None)
             if not issuer:
                 continue
 
-            filing_url = issuer["url"]
-            if filing_url in processed_urls or filing_exists(filing_url):
-                continue
-            processed_urls.add(filing_url)
-
-            issuer_match = re.match(r'4\s*-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)', issuer["title"])
-            company_name = issuer_match.group(1).strip() if issuer_match else issuer["title"]
-            cik = issuer_match.group(2) if issuer_match else ""
-            ticker = get_ticker_from_cik(cik) if cik else "UNKNOWN"
-
-            # Skip if not in watchlist
-            if ticker not in watched:
+            m = re.match(r"4\s*-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)", issuer["title"])
+            company_name = m.group(1).strip() if m else issuer["title"]
+            cik = m.group(2) if m else ""
+            ticker = get_ticker_from_cik(cik)
+            if not ticker or ticker not in watched:
                 continue
 
             insider_name = "Unknown Insider"
             if reporting:
-                rep_match = re.match(r'4\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)', reporting["title"])
-                if rep_match:
-                    insider_name = rep_match.group(1).strip()
+                rm = re.match(r"4\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)", reporting["title"])
+                if rm:
+                    insider_name = rm.group(1).strip()
 
-            filing_text = fetch_form4_text(filing_url, company_name, insider_name)
-            if not filing_text or len(filing_text) < 50:
-                filing_text = f"{company_name} insider {insider_name} filed Form 4 disclosing changes in ownership."
+            filed = parse_atom_date(issuer["updated"])
+            candidates.append({
+                "url": issuer["url"],
+                "company_name": company_name,
+                "cik": cik,
+                "ticker": ticker,
+                "insider_name": insider_name,
+                "accession": acc_num,
+                "filed_at": (filed or datetime.now(timezone.utc)).isoformat(),
+            })
 
-            store_filing(
-                filing_type="4",
-                company_name=company_name,
-                ticker=ticker,
-                raw_text=filing_text,
-                filing_url=filing_url,
-                extra={"insider_name": insider_name, "cik": cik}
-            )
-            new_count += 1
-            time.sleep(0.3)
+        if not candidates:
+            logger.info("[EDGAR] Form 4: %d accessions, none watchlisted.", len(by_accession))
+            return
 
-        if new_count == 0:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] No new Form 4 filings.")
-        else:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {new_count} new Form 4 filings.")
+        try:
+            seen = existing_filing_urls({c["url"] for c in candidates})
+        except Exception as e:
+            logger.error("[EDGAR] Form 4 dedup query failed, skipping cycle: %s", e)
+            log_poller_error(POLLER_NAME, "dedup:form4", e)
+            return
+
+        stored = 0
+        for c in candidates:
+            if (c["url"], c["ticker"]) in seen:
+                continue
+
+            text = fetch_form4_text(c["url"], c["company_name"], c["insider_name"])
+            if not text or len(text) < 50:
+                text = (f"{c['company_name']} insider {c['insider_name']} filed a Form 4 "
+                        f"disclosing a change in beneficial ownership.")
+
+            if store_filing("4", c["company_name"], c["ticker"], text, c["url"],
+                            c["filed_at"], cik=c["cik"],
+                            extra={"insider_name": c["insider_name"],
+                                   "accession": c["accession"],
+                                   "title": f"{c['company_name']} Form 4 — {c['insider_name']}"}):
+                stored += 1
+                seen.add((c["url"], c["ticker"]))
+
+        logger.info("[EDGAR] Form 4: %d accessions, %d watchlisted, %d stored.",
+                    len(by_accession), len(candidates), stored)
 
     except Exception as e:
-        log_poller_error("poll_sec_form4", e, {"url": EDGAR_FORM4_URL})
+        logger.exception("[EDGAR] Form 4 poll failed: %s", e)
+        log_poller_error(POLLER_NAME, "poll_sec_form4", e, {"url": EDGAR_FORM4_URL})
+
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_cik_map()
-    while True:
-        poll_sec_8k()
-        poll_sec_form4()
-        poll_sec_10q()
-        poll_sec_10k()
-        poll_sec_s1()
-        time.sleep(30)
+    poll_sec_8k()
+    poll_sec_form4()
+    poll_sec_10q()
+    poll_sec_10k()
+    poll_sec_s1()

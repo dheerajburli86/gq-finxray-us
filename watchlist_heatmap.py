@@ -1,247 +1,356 @@
-#!/usr/bin/env python3
 """
 watchlist_heatmap.py
-GQ FinXray US — Generate watchlist performance heatmap with glocom color coding.
+GQ FinXray US — Feature 14, the personal watchlist heatmap.
 
-Color scheme (based on return percentile):
-- Top 20% (0-20th percentile): Dark Green (#006400)
-- 20-40%: Light Green (#00AA00)
-- 40-60%: White (#FFFFFF)
-- 60-80%: Light Red (#FF6666)
-- Bottom 20% (80-100th percentile): Dark Red (#CC0000)
+One image per user, showing only the stocks that user actually watches, sent
+only to that user.
 
-Stocks sorted descending by return (best → worst).
+WHAT THIS REPLACES
+------------------
+The previous version was a placeholder: ten hardcoded tickers with invented
+returns, a `chat_id` argument it never used, no watchlist lookup, no quote
+fetch, and no delivery — it wrote a JPEG to disk and returned. Nothing about it
+was per-user except the function signature.
+
+DESIGN NOTES
+------------
+* ONE QUOTE PASS FOR THE WHOLE SYSTEM. Watchlists overlap heavily (AAPL is on
+  most of them), so quotes are fetched once for the union of every user's
+  tickers and each user's image is rendered from that shared map. The obvious
+  loop — for each user, for each ticker, fetch — costs O(users x tickers) FMP
+  calls per slot and will exhaust the plan.
+
+* THE 75% COVERAGE RULE, inherited from the India system: if fewer than three
+  quarters of a user's tickers resolved to a price, the heatmap would misrepresent
+  their portfolio by omission, so it is skipped and the reason logged rather than
+  sent with holes in it.
+
+* LARGE WATCHLISTS ARE TRIMMED, NOT TRUNCATED. Above 25 tickers the image shows
+  the 12 best and 12 worst, and the caption says so explicitly. Silently dropping
+  the middle would leave a user believing they were looking at everything.
 """
 
-import os
 import logging
-from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
-from supabase import create_client
-from PIL import Image, ImageDraw, ImageFont
-import textwrap
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-load_dotenv()
+import fmp_client
+import heatmap_style as hs
+from feature_map import tag_extra
+from heatmap_generator import is_trading_day
+from watchlist_util import log_poller_error
 
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ET = ZoneInfo("America/New_York")
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+SOURCE = "WATCHLIST_HEATMAP"
 
-# Heatmap settings
-HEATMAP_WIDTH = 958
-HEADER_HEIGHT = 80
-CELL_WIDTH = 170
-CELL_HEIGHT = 150
-GAP = 12
-COLS = 5
+# The two slots feature_map.py recognises for feature 14.
+SLOT_MIDDAY = "HEATMAP_WATCHLIST_MIDDAY"
+SLOT_EOD = "HEATMAP_WATCHLIST_EOD"
 
-# Glocom color scheme (RGB)
-COLOR_DARK_GREEN = (0, 100, 0)        # Top 20%
-COLOR_LIGHT_GREEN = (0, 170, 0)       # 20-40%
-COLOR_WHITE = (240, 240, 240)         # 40-60%
-COLOR_LIGHT_RED = (255, 102, 102)     # 60-80%
-COLOR_DARK_RED = (204, 0, 0)          # Bottom 20%
-
-COLOR_TEXT_DARK = (255, 255, 255)     # White text
-COLOR_TEXT_LIGHT = (0, 0, 0)          # Black text
-COLOR_HEADER_BG = (20, 20, 20)        # Dark header
-COLOR_HEADER_TEXT = (255, 255, 255)   # White header text
-COLOR_BORDER = (100, 100, 100)        # Gray borders
+MIN_COVERAGE = 0.75      # share of a user's tickers that must resolve to a price
+TRIM_THRESHOLD = 25      # above this many resolved tickers, show extremes only
+TRIM_HEAD = 12           # top gainers kept
+TRIM_TAIL = 12           # bottom losers kept
 
 
-def get_percentile_rank(value, all_values):
-    """Calculate percentile rank (0-100) for a value in a list."""
-    if not all_values:
-        return 50
-    sorted_vals = sorted(all_values)
-    rank = sum(1 for v in sorted_vals if v <= value) / len(sorted_vals) * 100
-    return rank
+def _supabase():
+    import os
+    from supabase import create_client
+    return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 
-def get_color_for_return(return_pct, all_returns):
-    """Get color based on glocom scheme (percentile rank)."""
-    percentile = get_percentile_rank(return_pct, all_returns)
-
-    if percentile <= 20:
-        return COLOR_DARK_GREEN, COLOR_TEXT_DARK
-    elif percentile <= 40:
-        return COLOR_LIGHT_GREEN, COLOR_TEXT_DARK
-    elif percentile <= 60:
-        return COLOR_WHITE, COLOR_TEXT_LIGHT
-    elif percentile <= 80:
-        return COLOR_LIGHT_RED, COLOR_TEXT_LIGHT
-    else:
-        return COLOR_DARK_RED, COLOR_TEXT_DARK
-
-
-def get_watchlist_performance(chat_id: int, period: str = "DAILY"):
+# ── Data ──────────────────────────────────────────────────────────────────────
+def build_quote_map(tickers):
     """
-    Fetch watchlist stocks and their performance.
-
-    Returns: list of dicts with ticker, return_pct, sector, exchange
+    {TICKER: {"change_p": float, "price": float, "name": str}} for the union of
+    every watchlist, in a single batched pass.
     """
-    # Get in-memory watchlist (hardcoded for now)
-    # TODO: Integrate with persistent watchlist storage
-    return []
+    tickers = sorted({(t or "").upper() for t in tickers if t})
+    if not tickers:
+        return {}
 
-
-def generate_watchlist_heatmap(chat_id: int, period: str = "DAILY"):
-    """
-    Generate watchlist heatmap image.
-
-    Args:
-        chat_id: User's Telegram chat ID
-        period: "DAILY", "WEEKLY", or "MONTHLY"
-
-    Returns:
-        Path to generated heatmap image or None if watchlist empty
-    """
-
-    # For now, use hardcoded watchlist for testing
-    # TODO: Fetch from in-memory bot watchlist or DB
-    hardcoded_stocks = [
-        {"ticker": "AAPL", "return_pct": 5.2, "sector": "Technology", "exchange": "NASDAQ"},
-        {"ticker": "MSFT", "return_pct": 3.8, "sector": "Technology", "exchange": "NASDAQ"},
-        {"ticker": "NVDA", "return_pct": 8.5, "sector": "Semiconductors", "exchange": "NASDAQ"},
-        {"ticker": "TSLA", "return_pct": -2.1, "sector": "Automotive", "exchange": "NASDAQ"},
-        {"ticker": "JPM", "return_pct": 1.5, "sector": "Finance", "exchange": "NYSE"},
-        {"ticker": "BAC", "return_pct": -1.2, "sector": "Finance", "exchange": "NYSE"},
-        {"ticker": "PG", "return_pct": 2.3, "sector": "Consumer", "exchange": "NYSE"},
-        {"ticker": "JNJ", "return_pct": 0.8, "sector": "Healthcare", "exchange": "NYSE"},
-        {"ticker": "LLY", "return_pct": 12.5, "sector": "Pharma", "exchange": "NYSE"},
-        {"ticker": "AMD", "return_pct": 6.7, "sector": "Semiconductors", "exchange": "NASDAQ"},
-    ]
-
-    if not hardcoded_stocks:
-        logger.warning(f"[HEATMAP] No stocks in watchlist for user {chat_id}")
-        return None
-
-    # Sort by return descending (best to worst)
-    stocks = sorted(hardcoded_stocks, key=lambda x: x["return_pct"], reverse=True)
-
-    # Extract all returns for percentile calculation
-    all_returns = [s["return_pct"] for s in stocks]
-
-    # Calculate grid dimensions
-    num_stocks = len(stocks)
-    rows = (num_stocks + COLS - 1) // COLS
-    total_height = HEADER_HEIGHT + (rows * CELL_HEIGHT) + ((rows - 1) * GAP) + 20
-
-    # Create image
-    img = Image.new("RGB", (HEATMAP_WIDTH, total_height), color=(250, 250, 250))
-    draw = ImageDraw.Draw(img)
-
-    # Try to load fonts
     try:
-        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
-        font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-        font_cell = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
-        font_return = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
-    except:
-        # Fallback to default font
-        font_title = ImageFont.load_default()
-        font_header = ImageFont.load_default()
-        font_cell = ImageFont.load_default()
-        font_return = ImageFont.load_default()
+        quotes = fmp_client.get_quotes(tickers)
+    except Exception as e:
+        logger.error("[WL-HEATMAP] Batch quote fetch failed: %s", e)
+        log_poller_error("watchlist_heatmap", "build_quote_map", e,
+                         {"ticker_count": len(tickers)})
+        return {}
 
-    # Draw header
-    draw.rectangle([(0, 0), (HEATMAP_WIDTH, HEADER_HEIGHT)], fill=COLOR_HEADER_BG)
+    out = {}
+    for ticker, q in (quotes or {}).items():
+        if not q:
+            continue
+        try:
+            change_p = float(q.get("changePercentage") or 0.0)
+            price = float(q.get("price") or 0.0)
+        except (TypeError, ValueError):
+            logger.warning("[WL-HEATMAP] Unparseable quote for %s", ticker)
+            continue
+        if price <= 0:
+            # A zero price means the symbol did not really resolve; counting it
+            # as covered would let the 75% rule pass on empty data.
+            continue
+        out[ticker.upper()] = {
+            "ticker": ticker.upper(),
+            "change_p": round(change_p, 2),
+            "price": price,
+            "name": q.get("name") or ticker.upper(),
+        }
 
-    # Add Finxray logo text
-    title_text = "GQ FinXray US — Watchlist Heatmap"
-    time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    draw.text((15, 10), title_text, fill=COLOR_HEADER_TEXT, font=font_title)
-    draw.text((15, 45), f"{period} Performance | {time_str}", fill=COLOR_HEADER_TEXT, font=font_header)
-
-    # Draw stock tiles
-    for idx, stock in enumerate(stocks):
-        row = idx // COLS
-        col = idx % COLS
-
-        x = 10 + col * (CELL_WIDTH + GAP)
-        y = HEADER_HEIGHT + 10 + row * (CELL_HEIGHT + GAP)
-
-        ticker = stock["ticker"]
-        return_pct = stock["return_pct"]
-
-        # Get color based on percentile
-        bg_color, text_color = get_color_for_return(return_pct, all_returns)
-
-        # Draw cell background
-        draw.rectangle(
-            [(x, y), (x + CELL_WIDTH, y + CELL_HEIGHT)],
-            fill=bg_color,
-            outline=COLOR_BORDER,
-            width=1
-        )
-
-        # Draw ticker
-        draw.text(
-            (x + 10, y + 15),
-            ticker,
-            fill=text_color,
-            font=font_cell
-        )
-
-        # Draw return percentage
-        return_str = f"{return_pct:+.2f}%"
-        return_color = (0, 150, 0) if return_pct >= 0 else (200, 0, 0)
-        draw.text(
-            (x + 10, y + 50),
-            return_str,
-            fill=return_color,
-            font=font_return
-        )
-
-        # Draw sector
-        sector = stock["sector"][:12]  # Truncate if too long
-        draw.text(
-            (x + 10, y + 80),
-            sector,
-            fill=text_color,
-            font=font_return
-        )
-
-        # Draw exchange
-        exchange = stock["exchange"]
-        draw.text(
-            (x + 10, y + 110),
-            exchange,
-            fill=text_color,
-            font=font_return
-        )
-
-    # Save image
-    output_dir = "media/heatmaps"
-    os.makedirs(output_dir, exist_ok=True)
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    filename = f"watchlist_heatmap_{period.lower()}_{chat_id}_{timestamp}.jpg"
-    filepath = os.path.join(output_dir, filename)
-
-    img.save(filepath, quality=95)
-    logger.info(f"[HEATMAP] Generated: {filepath}")
-
-    return filepath
+    logger.info("[WL-HEATMAP] Resolved %d/%d distinct tickers", len(out), len(tickers))
+    return out
 
 
-def run_watchlist_heatmap_daily():
-    """Generate daily watchlist heatmap (for testing)."""
-    logger.info("[HEATMAP] Generating daily watchlist heatmap...")
+def select_user_rows(tickers, quote_map):
+    """
+    (rows, coverage, omitted) for one user.
 
-    # For hardcoded test: use chat_id = 0
-    filepath = generate_watchlist_heatmap(chat_id=0, period="DAILY")
+    rows      sorted best -> worst, already trimmed for display
+    coverage  share of the user's tickers that resolved to a price
+    omitted   how many mid-table names the trim removed (0 when nothing trimmed)
+    """
+    unique = sorted({(t or "").upper() for t in tickers if t})
+    if not unique:
+        return [], 0.0, 0
 
-    if filepath:
-        logger.info(f"[HEATMAP] Daily heatmap generated: {filepath}")
-    else:
-        logger.warning("[HEATMAP] Failed to generate daily heatmap")
+    resolved = [quote_map[t] for t in unique if t in quote_map]
+    coverage = len(resolved) / len(unique)
+    resolved.sort(key=lambda r: r["change_p"], reverse=True)
+
+    omitted = 0
+    if len(resolved) > TRIM_THRESHOLD:
+        omitted = len(resolved) - (TRIM_HEAD + TRIM_TAIL)
+        resolved = resolved[:TRIM_HEAD] + resolved[-TRIM_TAIL:]
+
+    return resolved, coverage, omitted
+
+
+# ── Rendering ─────────────────────────────────────────────────────────────────
+SLOT_LABELS = {SLOT_MIDDAY: "Midday", SLOT_EOD: "Market Close"}
+
+
+def generate_watchlist_image(rows, username, slot, omitted=0):
+    """Percentile-coloured grid of one user's watchlist. Returns a PIL image."""
+    colors = hs.percentile_colors([r["change_p"] for r in rows])
+    img, draw = hs.new_canvas(len(rows))
+    fonts = hs.load_fonts()
+
+    who = f"{username}'s Watchlist" if username else "Your Watchlist"
+    subtitle = f"{len(rows)} holding{'s' if len(rows) != 1 else ''} · {SLOT_LABELS.get(slot, '')} Performance"
+    if omitted:
+        subtitle += f" · top {TRIM_HEAD} and bottom {TRIM_TAIL} shown"
+
+    hs.draw_header(
+        draw,
+        f"GQ FinXray US — {who}",
+        subtitle,
+        datetime.now(ET).strftime("%B %d, %Y · %I:%M %p ET"),
+        fonts,
+    )
+
+    for i, row in enumerate(rows):
+        hs.draw_tile(draw, i, colors[i], f"#{i + 1}", row["ticker"],
+                     row["change_p"], f"${row['price']:.2f}", fonts)
+
+    hs.draw_footer(draw, img.size[1], fonts=fonts)
+    return img
+
+
+def _summary_line(rows, slot, total_watched, omitted):
+    """Digest stored on the alerts row — readable without the image."""
+    best, worst = rows[0], rows[-1]
+    gainers = sum(1 for r in rows if r["change_p"] > 0)
+    losers = sum(1 for r in rows if r["change_p"] < 0)
+    text = (f"Watchlist heatmap ({SLOT_LABELS.get(slot, slot)}) over {len(rows)} of "
+            f"{total_watched} watched tickers — {gainers} up, {losers} down. "
+            f"Best: {best['ticker']} {best['change_p']:+.2f}%. "
+            f"Worst: {worst['ticker']} {worst['change_p']:+.2f}%.")
+    if omitted:
+        text += f" {omitted} mid-range holdings omitted from the image."
+    return text
+
+
+def _caption(rows, slot, total_watched, omitted):
+    best, worst = rows[0], rows[-1]
+    gainers = sum(1 for r in rows if r["change_p"] > 0)
+    losers = sum(1 for r in rows if r["change_p"] < 0)
+    flat = len(rows) - gainers - losers
+
+    lines = [
+        f"<b>Your Watchlist Heatmap — {SLOT_LABELS.get(slot, '')}</b>",
+        f"{datetime.now(ET).strftime('%B %d, %Y · %I:%M %p ET')}",
+        "",
+        f"Best: <b>{best['ticker']} {best['change_p']:+.2f}%</b> (${best['price']:.2f})",
+        f"Worst: <b>{worst['ticker']} {worst['change_p']:+.2f}%</b> (${worst['price']:.2f})",
+        f"{gainers} up · {losers} down" + (f" · {flat} flat" if flat else ""),
+    ]
+    if omitted:
+        lines += ["", (f"Showing your top {TRIM_HEAD} and bottom {TRIM_TAIL} of "
+                       f"{total_watched} watched tickers — {omitted} mid-range "
+                       f"holdings were left out to keep the image readable.")]
+    lines += ["", "<i>GQ FinXray US · Feature 14 — Watchlist Heatmap</i>"]
+    return "\n".join(lines)
+
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+def already_sent_today(slot):
+    """
+    Set of user_ids that already received this slot today (ET).
+
+    Fetched in one query rather than per user: the alerts row carries the
+    recipient in extra.user_id, so a restart mid-fan-out resumes without
+    re-sending to the users already covered.
+    """
+    try:
+        midnight_et = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
+        rows = (_supabase().table("alerts")
+                .select("extra")
+                .eq("source", SOURCE)
+                .eq("filing_type", slot)
+                .gte("created_at", midnight_et.isoformat())
+                .execute()).data or []
+        return {(r.get("extra") or {}).get("user_id") for r in rows
+                if (r.get("extra") or {}).get("user_id")}
+    except Exception as e:
+        # Fail open — a dedup outage should not silence the feature.
+        logger.warning("[WL-HEATMAP] Dedup lookup failed for %s (%s); proceeding", slot, e)
+        return set()
+
+
+def save_user_record(user, slot, summary, rows, total_watched, omitted, sent, failed):
+    """
+    One alerts row per user per slot, already marked delivered.
+
+    delivered=True matters: the image has been sent from here, and the text
+    fan-out in delivery.py must not pick the row up and re-post it as an
+    image-less stub.
+    """
+    try:
+        extra = tag_extra({
+            "user_id": user["user_id"],
+            "username": user.get("username"),
+            "rendered": len(rows),
+            "watched": total_watched,
+            "omitted": omitted,
+            "sent": sent,
+            "failed": failed,
+            "holdings": [{"ticker": r["ticker"], "change_p": r["change_p"]} for r in rows],
+        }, SOURCE, slot)
+
+        _supabase().table("alerts").insert({
+            "ticker": "WATCHLIST",
+            "summary": summary,
+            "impact": "LOW",
+            "source": SOURCE,
+            "filing_type": slot,
+            "delivered": True,
+            "extra": extra,
+        }).execute()
+    except Exception as e:
+        logger.error("[WL-HEATMAP] Failed to save alerts row for user %s: %s",
+                     user.get("user_id"), e)
+        log_poller_error("watchlist_heatmap", slot, e,
+                         {"stage": "save_record", "user_id": user.get("user_id")})
+
+
+# ── Run body ──────────────────────────────────────────────────────────────────
+def _run(slot):
+    """Shared body for both slots. Never raises."""
+    stats = {"sent": 0, "skipped_empty": 0, "skipped_coverage": 0, "skipped_dup": 0, "failed": 0}
+    try:
+        if not is_trading_day():
+            logger.info("[WL-HEATMAP] %s skipped — market closed today", slot)
+            return
+
+        from delivery import list_users_with_watchlists, deliver_photo_sync
+
+        pairs = list_users_with_watchlists()
+        if not pairs:
+            logger.info("[WL-HEATMAP] %s: no active users with a watchlist", slot)
+            return
+
+        done = already_sent_today(slot)
+        pending = [(u, t) for u, t in pairs if u["user_id"] not in done]
+        stats["skipped_dup"] = len(pairs) - len(pending)
+        if not pending:
+            logger.info("[WL-HEATMAP] %s already sent to all %d user(s)", slot, len(pairs))
+            return
+
+        # One quote pass across every distinct ticker any pending user watches.
+        universe = {t for _, tickers in pending for t in tickers}
+        quote_map = build_quote_map(universe)
+        if not quote_map:
+            msg = f"No quotes resolved for {len(universe)} watchlist tickers; skipping {slot}"
+            logger.error("[WL-HEATMAP] %s", msg)
+            log_poller_error("watchlist_heatmap", slot, msg, {"ticker_count": len(universe)})
+            return
+
+        stamp = datetime.now(ET).strftime("%Y%m%d_%H%M%S")
+
+        for user, tickers in pending:
+            uid = user["user_id"]
+            if not tickers:
+                stats["skipped_empty"] += 1
+                logger.info("[WL-HEATMAP] User %s skipped — empty watchlist", uid)
+                continue
+
+            rows, coverage, omitted = select_user_rows(tickers, quote_map)
+            total_watched = len({t.upper() for t in tickers if t})
+
+            if not rows or coverage < MIN_COVERAGE:
+                stats["skipped_coverage"] += 1
+                logger.info("[WL-HEATMAP] User %s skipped — only %.0f%% of %d watched tickers "
+                            "resolved to a price (need %.0f%%)",
+                            uid, coverage * 100, total_watched, MIN_COVERAGE * 100)
+                continue
+
+            try:
+                img = generate_watchlist_image(rows, user.get("username"), slot, omitted)
+                path = hs.save_image(img, f"watchlist_heatmap_{slot}_{uid}_{stamp}.jpg")
+            except Exception as e:
+                stats["failed"] += 1
+                logger.error("[WL-HEATMAP] Render failed for user %s: %s", uid, e)
+                log_poller_error("watchlist_heatmap", slot, e,
+                                 {"stage": "render", "user_id": uid})
+                continue
+
+            caption = _caption(rows, slot, total_watched, omitted)
+            sent, failed = deliver_photo_sync(path, caption, SOURCE, slot, user_id=uid)
+
+            if sent == 0:
+                stats["failed"] += 1
+                logger.warning("[WL-HEATMAP] User %s: photo not delivered (failed=%d)", uid, failed)
+                continue
+
+            save_user_record(user, slot,
+                             _summary_line(rows, slot, total_watched, omitted),
+                             rows, total_watched, omitted, sent, failed)
+            stats["sent"] += 1
+
+        logger.info("[WL-HEATMAP] %s — sent=%d skipped(dup)=%d skipped(empty)=%d "
+                    "skipped(coverage)=%d failed=%d",
+                    slot, stats["sent"], stats["skipped_dup"], stats["skipped_empty"],
+                    stats["skipped_coverage"], stats["failed"])
+    except Exception as e:
+        logger.exception("[WL-HEATMAP] %s failed: %s", slot, e)
+        log_poller_error("watchlist_heatmap", slot, e, stats)
+    finally:
+        hs.cleanup_old_images()
+
+
+# ── Entry points (imported by main.py — names are a contract) ─────────────────
+def run_watchlist_heatmap_midday():
+    _run(SLOT_MIDDAY)
+
+
+def run_watchlist_heatmap_eod():
+    _run(SLOT_EOD)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run_watchlist_heatmap_daily()
+    run_watchlist_heatmap_midday()

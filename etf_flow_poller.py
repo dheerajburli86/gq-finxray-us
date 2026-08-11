@@ -1,157 +1,283 @@
 """
 etf_flow_poller.py
-GQ FinXray US — Feature 7. Rewritten on Massive (was EODHD).
+GQ FinXray US — Feature 7. Unusual volume + price movement across a fixed ETF set.
 
-Simplification vs the EODHD version: EODHD needed two calls per ETF
-(real-time quote, then a separate 20-day EOD history pull just to compute
-average volume). Massive's single-ticker snapshot
-(/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}) returns today's
-day.v (volume) AND prevDay.v (prior session volume) in one response, so
-the volume-ratio check here is a same-day-vs-prior-session comparison in
-one call instead of two. (Prior session vs a rolling 20-day average is a
-slightly different baseline — noted in case the alert cadence looks
-different than before; can layer a rolling average back in via
-massive_client.get_aggregates() if the 1-day baseline proves too noisy.)
+WHAT THIS FEATURE ACTUALLY OBSERVES — AND WHAT IT DOES NOT
+----------------------------------------------------------
+The only inputs here are price and exchange volume. That is NOT fund flow data.
+Actual ETF creations and redemptions are reported by the issuer after the close;
+secondary-market volume is a different thing entirely, and a heavily traded
+session can be a wash between buyers and sellers with no net creation at all.
+The previous version's copy asserted "institutional buying likely" off nothing
+but a volume ratio, which is a claim the data cannot support. Every string in
+this module is worded as what was measured — unusual volume alongside a price
+move — and the summaries say outright that creation/redemption data is not
+observed. Do not reintroduce flow language here.
 
-Runs every 60 minutes via scheduler in main.py.
+FIXES OVER THE PREVIOUS VERSION
+-------------------------------
+* Added a US market-hours guard. It previously ran hourly around the clock, so
+  overnight and weekend runs compared a frozen post-close snapshot against the
+  prior session and re-derived the same "signal" from stale numbers.
+* Volume ratio is now measured against the volume expected by this point in the
+  session, not against the prior session's full-day total. The old maths made an
+  intraday 1.5x threshold unreachable before roughly 14:00.
+* Failures write to `poller_error_log`; previously they went to the logger only
+  and disappeared with the container.
+* Dedup is one batched query and fails closed.
+
+The ETF universe is deliberately fixed and market-wide (feature_map marks
+feature 7 `market_wide=True`), so these alerts are not watchlist-scoped —
+delivery.py routes them to users who have not opted out of market-wide messages.
 """
 
+import os
 import logging
-from datetime import datetime, timezone, date
+from datetime import datetime
+
 from dotenv import load_dotenv
 from supabase import create_client
-import os
 
 import massive_client
 from feature_map import tag_extra
+from watchlist_util import log_poller_error
+
+# The session clock lives in technical_poller as the single canonical
+# implementation. Two copies of a market-hours window is exactly how this
+# codebase ended up running the US market on India's 09:00-17:30 schedule.
+from technical_poller import ET, is_market_open, session_volume_fraction
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
+SOURCE = "ETF_FLOW"
+POLLER = "etf_flow_poller"
+
+# Both conditions must hold. Volume alone is often an index rebalance or an
+# options expiry; a price move alone is just a normal directional day.
 VOLUME_SPIKE_THRESHOLD = 1.5
 PRICE_MOVE_THRESHOLD = 1.0
 
+# Same rationale as technical_poller: the opening auction distorts any
+# volume-pace comparison until roughly half an hour into the session.
+MIN_SESSION_ELAPSED = 0.08
+
 ETF_UNIVERSE = [
-    {"ticker": "SPY",  "name": "S&P 500 ETF",                "category": "Broad Market"},
-    {"ticker": "QQQ",  "name": "NASDAQ 100 ETF",              "category": "Technology"},
-    {"ticker": "IWM",  "name": "Russell 2000 ETF",            "category": "Small Cap"},
-    {"ticker": "XLK",  "name": "Technology Select ETF",       "category": "Technology"},
-    {"ticker": "XLF",  "name": "Financial Select ETF",        "category": "Finance"},
-    {"ticker": "XLE",  "name": "Energy Select ETF",           "category": "Energy"},
-    {"ticker": "XLV",  "name": "Health Care Select ETF",      "category": "Healthcare"},
-    {"ticker": "XLI",  "name": "Industrial Select ETF",       "category": "Industrials"},
-    {"ticker": "XLY",  "name": "Consumer Discretionary ETF",  "category": "Consumer"},
-    {"ticker": "GLD",  "name": "Gold ETF",                    "category": "Commodities"},
-    {"ticker": "TLT",  "name": "20+ Year Treasury ETF",       "category": "Bonds"},
+    {"ticker": "SPY", "name": "S&P 500 ETF",               "category": "Broad Market"},
+    {"ticker": "QQQ", "name": "NASDAQ 100 ETF",            "category": "Technology"},
+    {"ticker": "IWM", "name": "Russell 2000 ETF",          "category": "Small Cap"},
+    {"ticker": "XLK", "name": "Technology Select ETF",     "category": "Technology"},
+    {"ticker": "XLF", "name": "Financial Select ETF",      "category": "Finance"},
+    {"ticker": "XLE", "name": "Energy Select ETF",         "category": "Energy"},
+    {"ticker": "XLV", "name": "Health Care Select ETF",    "category": "Healthcare"},
+    {"ticker": "XLI", "name": "Industrial Select ETF",     "category": "Industrials"},
+    {"ticker": "XLY", "name": "Consumer Discretionary ETF", "category": "Consumer"},
+    {"ticker": "GLD", "name": "Gold ETF",                  "category": "Commodities"},
+    {"ticker": "TLT", "name": "20+ Year Treasury ETF",     "category": "Bonds"},
 ]
 
-
-def get_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+ETF_BY_TICKER = {e["ticker"]: e for e in ETF_UNIVERSE}
 
 
-def already_sent_today(ticker, flow_direction):
-    sb = get_supabase()
-    today = date.today().isoformat()
-    result = sb.table("alerts") \
-        .select("id") \
-        .eq("ticker", ticker) \
-        .eq("source", "ETF_FLOW") \
-        .eq("filing_type", flow_direction) \
-        .gte("created_at", f"{today}T00:00:00+00:00") \
-        .execute()
-    return len(result.data) > 0
-
-
-def save_alert(ticker, filing_type, summary, impact, extra=None):
-    sb = get_supabase()
-    sb.table("alerts").insert({
-        "ticker": ticker,
-        "summary": summary,
-        "impact": impact,
-        "source": "ETF_FLOW",
-        "filing_type": filing_type,
-        "delivered": False,
-        "extra": tag_extra(extra, "ETF_FLOW", filing_type),
-        "filing_url": None
-    }).execute()
-    logger.info(f"[ETF FLOW] Saved alert: {ticker} | {filing_type} | {impact}")
-
-
-def check_etf(etf_info):
-    ticker = etf_info["ticker"]
-    name = etf_info["name"]
-    category = etf_info["category"]
-
-    snap = massive_client.get_snapshot(ticker)
-    if not snap:
+def _num(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    try:
+        cleaned = str(value).replace(",", "").replace("$", "").strip()
+        return float(cleaned) if cleaned else None
+    except (TypeError, ValueError):
         return None
 
-    day = snap.get("day", {}) or {}
-    prev = snap.get("prevDay", {}) or {}
-    price = day.get("c") or prev.get("c")
-    prev_close = prev.get("c")
-    volume = day.get("v")
-    prev_volume = prev.get("v")
+
+def load_sent_today():
+    """
+    {(ticker, filing_type)} already alerted today from ET midnight, or None if
+    the ledger could not be read — in which case the run must emit nothing
+    rather than risk duplicating alerts users already received.
+    """
+    midnight_et = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        rows = (supabase.table("alerts")
+                .select("ticker, filing_type")
+                .eq("source", SOURCE)
+                .gte("created_at", midnight_et.isoformat())
+                .execute()).data or []
+    except Exception as e:
+        log_poller_error(POLLER, "load_sent_today", e)
+        logger.error("[ETF FLOW] Dedup ledger unreadable (%s) — emitting nothing this run", e)
+        return None
+    return {((r.get("ticker") or "").upper(), r.get("filing_type")) for r in rows}
+
+
+def fetch_etf_snapshots():
+    """
+    day + prevDay OHLCV for the whole ETF universe in ONE call. Falls back to
+    per-ticker snapshots only if the filtered market snapshot comes back empty.
+    """
+    tickers = [e["ticker"] for e in ETF_UNIVERSE]
+    try:
+        rows = massive_client.get_full_market_snapshot(tickers=tickers)
+    except Exception as e:
+        log_poller_error(POLLER, "get_full_market_snapshot", e)
+        rows = []
+
+    if not rows:
+        rows = []
+        for t in tickers:
+            try:
+                snap = massive_client.get_snapshot(t)
+            except Exception as e:
+                log_poller_error(POLLER, "get_snapshot", e, {"ticker": t})
+                continue
+            if snap:
+                rows.append(snap)
+
+    return {(r.get("ticker") or "").upper(): r for r in rows}
+
+
+def evaluate_etf(ticker, snap, elapsed_fraction):
+    """
+    Returns an `alerts` row dict when the volume-and-price conditions both hold,
+    otherwise None. Pure — no I/O, so the thresholds are trivially testable.
+    """
+    info = ETF_BY_TICKER[ticker]
+    day = snap.get("day") or {}
+    prev = snap.get("prevDay") or {}
+
+    price = _num(day.get("c")) or _num(prev.get("c"))
+    prev_close = _num(prev.get("c"))
+    volume = _num(day.get("v"))
+    prev_volume = _num(prev.get("v"))
 
     if not price or not prev_close or not volume or not prev_volume:
         return None
 
-    change_p = ((price - prev_close) / prev_close) * 100
-    volume_ratio = volume / prev_volume
-
-    if volume_ratio < VOLUME_SPIKE_THRESHOLD:
+    change_pct = (price - prev_close) / prev_close * 100.0
+    expected = prev_volume * elapsed_fraction
+    if expected <= 0:
         return None
-    if abs(change_p) < PRICE_MOVE_THRESHOLD:
+    volume_ratio = volume / expected
+
+    if volume_ratio < VOLUME_SPIKE_THRESHOLD or abs(change_pct) < PRICE_MOVE_THRESHOLD:
         return None
 
-    if change_p > 0:
-        flow, emoji, signal = "INFLOW", "🟢", "Bullish flow — institutional buying likely"
+    if change_pct > 0:
+        filing_type = "INFLOW"
+        headline = "Heavy Volume Alongside A Price Gain"
+        reading = "consistent with net buying interest"
     else:
-        flow, emoji, signal = "OUTFLOW", "🔴", "Bearish flow — institutional selling likely"
+        filing_type = "OUTFLOW"
+        headline = "Heavy Volume Alongside A Price Decline"
+        reading = "consistent with net selling pressure"
+
     impact = "HIGH" if volume_ratio >= 2.0 else "MEDIUM"
+    sign = "+" if change_pct > 0 else ""
 
-    if already_sent_today(ticker, flow):
-        logger.info(f"[ETF FLOW] Already sent {flow} for {ticker} today, skipping.")
-        return None
-
-    sign = "+" if change_p > 0 else ""
     summary = (
-        f"{emoji} *ETF Flow Alert — ${ticker}*\n\n"
-        f"*ETF:* {name} ({category})\n"
-        f"*Price:* ${price:.2f} ({sign}{change_p:.2f}%)\n"
-        f"*Volume:* {int(volume):,} ({volume_ratio:.1f}x prior session)\n"
-        f"*Flow:* {flow}\n"
-        f"*Signal:* {signal}\n"
-        f"_Source: Massive ETF Snapshot | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
+        f"{info['name']} ({ticker}, {info['category']}) has traded {int(volume):,} shares "
+        f"so far today, roughly {volume_ratio:.1f}x the {int(expected):,} shares a normal "
+        f"session would have on the tape by this point. It is at ${price:,.2f}, "
+        f"{sign}{change_pct:.2f}% against the prior close of ${prev_close:,.2f}. "
+        f"Unusual volume with a move of this size is {reading}, though this is "
+        f"secondary-market trading activity — actual creation and redemption flows are "
+        f"reported by the issuer after the close and are not observed here."
     )
 
-    save_alert(ticker, flow, summary, impact, {
-        "name": name, "category": category, "price": price,
-        "change_p": round(change_p, 2), "volume": int(volume),
-        "prev_volume": int(prev_volume), "volume_ratio": round(volume_ratio, 2),
-        "flow": flow, "signal": signal
-    })
+    extra = tag_extra({
+        "headline": headline,
+        "name": info["name"],
+        "category": info["category"],
+        "price": price,
+        "prev_close": prev_close,
+        "change_pct": round(change_pct, 2),
+        "volume": int(volume),
+        "prev_volume": int(prev_volume),
+        "expected_volume_so_far": int(expected),
+        "volume_ratio": round(volume_ratio, 2),
+        "session_elapsed_fraction": round(elapsed_fraction, 3),
+        "signal_basis": "price_and_volume_only",
+    }, SOURCE, filing_type)
 
-    return flow
+    # Build FMP link for ETF flow alerts (clickable source)
+    filing_url = f"https://site.financialmodelingprep.com/etf/{ticker.upper()}"
+
+    return {
+        "ticker": ticker,
+        "summary": summary,
+        "impact": impact,
+        "source": SOURCE,
+        "filing_type": filing_type,
+        "delivered": False,
+        "extra": extra,
+        "filing_url": filing_url,
+    }
+
+
+def _write_alerts(rows):
+    if not rows:
+        return 0
+    try:
+        supabase.table("alerts").insert(rows).execute()
+        return len(rows)
+    except Exception as e:
+        log_poller_error(POLLER, "write_alerts", e, {"tickers": [r["ticker"] for r in rows]})
+        return 0
 
 
 def run_etf_flow_poller():
-    logger.info("[ETF FLOW] Starting ETF flow poller (Massive)...")
-    alerts_generated = 0
-    for etf in ETF_UNIVERSE:
-        try:
-            result = check_etf(etf)
-            if result:
-                alerts_generated += 1
-                logger.info(f"[ETF FLOW] {etf['ticker']} — {result} signal fired")
-        except Exception as e:
-            logger.error(f"[ETF FLOW] Error checking {etf['ticker']}: {e}")
-    logger.info(f"[ETF FLOW] Done. {len(ETF_UNIVERSE)} ETFs checked, {alerts_generated} alerts generated.")
+    """One full pass over the ETF universe. Never raises."""
+    try:
+        now_et = datetime.now(ET)
+        if not is_market_open(now_et):
+            logger.info("[ETF FLOW] Outside US regular hours (09:30-16:00 ET, Mon-Fri) — skipping.")
+            return
+
+        elapsed = session_volume_fraction(now_et)
+        if elapsed < MIN_SESSION_ELAPSED:
+            logger.info("[ETF FLOW] Only %.0f%% of the session's expected volume has elapsed — "
+                        "too early for a reliable volume comparison. Skipping.", elapsed * 100)
+            return
+
+        sent = load_sent_today()
+        if sent is None:
+            return
+
+        snapshots = fetch_etf_snapshots()
+        if not snapshots:
+            log_poller_error(POLLER, "fetch_etf_snapshots",
+                             "No snapshot data returned for any ETF in the universe")
+            return
+
+        rows = []
+        for etf in ETF_UNIVERSE:
+            ticker = etf["ticker"]
+            snap = snapshots.get(ticker)
+            if not snap:
+                continue
+            try:
+                row = evaluate_etf(ticker, snap, elapsed)
+            except Exception as e:
+                log_poller_error(POLLER, "evaluate_etf", e, {"ticker": ticker})
+                continue
+            if not row:
+                continue
+            if (ticker, row["filing_type"]) in sent:
+                continue
+            sent.add((ticker, row["filing_type"]))
+            rows.append(row)
+
+        written = _write_alerts(rows)
+        logger.info("[ETF FLOW] Done. %d/%d ETFs priced, %d alerts written.",
+                    len(snapshots), len(ETF_UNIVERSE), written)
+
+    except Exception as e:
+        log_poller_error(POLLER, "run_etf_flow_poller", e)
+        logger.exception("[ETF FLOW] Run failed: %s", e)
 
 
 if __name__ == "__main__":
