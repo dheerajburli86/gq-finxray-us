@@ -1,11 +1,8 @@
+"""Prompt_P2_GibberishChecker.py — Reject gibberish/lorem ipsum output"""
+
 def get_prompt(text):
+    return f"""Is this text gibberish, lorem ipsum, or nonsensical? Respond with JSON only:
+{{"is_gibberish": true/false}}
 
-    prompt = f"""
-            <INST>
-
-            Analyze the text below. If it is gibberish, respond with {{"is_gibberish":true}}. If it is meaningful, respond with {{"is_gibberish":false}}. Ensure your response strictly adheres to this JSON format.
-
-            Text: {text}
-            </INST>"""
-
-    return prompt
+Text:
+{text[:2000]}"""
