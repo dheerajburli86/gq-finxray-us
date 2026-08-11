@@ -10,17 +10,13 @@ Mapping is keyed by (source, filing_type) since that is what every poller
 already stores. `resolve_feature()` does a best-effort match; if nothing matches
 it falls back to feature 0 ("Unmapped") rather than crashing.
 
-NEW IN THIS REVISION
---------------------
-* `is_market_wide()` — tells the delivery layer whether an alert is scoped to a
-  single ticker (deliver only to users watching that ticker) or is a broad
-  market message with no meaningful ticker (sector heatmap, IPO calendar, macro
-  digest). Without this the delivery layer has no way to route an alert whose
-  ticker is "MARKET" or an IPO symbol nobody can have watchlisted yet.
-* Features 12 and 13 registered so analyst-rating and macro alerts stop
-  resolving to "Unmapped".
-* `LARGE_TRADE` registered under feature 5 — it is the second-highest-volume
-  source in production and was previously unmapped in this file.
+WATCHLIST-ONLY DELIVERY
+-______________________
+All features are now watchlist-scoped. The `is_market_wide()` function is kept for
+backwards compatibility but always returns False. Users only receive alerts for
+companies on their watchlist — there are no broadcast features. Alerts about IPOs,
+sector heatmaps, macro digests, and ETF flows are dropped if the ticker is not
+watchlisted.
 """
 
 FEATURES = {
@@ -75,16 +71,14 @@ FEATURES = {
         "detail": "Institutional inflow/outflow signal from ETF volume + price-move thresholds.",
         "sources": {"ETF_FLOW"},
         "filing_types": {"INFLOW", "OUTFLOW"},
-        "market_wide": True,
+        "market_wide": False,
     },
     8: {
         "name": "IPO Deep Dive",
         "detail": "Upcoming US IPO alerts — pricing, share count, deal size, listing date.",
         "sources": {"FMP_IPO"},
         "filing_types": {"IPO_UPCOMING"},
-        # An IPO ticker cannot be on anyone's watchlist before it lists, so
-        # routing this by watchlist would deliver it to nobody, ever.
-        "market_wide": True,
+        "market_wide": False,
     },
     9: {
         "name": "Sector Heatmap",
@@ -92,14 +86,14 @@ FEATURES = {
         "sources": {"SECTOR_HEATMAP"},
         "filing_types": {"HEATMAP_DAILY_MIDDAY", "HEATMAP_DAILY_AFTERNOON",
                          "HEATMAP_WEEKLY", "HEATMAP_MONTHLY"},
-        "market_wide": True,
+        "market_wide": False,
     },
     10: {
         "name": "ETF Xray",
         "detail": "Structured ETF fundamentals snapshot — expense ratio, AUM, holdings.",
         "sources": {"ETF_XRAY"},
         "filing_types": {"ETF_XRAY"},
-        "market_wide": True,
+        "market_wide": False,
     },
     11: {
         "name": "Earnings Call Transcripts",
@@ -121,7 +115,7 @@ FEATURES = {
         "detail": "Fed decisions, Treasury yields, jobs/inflation prints, commodities, USD.",
         "sources": {"MACRO_ROUNDUP"},
         "filing_types": {"MACRO_BRIEFING"},
-        "market_wide": True,
+        "market_wide": False,
     },
 }
 

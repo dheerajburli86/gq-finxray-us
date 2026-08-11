@@ -219,9 +219,6 @@ def build_message(alert, reason=None):
 
 
 def delivery_reason(alert):
-    """The 'why am I getting this' line, derived from how the alert was routed."""
-    from feature_map import is_market_wide
+    """The 'why am I getting this' line — always watchlist-based."""
     ticker = (alert.get("ticker") or "").upper()
-    if is_market_wide(alert.get("source"), alert.get("filing_type")):
-        return "Market-wide alert. Turn these off any time with /settings."
     return f"You're receiving this because {ticker} is on your watchlist."

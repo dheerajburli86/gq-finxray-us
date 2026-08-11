@@ -54,12 +54,7 @@ from Prompt_S1N_NewsSummarization import get_prompt as s1n_prompt
 from Prompt_S1A_AnnouncementSummarization import get_prompt as s1a_prompt
 from Prompt_S1T_TranscriptSummarization import get_prompt as s1t_prompt
 from Prompt_H1_HeadlineGeneration import get_prompt as h1_prompt
-from feature_map import resolve_feature, is_market_wide
-
-# Helper to check if a source/filing_type combination is market-wide
-def is_market_wide_content(source, filing_type):
-    """True if this alert type is broadcast to all users (no watchlist match needed)."""
-    return is_market_wide(source, filing_type)
+from feature_map import resolve_feature
 
 # ── Word-count escalation ladder ──────────────────────────────────────────────
 MIN_WORDS = 70
@@ -441,19 +436,12 @@ def process_filing(filing, watched=None):
     sub_summary  = extra.get("title", "")
 
     # ── Stage 0: is anyone watching this company? ────────────────────────────
+    # Enforce watchlist gate strictly. No exceptions, no market-wide bypass.
+    # All alerts (IPO, macro, sector, ETF) require the ticker to be on a watchlist.
     if not PROCESS_ALL_TICKERS:
         watched = watched if watched is not None else get_watched_tickers()
-        # Allow market-wide content (ticker="MARKET") or watched-list items
-        # If ticker="MARKET" and this is a news source that SHOULD be market-wide,
-        # skip the watchlist gate entirely. Otherwise, enforce watchlist.
-        if ticker not in ("MARKET", "UNKNOWN"):
-            if ticker not in watched:
-                update_filing_status(filing_id, "SKIPPED_UNWATCHED")
-                return
-        elif ticker == "MARKET" and not is_market_wide_content(source, filing_type):
-            # ticker="MARKET" on a ticker-scoped feature = delivery will reject it anyway
-            # Skip rather than waste LLM cycles
-            update_filing_status(filing_id, "SKIPPED_MARKET_NOT_APPLICABLE")
+        if ticker not in watched:
+            update_filing_status(filing_id, "SKIPPED_UNWATCHED")
             return
 
     print(f"\n[PROCESSING] {filing_type} -- {company_name} ({ticker}) [source={source}]")

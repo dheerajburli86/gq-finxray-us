@@ -6,14 +6,11 @@ THE RULE THIS MODULE ENFORCES
 -----------------------------
 A user receives an alert about a company if, and only if, that company is on
 their watchlist. Nothing else. There is no firehose channel, no "everyone gets
-everything" path, no default subscription to the whole market.
+everything" path, no default subscription to the whole market, and no exceptions.
 
-The only exception is a small set of features that have no meaningful ticker to
-match against — the sector heatmap, the IPO calendar (an IPO ticker cannot be on
-a watchlist before it lists), the ETF Xray and the macro digest. Those are
-flagged `market_wide=True` in feature_map.py and go to users who have not turned
-them off (`user_preferences.receive_market_wide`). Everything else is strictly
-watchlist-scoped.
+All features — including IPO alerts, sector heatmaps, macro digests, and ETF
+flows — are routed strictly by watchlist ticker. Alerts about unwatchlisted
+symbols are silently skipped at delivery time.
 
 WHY alerts.delivered IS NOT ENOUGH ANY MORE
 -------------------------------------------
@@ -44,7 +41,7 @@ from telegram.constants import ParseMode
 from telegram.error import RetryAfter, Forbidden, BadRequest
 
 from alert_formatter import build_message, delivery_reason
-from feature_map import is_market_wide, resolve_feature
+from feature_map import resolve_feature
 
 load_dotenv()
 
@@ -93,7 +90,7 @@ def _fetch_active_users():
                  .eq("is_active", True)
                  .execute()).data or []
         prefs = (supabase.table("user_preferences")
-                 .select("user_id, min_impact, receive_market_wide, muted_features, max_alerts_per_day")
+                 .select("user_id, min_impact, muted_features, max_alerts_per_day")
                  .execute()).data or []
     except Exception as e:
         logger.error(f"[DELIVERY] Failed to load users/preferences: {e}")
@@ -112,7 +109,6 @@ def _fetch_active_users():
             "chat_id": str(chat_id),
             "username": u.get("telegram_username"),
             "min_impact": (p.get("min_impact") or "MEDIUM").upper(),
-            "receive_market_wide": p.get("receive_market_wide", True),
             "muted_features": set(p.get("muted_features") or []),
             "max_alerts_per_day": p.get("max_alerts_per_day") or 200,
         }
@@ -186,7 +182,8 @@ def resolve_audience(alert, users, watchers):
     Who should receive this alert, and why.
     Returns a list of (user_dict, reason_string).
 
-    This is the single place the watchlist rule is applied. Nothing bypasses it.
+    Strict watchlist routing. No exceptions, no market-wide bypass.
+    An alert is delivered only to users watching the alert's ticker.
     """
     source      = alert.get("source")
     filing_type = alert.get("filing_type")
@@ -195,18 +192,15 @@ def resolve_audience(alert, users, watchers):
     fid, _      = resolve_feature(source, filing_type)
     alert_rank  = IMPACT_RANK.get(impact, 1)
 
-    if is_market_wide(source, filing_type):
-        candidates = [u for u in users.values() if u["receive_market_wide"]]
-        reason = "Market-wide alert. Turn these off any time with /settings."
-    else:
-        if not ticker or ticker in ("MARKET", "UNKNOWN"):
-            # A ticker-scoped feature with no usable ticker cannot be routed to
-            # anyone without violating the watchlist rule. Drop it rather than
-            # guess — and say so in the ledger so it is visible, not silent.
-            return []
-        uids = watchers.get(ticker, set())
-        candidates = [users[uid] for uid in uids if uid in users]
-        reason = f"You're receiving this because {ticker} is on your watchlist."
+    # All features are watchlist-scoped. No ticker = no delivery.
+    if not ticker or ticker in ("MARKET", "UNKNOWN"):
+        # An alert with no usable ticker cannot be routed to anyone.
+        # Drop it; it should have been filtered in ai_pipeline Stage 0.
+        return []
+
+    uids = watchers.get(ticker, set())
+    candidates = [users[uid] for uid in uids if uid in users]
+    reason = f"You're receiving this because {ticker} is on your watchlist."
 
     audience = []
     for u in candidates:
@@ -284,7 +278,6 @@ async def deliver_pending_alerts():
     tickers = {
         (a.get("ticker") or "").upper()
         for a in alerts
-        if not is_market_wide(a.get("source"), a.get("filing_type"))
     }
     watchers = _fetch_watchers(sorted(t for t in tickers if t and t not in ("MARKET", "UNKNOWN")))
 
@@ -357,12 +350,13 @@ async def deliver_photo(image_path, caption, source, filing_type,
     Send an image (heatmap) to the correct audience.
 
     The text fan-out above cannot carry an image, so heatmap modules call this
-    directly — but they still go through the same audience rules rather than
-    blasting a shared channel:
+    directly — but they still go through the same audience rules:
 
       user_id given  -> personal heatmap, that one user only
-      user_id None   -> market-wide heatmap, every active user who has not set
-                        `receive_market_wide = false`
+      user_id None   -> no broadcast heatmaps; this function is only for personal delivery
+
+    All heatmaps are now watchlist-scoped (e.g., sector heatmap only to users
+    whose watchlist contains a sector index).
 
     Returns (sent_count, failed_count).
     """
@@ -370,7 +364,8 @@ async def deliver_photo(image_path, caption, source, filing_type,
     if user_id is not None:
         targets = [users[user_id]] if user_id in users else []
     else:
-        targets = [u for u in users.values() if u["receive_market_wide"]]
+        # No broadcast heatmaps anymore. Return empty.
+        targets = []
 
     if not targets:
         logger.info("[DELIVERY] Photo %s: no eligible recipients", filing_type)

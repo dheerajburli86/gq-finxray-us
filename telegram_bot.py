@@ -103,7 +103,7 @@ def get_prefs(user_id):
             return rows[0]
     except Exception as e:
         logger.error("[BOT] get_prefs failed: %s", e)
-    return {"min_impact": "MEDIUM", "receive_market_wide": True, "max_alerts_per_day": 200}
+    return {"min_impact": "MEDIUM", "max_alerts_per_day": 200}
 
 
 def lookup_stock(ticker):
@@ -315,23 +315,15 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         parse_mode=ParseMode.HTML)
         return
 
-    if len(args) >= 2 and args[0] == "market":
-        on = args[1] in ("on", "yes", "true", "1")
-        supabase.table("user_preferences").update({"receive_market_wide": on}).eq("user_id", user["id"]).execute()
-        await update.message.reply_text(
-            f"✅ Market-wide alerts (sector heatmap, IPOs, macro digest) are now <b>{'on' if on else 'off'}</b>.",
-            parse_mode=ParseMode.HTML)
-        return
-
     p = get_prefs(user["id"])
     await update.message.reply_text(
         "<b>Your settings</b>\n\n"
         f"Minimum impact: <b>{p.get('min_impact', 'MEDIUM')}</b>\n"
-        f"Market-wide alerts: <b>{'on' if p.get('receive_market_wide', True) else 'off'}</b>\n"
         f"Daily limit: <b>{p.get('max_alerts_per_day', 200)}</b> alerts\n\n"
         "Change them:\n"
         "<code>/settings impact high</code>\n"
-        "<code>/settings market off</code>",
+        "<code>/settings impact medium</code>\n"
+        "<code>/settings impact low</code>",
         parse_mode=ParseMode.HTML,
     )
 
