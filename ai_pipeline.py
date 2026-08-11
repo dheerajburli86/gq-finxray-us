@@ -289,7 +289,8 @@ def classify_failure(summary, max_words, min_words=MIN_WORDS):
 # ── S.1 / S.3 ─────────────────────────────────────────────────────────────────
 def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_word_count=MIN_WORDS):
     if filing_type == "NEWS":
-        prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT])
+        prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT],
+                            target_word_count=STARTING_TARGET, min_word_count=min_word_count)
     elif filing_type == "EARNINGS_TRANSCRIPT":
         prompt = s1t_prompt(company_name, sub_summary, raw_text[:TRANSCRIPT_CHAR_LIMIT],
                             target_word_count=STARTING_TARGET, min_word_count=min_word_count)
