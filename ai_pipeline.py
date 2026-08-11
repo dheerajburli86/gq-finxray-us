@@ -287,15 +287,15 @@ def classify_failure(summary, max_words, min_words=MIN_WORDS):
 
 
 # ── S.1 / S.3 ─────────────────────────────────────────────────────────────────
-def generate_s1(company_name, raw_text, filing_type="", sub_summary=""):
+def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_word_count=MIN_WORDS):
     if filing_type == "NEWS":
         prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT])
     elif filing_type == "EARNINGS_TRANSCRIPT":
         prompt = s1t_prompt(company_name, sub_summary, raw_text[:TRANSCRIPT_CHAR_LIMIT],
-                            target_word_count=STARTING_TARGET, min_word_count=MIN_WORDS)
+                            target_word_count=STARTING_TARGET, min_word_count=min_word_count)
     else:
         prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
-                            target_word_count=STARTING_TARGET, min_word_count=MIN_WORDS)
+                            target_word_count=STARTING_TARGET, min_word_count=min_word_count)
     return call_deepinfra(prompt, max_tokens=600)
 
 
@@ -344,7 +344,7 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     min_words, max_target = word_bounds(raw_text, filing_type)
     target = min(STARTING_TARGET, max_target)
 
-    raw = generate_s1(company_name, raw_text, filing_type, sub_summary)
+    raw = generate_s1(company_name, raw_text, filing_type, sub_summary, min_word_count=min_words)
     summary = standardize_numbers(clean_summary(raw)) if raw else None
     failure = classify_failure(summary, target, min_words)
     attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
