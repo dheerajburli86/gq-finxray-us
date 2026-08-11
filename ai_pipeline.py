@@ -301,10 +301,12 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary=""):
 
 def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=MIN_WORDS):
     char_limit = TRANSCRIPT_CHAR_LIMIT if filing_type == "EARNINGS_TRANSCRIPT" else NEWS_CHAR_LIMIT
+    # For NEWS, min_words is already proportional from word_bounds(). For others, use passed value.
+    effective_min = min_words if min_words else MIN_WORDS
     prompt = f"""You are a financial analyst. Write a summary of the following content using exactly {target_words} words.
 
 Rules:
-- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {min_words} words and never more than {target_words} words.
+- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {effective_min} words and never more than {target_words} words.
 - Do not pad the summary with filler phrases, restated facts, or generic commentary just to reach the word count -- every added word must carry real information from the content below.
 - Must end with a complete sentence ending in . ! or ?
 - Do not start with "This", "The following", "Summary:", "Note:" or similar
