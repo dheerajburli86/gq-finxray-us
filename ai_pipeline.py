@@ -62,6 +62,40 @@ STARTING_TARGET = 75
 TARGET_STEP = 5
 MAX_TARGET = 100
 
+# Absolute floor. Below this a "summary" is a fragment, whatever the source.
+ABS_MIN_WORDS = 12
+
+
+def word_bounds(raw_text, filing_type):
+    """
+    The (min_words, max_target) the SOURCE can actually support.
+
+    A summary cannot carry more information than the text it summarises. FMP
+    news arrives as a headline plus a truncated snippet — 48 words on average,
+    some as short as 18 — so applying the standard 70-word floor asks the model
+    to invent the difference, and the validator then rejects what comes back as
+    'too_short'. On 2026-08-11 that was 40 of 41 flagged summaries: every single
+    news item the pipeline had processed, discarded for being faithful to a
+    short source.
+
+    Long-form sources (SEC filings, transcripts) genuinely do carry 70+ words of
+    substance, so they keep the original bounds.
+    """
+    if filing_type != "NEWS":
+        return MIN_WORDS, MAX_TARGET
+
+    src_words = len((raw_text or "").split())
+
+    # The floor is deliberately loose (0.35) rather than a tight compression
+    # ratio. The observed failures were summaries of 13-24 words drawn from
+    # ~48-word snippets: accurate, useful, and rejected. The floor's job is to
+    # catch a truncated fragment, not to enforce a length the source cannot
+    # justify. The target (0.9) stays generous so the model has room to use
+    # everything the snippet offers.
+    lo = max(ABS_MIN_WORDS, min(MIN_WORDS, int(src_words * 0.35)))
+    hi = max(lo + TARGET_STEP, min(MAX_TARGET, int(src_words * 0.9)))
+    return lo, hi
+
 TRANSCRIPT_CHAR_LIMIT = 12000
 FILING_CHAR_LIMIT = 8000
 NEWS_CHAR_LIMIT = 6000
@@ -237,13 +271,13 @@ def last_sentence_incomplete(text):
     return True
 
 
-def classify_failure(summary, max_words):
+def classify_failure(summary, max_words, min_words=MIN_WORDS):
     if not summary:
         return "empty"
     wc = count_words(summary)
     if wc > max_words:
         return "too_long"
-    if wc < MIN_WORDS:
+    if wc < min_words:
         return "too_short"
     if starts_with_bad_keyword(summary):
         return "bad_start"
@@ -265,12 +299,12 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary=""):
     return call_deepinfra(prompt, max_tokens=600)
 
 
-def generate_s3(company_name, raw_text, target_words, filing_type=""):
+def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=MIN_WORDS):
     char_limit = TRANSCRIPT_CHAR_LIMIT if filing_type == "EARNINGS_TRANSCRIPT" else NEWS_CHAR_LIMIT
     prompt = f"""You are a financial analyst. Write a summary of the following content using exactly {target_words} words.
 
 Rules:
-- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {MIN_WORDS} words and never more than {target_words} words.
+- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {min_words} words and never more than {target_words} words.
 - Do not pad the summary with filler phrases, restated facts, or generic commentary just to reach the word count -- every added word must carry real information from the content below.
 - Must end with a complete sentence ending in . ! or ?
 - Do not start with "This", "The following", "Summary:", "Note:" or similar
@@ -305,19 +339,20 @@ def store_flagged_summary(filing_id, ticker, company_name, final_summary, failur
 def summarise(company_name, raw_text, filing_type="", sub_summary="",
               filing_id=None, ticker=None, source="SEC_EDGAR"):
     attempts_log = []
-    target = STARTING_TARGET
+    min_words, max_target = word_bounds(raw_text, filing_type)
+    target = min(STARTING_TARGET, max_target)
 
     raw = generate_s1(company_name, raw_text, filing_type, sub_summary)
     summary = standardize_numbers(clean_summary(raw)) if raw else None
-    failure = classify_failure(summary, target)
+    failure = classify_failure(summary, target, min_words)
     attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
 
-    while failure and target < MAX_TARGET:
-        target += TARGET_STEP
+    while failure and target < max_target:
+        target = min(target + TARGET_STEP, max_target)
         print(f"[SUMMARY] Retry — {failure}, new target {target} words")
-        raw = generate_s3(company_name, raw_text, target, filing_type)
+        raw = generate_s3(company_name, raw_text, target, filing_type, min_words)
         summary = standardize_numbers(clean_summary(raw)) if raw else None
-        failure = classify_failure(summary, target)
+        failure = classify_failure(summary, target, min_words)
         attempts_log.append({"attempt": len(attempts_log) + 1, "target": target,
                              "words": count_words(summary), "failure": failure})
 
@@ -468,7 +503,8 @@ def process_filing(filing, watched=None):
             update_filing_status(filing_id, "FLAGGED_FOR_REVIEW")
             return
         corrected = standardize_numbers(clean_summary(corrected))
-        failure = classify_failure(corrected, MAX_TARGET)
+        _min_words, _max_target = word_bounds(raw_text, filing_type)
+        failure = classify_failure(corrected, _max_target, _min_words)
         if failure:
             store_flagged_summary(filing_id, ticker, company_name, corrected,
                                   f"v1_correction_{failure}",
@@ -544,20 +580,69 @@ def process_filing(filing, watched=None):
     # Stage 6: Send — handled by delivery_loop() in main.py
 
 
-def run_pipeline(batch=10):
+def sweep_unwatched(watched):
+    """
+    Bulk-retire PENDING rows for tickers nobody watches.
+
+    Without this, unwatched rows accumulate in the queue forever: run_pipeline
+    no longer selects them (the watchlist filter is in the query now), so
+    nothing would ever move them out of PENDING. One UPDATE clears the lot.
+    """
+    if not watched:
+        return 0
+    try:
+        res = (supabase.table("raw_filings")
+               .update({"status": "SKIPPED_UNWATCHED"})
+               .eq("status", "PENDING")
+               .not_.in_("ticker", sorted(watched))
+               .execute())
+        n = len(res.data or [])
+        if n:
+            print(f"[GATE] Swept {n} unwatched PENDING row(s) out of the queue.")
+        return n
+    except Exception as e:
+        print(f"[GATE] Sweep failed (non-fatal): {e}")
+        return 0
+
+
+def run_pipeline(batch=25):
+    """
+    Drain the PENDING queue.
+
+    TWO FIXES, both learned from a 2,300-row stall on 2026-08-11:
+
+    * **The watchlist filter is in the query, not after the fetch.** It used to
+      `select * ... limit 10` and *then* discard whatever was not watchlisted.
+      A legacy backfill had left ~2,300 PENDING rows for tickers nobody follows,
+      so every cycle burned its entire batch marking those SKIPPED and reached
+      zero real content. Four hours of polling produced no alerts. Filtering in
+      the query means a batch is always 25 rows that can actually become alerts.
+
+    * **Newest first.** Ordering was `created_at` ascending, so the queue drained
+      oldest-first. On any backlog that delivers stale news — a market-moving
+      headline sits behind hours of already-priced-in noise. Freshness is the
+      whole product here, so the newest row wins.
+    """
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking PENDING filings [{DEEPINFRA_MODEL}]")
     try:
-        res = (supabase.table("raw_filings").select("*")
-               .eq("status", "PENDING").order("created_at").limit(batch).execute())
-        filings = res.data or []
-        if not filings:
-            print("No PENDING filings.")
-            return
-
         watched = None if PROCESS_ALL_TICKERS else get_watched_tickers()
         if watched is not None and not watched:
             print("[GATE] No user has any ticker on a watchlist — nothing to summarise. "
                   "Add tickers via the Telegram bot, or set PROCESS_ALL_TICKERS=true.")
+            return
+
+        q = supabase.table("raw_filings").select("*").eq("status", "PENDING")
+        if watched is not None:
+            # Only ever pull rows that can produce a deliverable alert.
+            q = q.in_("ticker", sorted(watched))
+
+        res = q.order("created_at", desc=True).limit(batch).execute()
+        filings = res.data or []
+
+        if not filings:
+            print("No PENDING filings for watched tickers.")
+            if watched is not None:
+                sweep_unwatched(watched)
             return
 
         print(f"Found {len(filings)} PENDING; {len(watched) if watched else 'all'} tickers watched")

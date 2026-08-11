@@ -18,9 +18,15 @@ FIXES OVER THE PREVIOUS VERSION
   ai_pipeline, so nothing else would supply one and alert_formatter would render
   a headline-less message.
 
-An IPO ticker cannot be on anyone's watchlist before it lists, so feature 8 is
-marked `market_wide=True` in feature_map — delivery.py routes these to users who
-have not opted out of market-wide alerts rather than by ticker.
+IPO alerts (feature 8) are watchlist-scoped: an IPO alert reaches only the users
+who watch that specific ticker. Add an upcoming IPO's ticker to your watchlist
+before its listing date to get the heads-up.
+
+The gate is applied in run_ipo_poller, before anything is summarised. It used to
+sit downstream, so every calendar entry was written to `alerts` and then dropped
+at delivery for having no audience — real LLM spend on messages that could not
+be sent. Filtering the calendar against the watchlist first means an unwatched
+IPO costs one list comparison and nothing else.
 
 Runs once a day via the scheduler in main.py.
 """
@@ -34,7 +40,7 @@ from supabase import create_client
 
 import fmp_client
 from feature_map import tag_extra
-from watchlist_util import log_poller_error
+from watchlist_util import log_poller_error, get_watched_tickers
 
 load_dotenv()
 
@@ -293,8 +299,31 @@ def run_ipo_poller():
             logger.info("[IPO] No upcoming IPOs in the window %s to %s.", from_date, to_date)
             return
 
+        # Watchlist gate, applied HERE rather than downstream.
+        #
+        # An IPO alert is delivered only to users who watch that specific ticker,
+        # so an IPO nobody follows has no recipient. Previously every calendar
+        # entry was summarised and written to `alerts` anyway, then dropped at
+        # delivery for having no audience — 9 such alerts in 48h, each costing an
+        # LLM call. Filtering up front means we only ever spend tokens on a deal
+        # someone is actually waiting for.
+        #
+        # To receive one, add the IPO's ticker to your watchlist before it lists.
+        watched = get_watched_tickers()
+        if not watched:
+            logger.info("[IPO] No user watches any ticker — skipping %d calendar entries.",
+                        len(ipos))
+            return
+
+        candidates = [i for i in ipos
+                      if ((i or {}).get("symbol") or "").strip().upper() in watched]
+        if not candidates:
+            logger.info("[IPO] %d upcoming IPO(s), none watchlisted — nothing to write.",
+                        len(ipos))
+            return
+
         written = 0
-        for ipo in ipos:
+        for ipo in candidates:
             try:
                 if process_ipo(ipo):
                     written += 1
@@ -302,8 +331,8 @@ def run_ipo_poller():
                 log_poller_error(POLLER, "process_ipo", e,
                                  {"symbol": (ipo or {}).get("symbol")})
 
-        logger.info("[IPO] Done. %d calendar entries examined, %d alerts written "
-                    "(as of %s).", len(ipos), written,
+        logger.info("[IPO] Done. %d calendar entries, %d watchlisted, %d alerts written "
+                    "(as of %s).", len(ipos), len(candidates), written,
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
     except Exception as e:
