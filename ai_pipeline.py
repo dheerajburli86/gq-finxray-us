@@ -461,17 +461,20 @@ def get_watched_tickers():
     changes only when someone runs /add or /remove.
     """
     now = time.monotonic()
-    if _watchlist_cache["tickers"] and (now - _watchlist_cache["at"]) < _WATCHLIST_TTL:
+    if (now - _watchlist_cache["at"]) < _WATCHLIST_TTL and _watchlist_cache["tickers"]:
+        print(f"[WATCHLIST] Cache hit: {len(_watchlist_cache['tickers'])} tickers (age={now - _watchlist_cache['at']:.1f}s)")
         return _watchlist_cache["tickers"]
     try:
         rows = supabase.table("watchlists").select("ticker").execute().data or []
         tickers = {(r.get("ticker") or "").upper() for r in rows if r.get("ticker")}
         _watchlist_cache.update({"tickers": tickers, "at": now})
+        print(f"[WATCHLIST] Loaded {len(tickers)} tickers: {sorted(tickers)}")
         return tickers
     except Exception as e:
         print(f"[ERROR] Could not load watchlist for gating: {e}")
         # Fail closed. Returning everything here would summarise the entire
         # market on a transient database error.
+        print(f"[WATCHLIST] Fallback to cached tickers: {len(_watchlist_cache['tickers'])} ({sorted(_watchlist_cache['tickers']) if _watchlist_cache['tickers'] else 'empty'})")
         return _watchlist_cache["tickers"]
 
 
