@@ -58,9 +58,9 @@ from feature_map import resolve_feature
 
 # ── Word-count escalation ladder ──────────────────────────────────────────────
 MIN_WORDS = 70
-STARTING_TARGET = 75
-TARGET_STEP = 5
-MAX_TARGET = 100
+STARTING_TARGET = 120  # Increased from 75 for richer summaries
+TARGET_STEP = 10       # Increased from 5 for bigger jumps
+MAX_TARGET = 180       # Increased from 100 for longer articles
 
 # Absolute floor. Below this a "summary" is a fragment, whatever the source.
 ABS_MIN_WORDS = 12

@@ -1,0 +1,174 @@
+From 4855cd9cd3aa8547f224d2b3281d8973f5512807 Mon Sep 17 00:00:00 2001
+From: Dheeraj <dheeraj.burli@gquants.com>
+Date: Thu, 13 Aug 2026 09:59:09 +0000
+Subject: [PATCH] fix: extend summarization prompts and word targets for
+ richer, fuller content
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Increased NEWS target from 75→120 words, max 100→180, step 5→10
+- Increased ANNOUNCEMENT target from 75→120 words, min 70→100
+- Increased TRANSCRIPT target from 75→150 words, min 70→120
+- Enhanced all three prompts with detailed instructions: prioritize key facts,
+  include specific numbers/dates, structure for clarity, no filler
+- News prompt now emphasizes financial impact and specific data points
+- Announcement prompt prioritizes material events and strategic implications
+- Transcript prompt covers earnings results, guidance, risks, management tone
+
+This addresses the issue of summaries being too short and lacking substance.
+Feature 2 alerts will now carry more complete information.
+
+Co-Authored-By: Claude Haiku 4.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011y1E2v3DADHfcdy3p3YAYX
+---
+ Prompt_S1A_AnnouncementSummarization.py | 29 +++++++++++++++-----
+ Prompt_S1N_NewsSummarization.py         | 23 +++++++++++-----
+ Prompt_S1T_TranscriptSummarization.py   | 36 ++++++++++++++++++++-----
+ ai_pipeline.py                          |  6 ++---
+ 4 files changed, 73 insertions(+), 21 deletions(-)
+
+diff --git a/Prompt_S1A_AnnouncementSummarization.py b/Prompt_S1A_AnnouncementSummarization.py
+index 4b5b18a..cbf261c 100644
+--- a/Prompt_S1A_AnnouncementSummarization.py
++++ b/Prompt_S1A_AnnouncementSummarization.py
+@@ -1,13 +1,30 @@
+ """Prompt_S1A_AnnouncementSummarization.py — Summarize SEC filings"""
+ 
+-def get_prompt(company_name, sub_summary, raw_text, target_word_count=75, min_word_count=70):
+-    return f"""Summarize this SEC filing from {company_name} in exactly {target_word_count} words.
+-Focus on what happened, why it matters, and key numbers. No boilerplate.
+-Minimum {min_word_count} words, maximum {target_word_count} words.
++def get_prompt(company_name, sub_summary, raw_text, target_word_count=120, min_word_count=100):
++    return f"""You are a financial analyst. Summarize this SEC filing from {company_name}.
++
++Target: exactly {target_word_count} words
++Minimum: {min_word_count} words (never shorter)
++Maximum: {target_word_count} words
++
++KEY PRIORITIES:
++- Lead with what happened: the material event, transaction, or announcement
++- Include financial impact: dollar amounts, percentages, affected units
++- Explain why it matters: strategic implications, market impact, risk factors
++- Specific dates, parties, terms if material to the news
++- No SEC boilerplate, no legal disclaimers, no repeat of submission format
++
++MUST FOLLOW:
++- Exactly {target_word_count} words if possible; never below {min_word_count}
++- End with complete sentence (period, exclamation, or question mark)
++- Never start with: "This filing", "The following", "Summary:", "Note:", "This document"
++- Plain English, neutral factual tone, no personal opinion
++- Every word must convey real information; no filler or padding
++- If exact word count impossible, come as close as possible while staying accurate
+ 
+ {sub_summary or ""}
+ 
+-Filing:
++FILING:
+ {raw_text}
+ 
+-Return only the summary."""
++Return only the summary. No preamble, no explanation."""
+diff --git a/Prompt_S1N_NewsSummarization.py b/Prompt_S1N_NewsSummarization.py
+index 2dd3ba0..feaf692 100644
+--- a/Prompt_S1N_NewsSummarization.py
++++ b/Prompt_S1N_NewsSummarization.py
+@@ -1,13 +1,24 @@
+ """Prompt_S1N_NewsSummarization.py — Summarize news articles"""
+ 
+-def get_prompt(company_name, sub_summary, raw_text, target_word_count=75, min_word_count=70):
+-    return f"""Summarize this news article about {company_name} in exactly {target_word_count} words.
+-Rules: Must end with complete sentence. No padding. No "This article", "The following", "Summary:".
+-Minimum {min_word_count} words, maximum {target_word_count} words.
++def get_prompt(company_name, sub_summary, raw_text, target_word_count=120, min_word_count=100):
++    return f"""You are a financial news analyst. Summarize this news article about {company_name}.
++
++Target: exactly {target_word_count} words
++Minimum: {min_word_count} words (never shorter)
++Maximum: {target_word_count} words
++
++CRITICAL RULES:
++- Include the most important facts: what happened, why it matters, financial impact if relevant
++- Include specific numbers, percentages, dates if present in the article
++- Must end with complete sentence (period, exclamation, or question mark)
++- Never start with filler: "This article", "The following", "Summary:", "Note:", "According to"
++- Plain English, neutral and factual, no personal opinion
++- Every word must carry real information — no padding or repetition
++- If word count cannot be exact, come as close as possible while staying accurate
+ 
+ {sub_summary or ""}
+ 
+-Article:
++ARTICLE:
+ {raw_text}
+ 
+-Return only the summary."""
++Return only the summary. No preamble, no explanation, no meta-commentary."""
+diff --git a/Prompt_S1T_TranscriptSummarization.py b/Prompt_S1T_TranscriptSummarization.py
+index 592bc5c..054a7ee 100644
+--- a/Prompt_S1T_TranscriptSummarization.py
++++ b/Prompt_S1T_TranscriptSummarization.py
+@@ -1,13 +1,37 @@
+ """Prompt_S1T_TranscriptSummarization.py — Summarize earnings call transcripts"""
+ 
+-def get_prompt(company_name, sub_summary, raw_text, target_word_count=75, min_word_count=70):
+-    return f"""Summarize this earnings call transcript from {company_name} in exactly {target_word_count} words.
+-Highlight key takeaways, guidance, surprises, and management outlook.
+-Minimum {min_word_count} words, maximum {target_word_count} words.
++def get_prompt(company_name, sub_summary, raw_text, target_word_count=150, min_word_count=120):
++    return f"""You are a financial analyst. Summarize this earnings call transcript from {company_name}.
++
++Target: exactly {target_word_count} words
++Minimum: {min_word_count} words (never shorter)
++Maximum: {target_word_count} words
++
++KEY TAKEAWAYS TO COVER:
++- Earnings results: revenue, earnings per share, guidance vs expectations
++- Business segment performance: growth areas, headwinds, margin trends
++- Forward guidance: what management says about the next quarter and year
++- Key strategic moves: acquisitions, divestitures, partnerships, product launches
++- Management tone: optimistic, cautious, or under pressure
++- Analyst surprises: what was unexpected or concerning
++
++STRUCTURE:
++- Lead with headline earnings and guidance
++- Include specific numbers: revenue, EPS, growth %, margins
++- Key risks or tailwinds management mentioned
++- One key quote if exceptionally important
++
++MUST FOLLOW:
++- Exactly {target_word_count} words if possible; never below {min_word_count}
++- End with complete sentence (period, exclamation, or question mark)
++- Never start with: "This transcript", "The following", "Summary:", "Management noted"
++- Plain English, neutral factual tone, no personal commentary
++- Every word conveys real information; no filler or repetition
++- If exact word count impossible, come as close as possible while staying accurate
+ 
+ {sub_summary or ""}
+ 
+-Transcript:
++TRANSCRIPT:
+ {raw_text}
+ 
+-Return only the summary."""
++Return only the summary. No preamble, no explanation."""
+diff --git a/ai_pipeline.py b/ai_pipeline.py
+index 1240a98..95f6dd0 100644
+--- a/ai_pipeline.py
++++ b/ai_pipeline.py
+@@ -58,9 +58,9 @@ from feature_map import resolve_feature
+ 
+ # ── Word-count escalation ladder ──────────────────────────────────────────────
+ MIN_WORDS = 70
+-STARTING_TARGET = 75
+-TARGET_STEP = 5
+-MAX_TARGET = 100
++STARTING_TARGET = 120  # Increased from 75 for richer summaries
++TARGET_STEP = 10       # Increased from 5 for bigger jumps
++MAX_TARGET = 180       # Increased from 100 for longer articles
+ 
+ # Absolute floor. Below this a "summary" is a fragment, whatever the source.
+ ABS_MIN_WORDS = 12
+-- 
+2.43.0
+
