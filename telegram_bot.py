@@ -1,30 +1,16 @@
+#!/usr/bin/env python3
 """
 telegram_bot.py
 GQ FinXray US — watchlist management bot.
 
-Replaces the previous file, which was a 50-line support-ticket forwarder with no
-commands and no database access. This one is the registration and watchlist
-surface the delivery layer depends on: if a user is not in `users` with a
-chat_id, and their tickers are not in `watchlists`, they receive nothing.
+Commands:
+  /start        — register this chat against your account
+  /add TICKER   — add a stock to your watchlist
+  /remove TICKER— remove a stock from your watchlist
+  /list         — show your watchlist
+  /help         — show commands
 
-Storage is Supabase, not memory. The earlier in-memory version lost every
-watchlist when the process restarted, and — more importantly — the alert
-delivery loop runs in a different process and could never see it.
-
-Identity: keyed on telegram_chat_id, which is stable for a given (user, bot)
-pair. Usernames are stored for display but are NOT the key, because a user can
-change their Telegram username at any time and we would lose them.
-
-Commands
-    /start              register (or re-activate) and bind this chat
-    /add AAPL MSFT      add one or more tickers, validated against `stocks`
-    /remove AAPL        remove a ticker
-    /list               show the current watchlist
-    /settings           show current preferences
-    /settings impact high|medium|low
-    /settings market on|off
-    /stop               pause all alerts (keeps the watchlist)
-    /help
+Run with:  python telegram_bot.py      (1 replica only — see main())
 """
 
 import os
@@ -32,378 +18,426 @@ import logging
 
 from dotenv import load_dotenv
 from supabase import create_client
-from telegram import Update
+from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes,
+    InlineQueryHandler, MessageHandler, filters,
+)
 
 load_dotenv()
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+# TELEGRAM_TOKEN is what Railway has; TELEGRAM_BOT_TOKEN accepted as an alias so
+# the same file runs unchanged in either environment.
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Onboarding a user is a Railway variable edit, not a code change + redeploy.
+AUTHORIZED_USERNAMES = {
+    u.strip().lstrip("@").lower()
+    for u in os.getenv("AUTHORIZED_USERNAMES", "dj_12312").split(",")
+    if u.strip()
+}
 
-# Caps the per-user API cost and keeps the watchlist heatmap readable.
-MAX_WATCHLIST = int(os.getenv("MAX_WATCHLIST_SIZE", "50"))
+MAX_WATCHLIST = int(os.getenv("MAX_WATCHLIST", "50"))
 
-IMPACT_CHOICES = {"high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
+if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
+    raise SystemExit(
+        "Missing env vars. Need TELEGRAM_TOKEN, SUPABASE_URL, SUPABASE_KEY."
+    )
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("bot")
 
 
-# ── User + watchlist persistence ──────────────────────────────────────────────
-def get_or_create_user(chat_id, username=None, user_id=None, display_name=None,
-                       reactivate=False):
-    """Idempotent registration keyed on chat_id. Returns the user row, or None.
+# ── users ─────────────────────────────────────────────────────────────────────
+def is_authorized(username: str) -> bool:
+    return bool(username) and username.lstrip("@").lower() in AUTHORIZED_USERNAMES
 
-    `reactivate` must be True ONLY for /start. Every command handler calls this
-    function, and it used to force is_active=True unconditionally — so a user who
-    sent /stop was silently resubscribed the moment they sent /list or /settings
-    to check that the stop had worked. Opting out has to survive the user looking
-    at their own settings.
-    """
-    chat_id = str(chat_id)
+
+def get_user_by_chat_id(chat_id):
+    # telegram_chat_id is TEXT in Postgres. Passing an int works by coercion on
+    # the way in but not on the way back out of a filter -- always send a string.
     try:
-        found = (supabase.table("users").select("*")
-                 .eq("telegram_chat_id", chat_id).limit(1).execute()).data
-        if found:
-            user = found[0]
-            patch = {"is_active": True} if reactivate else {}
-            if username and user.get("telegram_username") != username:
-                patch["telegram_username"] = username
-            if display_name and user.get("display_name") != display_name:
-                patch["display_name"] = display_name
-            if user_id and user.get("telegram_user_id") != str(user_id):
-                patch["telegram_user_id"] = str(user_id)
-            # An empty patch is now possible (a returning user with no changed
-            # profile fields and no reactivation); PostgREST rejects an empty
-            # UPDATE body, so only write when there is something to write.
-            if patch:
-                supabase.table("users").update(patch).eq("id", user["id"]).execute()
-                user.update(patch)
-            _ensure_prefs(user["id"])
-            return user
-
-        created = (supabase.table("users").insert({
-            "telegram_chat_id": chat_id,
-            "telegram_username": username,
-            "telegram_user_id": str(user_id) if user_id else None,
-            "display_name": display_name,
-            "is_active": True,
-        }).execute()).data
-        if created:
-            _ensure_prefs(created[0]["id"])
-            return created[0]
+        r = (supabase.table("users").select("*")
+             .eq("telegram_chat_id", str(chat_id)).limit(1).execute())
+        return r.data[0] if r.data else None
     except Exception as e:
-        logger.error("[BOT] get_or_create_user failed for chat %s: %s", chat_id, e)
-    return None
-
-
-def _ensure_prefs(user_id):
-    try:
-        supabase.table("user_preferences").upsert(
-            {"user_id": user_id}, on_conflict="user_id", ignore_duplicates=True
-        ).execute()
-    except Exception as e:
-        logger.error("[BOT] Failed to ensure preferences for %s: %s", user_id, e)
-
-
-def get_prefs(user_id):
-    try:
-        rows = (supabase.table("user_preferences").select("*")
-                .eq("user_id", user_id).limit(1).execute()).data
-        if rows:
-            return rows[0]
-    except Exception as e:
-        logger.error("[BOT] get_prefs failed: %s", e)
-    return {"min_impact": "MEDIUM", "max_alerts_per_day": 200}
-
-
-def lookup_stock(ticker):
-    """Validate against the 6,353-row stocks table. Returns the row or None."""
-    try:
-        rows = (supabase.table("stocks").select("ticker, exchange, sector")
-                .eq("ticker", ticker.upper()).limit(1).execute()).data
-        return rows[0] if rows else None
-    except Exception as e:
-        logger.error("[BOT] lookup_stock(%s) failed: %s", ticker, e)
+        log.error("[DB] lookup by chat_id %s failed: %s", chat_id, e)
         return None
 
 
-def get_watchlist(user_id):
+def get_user_by_username(username):
+    if not username:
+        return None
     try:
-        rows = (supabase.table("watchlists").select("ticker, company_name")
-                .eq("user_id", user_id).order("ticker").execute()).data or []
-        return rows
+        # ilike, not eq: the unique index is on lower(telegram_username), so a
+        # case-sensitive eq can miss a row that the index will still refuse to
+        # let us insert alongside.
+        r = (supabase.table("users").select("*")
+             .ilike("telegram_username", username.lstrip("@")).limit(1).execute())
+        return r.data[0] if r.data else None
     except Exception as e:
-        logger.error("[BOT] get_watchlist failed: %s", e)
+        log.error("[DB] lookup by username %s failed: %s", username, e)
+        return None
+
+
+def get_or_create_user(chat_id, username=None, display_name=None):
+    """Return this chat's users row, adopting or creating as required.
+
+    Three paths, in order. Skipping the middle one is what broke the old bot:
+    it looked users up by chat_id ONLY, so a row seeded by hand (username set,
+    chat_id still NULL) was invisible to it. It fell through to INSERT, hit the
+    unique index on lower(telegram_username), and returned an error -- for ever,
+    no matter how many times the user pressed /start.
+    """
+    chat_id = str(chat_id)
+    uname = (username or "").lstrip("@").strip().lower() or None
+
+    # 1. returning user, keyed by chat_id
+    row = get_user_by_chat_id(chat_id)
+    if row:
+        patch = {}
+        if uname and (row.get("telegram_username") or "").lower() != uname:
+            patch["telegram_username"] = uname
+        if display_name and row.get("display_name") != display_name:
+            patch["display_name"] = display_name
+        if not row.get("is_active"):
+            patch["is_active"] = True
+        if patch:
+            try:
+                supabase.table("users").update(patch).eq("id", row["id"]).execute()
+                row.update(patch)
+            except Exception as e:
+                log.warning("[DB] could not refresh %s: %s", row["id"], e)
+        return row
+
+    # 2. row seeded by hand / by an earlier account — adopt it, keeping its
+    #    uuid so the watchlist hanging off that uuid survives
+    if uname:
+        row = get_user_by_username(uname)
+        if row:
+            patch = {"telegram_chat_id": chat_id,
+                     "telegram_user_id": chat_id,
+                     "is_active": True}
+            if display_name:
+                patch["display_name"] = display_name
+            try:
+                supabase.table("users").update(patch).eq("id", row["id"]).execute()
+                row.update(patch)
+                log.info("[DB] adopted existing row %s for @%s", row["id"], uname)
+                return row
+            except Exception as e:
+                log.error("[DB] adopt failed for @%s: %s", uname, e)
+                return None
+
+    # 3. genuinely new user
+    payload = {"telegram_chat_id": chat_id,
+               "telegram_user_id": chat_id,
+               "is_active": True}
+    if uname:
+        payload["telegram_username"] = uname
+    if display_name:
+        payload["display_name"] = display_name
+    try:
+        r = supabase.table("users").insert(payload).execute()
+        log.info("[DB] created user for chat %s (@%s)", chat_id, uname)
+        return r.data[0] if r.data else None
+    except Exception as e:
+        # Lost a race with a concurrent /start, or an index we did not expect.
+        # Re-read rather than surfacing an error the user cannot act on.
+        if "duplicate" not in str(e).lower() and "23505" not in str(e):
+            log.error("[DB] insert failed for chat %s: %s", chat_id, e)
+            return None
+        log.warning("[DB] insert raced (%s) — re-reading", e)
+        return get_user_by_chat_id(chat_id) or get_user_by_username(uname)
+
+
+# ── stocks & watchlists ───────────────────────────────────────────────────────
+def get_stock_by_ticker(ticker):
+    try:
+        r = (supabase.table("stocks").select("*")
+             .eq("ticker", ticker.upper()).limit(1).execute())
+        return r.data[0] if r.data else None
+    except Exception as e:
+        log.error("[DB] stock lookup %s failed: %s", ticker, e)
+        return None
+
+
+def search_stocks_by_prefix(prefix, limit=8):
+    try:
+        r = (supabase.table("stocks").select("ticker, sector, exchange")
+             .ilike("ticker", f"{prefix.upper()}%").limit(limit).execute())
+        return r.data or []
+    except Exception as e:
+        log.error("[DB] stock search %s failed: %s", prefix, e)
         return []
 
 
-def add_ticker(user_id, ticker, company_name=None):
-    """Returns 'added' | 'exists' | 'error'."""
+def get_user_watchlist(user_id):
+    try:
+        # ORDER BY created_at. The column on this table is created_at, not
+        # added_at -- ordering by a column that does not exist makes PostgREST
+        # return an error, which the caller reads as "empty watchlist".
+        r = (supabase.table("watchlists").select("ticker")
+             .eq("user_id", user_id).order("created_at").execute())
+        return [row["ticker"] for row in (r.data or [])]
+    except Exception as e:
+        log.error("[DB] watchlist fetch for %s failed: %s", user_id, e)
+        return []
+
+
+def add_to_watchlist(user_id, ticker):
+    """True = added, None = already there, False = failed, 'FULL' = at cap."""
     ticker = ticker.upper()
+    current = get_user_watchlist(user_id)
+    if ticker in current:
+        return None
+    if len(current) >= MAX_WATCHLIST:
+        return "FULL"
     try:
-        # There is no UNIQUE(user_id, ticker) constraint on watchlists, so the
-        # duplicate branch below could never fire and `/add AAPL` twice inserted
-        # two rows. Delivery joins per row, so the user then received every AAPL
-        # alert twice. Check before inserting.
-        existing = (supabase.table("watchlists").select("id")
-                    .eq("user_id", user_id).eq("ticker", ticker)
-                    .limit(1).execute()).data
-        if existing:
-            return "exists"
-
-        supabase.table("watchlists").insert({
-            "user_id": user_id, "ticker": ticker, "company_name": company_name,
-        }).execute()
-        return "added"
+        supabase.table("watchlists").insert(
+            {"user_id": user_id, "ticker": ticker}
+        ).execute()
+        return True
     except Exception as e:
-        msg = str(e).lower()
-        if "duplicate" in msg or "unique" in msg or "23505" in msg:
-            return "exists"
-        logger.error("[BOT] add_ticker failed: %s", e)
-        return "error"
-
-
-def remove_ticker(user_id, ticker):
-    try:
-        res = (supabase.table("watchlists").delete()
-               .eq("user_id", user_id).eq("ticker", ticker.upper()).execute())
-        return bool(res.data)
-    except Exception as e:
-        logger.error("[BOT] remove_ticker failed: %s", e)
+        if "duplicate" in str(e).lower() or "23505" in str(e):
+            return None
+        log.error("[DB] add %s for %s failed: %s", ticker, user_id, e)
         return False
 
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg = update.effective_user
-    user = get_or_create_user(
-        chat_id=update.effective_chat.id,
-        username=tg.username,
-        user_id=tg.id,
-        display_name=tg.full_name,
-        reactivate=True,   # /start is the ONLY command that resubscribes.
-    )
-    if not user:
-        await update.message.reply_text("Couldn't set up your account just now. Try /start again in a moment.")
-        return
+def remove_from_watchlist(user_id, ticker):
+    try:
+        r = (supabase.table("watchlists").delete()
+             .eq("user_id", user_id).eq("ticker", ticker.upper()).execute())
+        return bool(r.data)
+    except Exception as e:
+        log.error("[DB] remove %s for %s failed: %s", ticker, user_id, e)
+        return False
 
-    count = len(get_watchlist(user["id"]))
-    if count:
+
+# ── handlers ──────────────────────────────────────────────────────────────────
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    # Telegram already tells us the username. Reading it straight off the
+    # account removes a whole class of onboarding failure: someone typing a name
+    # that does not match their account and landing on a row their watchlist is
+    # not attached to.
+    username = (tg_user.username or "").lstrip("@")
+
+    if username and not is_authorized(username):
         await update.message.reply_text(
-            f"Welcome back{', ' + tg.first_name if tg.first_name else ''}. "
-            f"You're tracking <b>{count}</b> stock{'s' if count != 1 else ''} and alerts are on.\n\n"
-            "<code>/list</code> to see them · <code>/add TICKER</code> to add more",
-            parse_mode=ParseMode.HTML,
+            f"❌ @{username} isn't on the access list.\n"
+            "Ask your GQ admin to add you, then send /start again."
         )
         return
 
+    if not username:
+        await update.message.reply_text(
+            "👋 Welcome to *GQ FinXray US*\n\n"
+            "Your Telegram account has no username set, so I can't identify you.\n"
+            "Set one in Telegram → Settings → Username, then send /start again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    user = get_or_create_user(chat_id, username=username,
+                             display_name=tg_user.full_name)
+    if not user:
+        await update.message.reply_text(
+            "⚠️ Couldn't set up your account. This has been logged — "
+            "tell your admin if it keeps happening."
+        )
+        return
+
+    context.user_data["user_id"] = user["id"]
+    n = len(get_user_watchlist(user["id"]))
     await update.message.reply_text(
-        f"Welcome to <b>GQ FinXray US</b>{', ' + tg.first_name if tg.first_name else ''}.\n\n"
-        "You'll get alerts only for the stocks you add — filings, news, earnings, "
-        "insider trades, analyst moves and technical signals.\n\n"
-        "Add your first stock to begin:\n"
-        "<code>/add TICKER</code>   (e.g. <code>/add TSLA</code>)\n\n"
-        "You can add several at once: <code>/add TSLA NVDA AMD</code>\n\n"
-        "<code>/list</code> — see your stocks\n"
-        "<code>/remove TICKER</code> — stop tracking one\n"
-        "<code>/settings</code> — alert preferences\n"
-        "<code>/help</code> — all commands",
-        parse_mode=ParseMode.HTML,
+        f"✅ You're registered as *@{username}*\n\n"
+        f"Watchlist: *{n}* stock{'' if n == 1 else 's'}\n\n"
+        "Alerts for these tickers will arrive here automatically.\n"
+        "Use /help to see what else I can do.",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg = update.effective_user
-    user = get_or_create_user(update.effective_chat.id, tg.username, tg.id, tg.full_name)
-    if not user:
-        await update.message.reply_text("Something went wrong. Try /start first.")
+    user = get_user_by_chat_id(update.effective_chat.id)
+    if not user or not user.get("is_active"):
+        await update.message.reply_text("❌ Not registered. Send /start first.")
         return
 
     if not context.args:
+        await update.message.reply_text("Usage: `/add AAPL`",
+                                        parse_mode=ParseMode.MARKDOWN)
+        return
+
+    ticker = context.args[0].upper()
+    stock = get_stock_by_ticker(ticker)
+    if not stock:
         await update.message.reply_text(
-            "Tell me which stock:\n<code>/add TICKER</code>\n\n"
-            "You can add several at once — <code>/add TICKER TICKER TICKER</code>",
-            parse_mode=ParseMode.HTML,
+            f"❌ *{ticker}* isn't a ticker I cover. Check the spelling.",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    current = len(get_watchlist(user["id"]))
-    room = MAX_WATCHLIST - current
-    if room <= 0:
+    result = add_to_watchlist(user["id"], ticker)
+    if result is True:
         await update.message.reply_text(
-            f"Your watchlist is full ({MAX_WATCHLIST} stocks). "
-            "Remove one with <code>/remove TICKER</code> to make space.",
-            parse_mode=ParseMode.HTML,
+            f"✅ Added *{ticker}* — {stock.get('sector') or 'Unknown sector'}\n\n"
+            "You'll get alerts for it from now on.",
+            parse_mode=ParseMode.MARKDOWN,
         )
-        return
-
-    added, existed, unknown = [], [], []
-    for raw in context.args[:room + 5]:
-        t = raw.strip().upper().lstrip("$")
-        if not t or not t.replace(".", "").replace("-", "").isalnum():
-            unknown.append(raw)
-            continue
-        if len(added) >= room:
-            break
-        stock = lookup_stock(t)
-        if not stock:
-            unknown.append(t)
-            continue
-        result = add_ticker(user["id"], t, stock.get("sector"))
-        if result == "added":
-            added.append(t)
-        elif result == "exists":
-            existed.append(t)
-        else:
-            unknown.append(t)
-
-    parts = []
-    if added:
-        parts.append(f"✅ Added <b>{', '.join(added)}</b>")
-    if existed:
-        parts.append(f"Already tracking {', '.join(existed)}")
-    if unknown:
-        parts.append(f"❌ Not found on NYSE or NASDAQ: {', '.join(unknown)}")
-    if added and (current + len(added)) >= MAX_WATCHLIST:
-        parts.append(f"That's your {MAX_WATCHLIST}-stock limit.")
-
-    await update.message.reply_text("\n".join(parts) or "Nothing to add.", parse_mode=ParseMode.HTML)
+    elif result is None:
+        await update.message.reply_text(f"ℹ️ *{ticker}* is already on your list.",
+                                        parse_mode=ParseMode.MARKDOWN)
+    elif result == "FULL":
+        await update.message.reply_text(
+            f"❌ Watchlist is full ({MAX_WATCHLIST}). Remove one first."
+        )
+    else:
+        await update.message.reply_text(f"❌ Couldn't add *{ticker}*. Try again.",
+                                        parse_mode=ParseMode.MARKDOWN)
 
 
 async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg = update.effective_user
-    user = get_or_create_user(update.effective_chat.id, tg.username, tg.id, tg.full_name)
-    if not user:
-        await update.message.reply_text("Something went wrong. Try /start first.")
+    user = get_user_by_chat_id(update.effective_chat.id)
+    if not user or not user.get("is_active"):
+        await update.message.reply_text("❌ Not registered. Send /start first.")
         return
 
     if not context.args:
-        await update.message.reply_text(
-            "Which one?\n<code>/remove TICKER</code>", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("Usage: `/remove AAPL`",
+                                        parse_mode=ParseMode.MARKDOWN)
         return
 
-    removed, missing = [], []
-    for raw in context.args:
-        t = raw.strip().upper().lstrip("$")
-        (removed if remove_ticker(user["id"], t) else missing).append(t)
-
-    parts = []
-    if removed:
-        parts.append(f"✅ Removed <b>{', '.join(removed)}</b>")
-    if missing:
-        parts.append(f"Not on your watchlist: {', '.join(missing)}")
-    await update.message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
+    ticker = context.args[0].upper()
+    if remove_from_watchlist(user["id"], ticker):
+        await update.message.reply_text(f"✅ Removed *{ticker}*.",
+                                        parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(f"❌ *{ticker}* isn't on your list.",
+                                        parse_mode=ParseMode.MARKDOWN)
 
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg = update.effective_user
-    user = get_or_create_user(update.effective_chat.id, tg.username, tg.id, tg.full_name)
-    if not user:
-        await update.message.reply_text("Something went wrong. Try /start first.")
+    user = get_user_by_chat_id(update.effective_chat.id)
+    if not user or not user.get("is_active"):
+        await update.message.reply_text("❌ Not registered. Send /start first.")
         return
 
-    rows = get_watchlist(user["id"])
-    if not rows:
+    watchlist = get_user_watchlist(user["id"])
+    if not watchlist:
         await update.message.reply_text(
-            "Your watchlist is empty, so you're not receiving any alerts yet.\n\n"
-            "Add one with <code>/add TICKER</code>", parse_mode=ParseMode.HTML)
+            "📋 Your watchlist is empty.\n\nAdd one with `/add AAPL`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
-    lines = [f"<b>Your watchlist — {len(rows)} stock{'s' if len(rows) != 1 else ''}</b>", ""]
-    lines += [f"• <b>{r['ticker']}</b>" + (f"  <i>{r['company_name']}</i>" if r.get("company_name") else "")
-              for r in rows]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg = update.effective_user
-    user = get_or_create_user(update.effective_chat.id, tg.username, tg.id, tg.full_name)
-    if not user:
-        await update.message.reply_text("Something went wrong. Try /start first.")
-        return
-
-    args = [a.lower() for a in (context.args or [])]
-
-    if len(args) >= 2 and args[0] == "impact":
-        choice = IMPACT_CHOICES.get(args[1])
-        if not choice:
-            await update.message.reply_text("Pick one: high, medium or low.")
-            return
-        supabase.table("user_preferences").update({"min_impact": choice}).eq("user_id", user["id"]).execute()
-        note = {"HIGH": "Only the biggest moves.",
-                "MEDIUM": "Meaningful news and above.",
-                "LOW": "Everything, including routine filings."}[choice]
-        await update.message.reply_text(f"✅ Minimum impact set to <b>{choice}</b>. {note}",
-                                        parse_mode=ParseMode.HTML)
-        return
-
-    p = get_prefs(user["id"])
-    await update.message.reply_text(
-        "<b>Your settings</b>\n\n"
-        f"Minimum impact: <b>{p.get('min_impact', 'MEDIUM')}</b>\n"
-        f"Daily limit: <b>{p.get('max_alerts_per_day', 200)}</b> alerts\n\n"
-        "Change them:\n"
-        "<code>/settings impact high</code>\n"
-        "<code>/settings impact medium</code>\n"
-        "<code>/settings impact low</code>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg = update.effective_user
-    user = get_or_create_user(update.effective_chat.id, tg.username, tg.id, tg.full_name)
-    if user:
-        supabase.table("users").update({"is_active": False}).eq("id", user["id"]).execute()
-    await update.message.reply_text(
-        "Alerts paused. Your watchlist is saved — send /start whenever you want them back.")
+    lines = [f"📋 *Your watchlist — {len(watchlist)} stock"
+             f"{'' if len(watchlist) == 1 else 's'}*\n"]
+    for ticker in watchlist:
+        stock = get_stock_by_ticker(ticker)
+        if stock:
+            lines.append(f"• *{ticker}* ({stock.get('exchange') or '?'}) — "
+                         f"{stock.get('sector') or 'Unknown'}")
+        else:
+            lines.append(f"• *{ticker}*")
+    lines.append("\n_Remove one with /remove TICKER_")
+    await update.message.reply_text("\n".join(lines),
+                                    parse_mode=ParseMode.MARKDOWN)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "<b>GQ FinXray US</b>\n\n"
-        "You receive alerts only for the stocks on your watchlist.\n\n"
-        "<code>/add TICKER</code> — track a stock\n"
-        "<code>/remove TICKER</code> — stop tracking it\n"
-        "<code>/list</code> — your watchlist\n"
-        "<code>/settings</code> — alert preferences\n"
-        "<code>/stop</code> — pause all alerts\n\n"
-        "<b>What you'll get</b>\n"
-        "SEC filings (8-K, 10-Q, 10-K, Form 4) · company news · quarterly results · "
-        "earnings calendar and call summaries · insider and large trades · analyst rating changes · "
-        "technical signals · plus a daily heatmap of your watchlist.",
-        parse_mode=ParseMode.HTML,
+        "🤖 *GQ FinXray US*\n\n"
+        "*Commands*\n"
+        "/start — register this chat\n"
+        "/add TICKER — add a stock (e.g. `/add AAPL`)\n"
+        "/remove TICKER — remove a stock\n"
+        "/list — show your watchlist\n"
+        "/help — this message\n\n"
+        "*How it works*\n"
+        "Alerts are filtered to your watchlist, and only MEDIUM and HIGH "
+        f"impact items reach you. Up to {MAX_WATCHLIST} tickers.\n\n"
+        "_Tickers are case-insensitive — aapl works as well as AAPL._",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """A bare ticker like 'AAPL' is almost certainly an attempt to add it."""
-    text = (update.message.text or "").strip().upper().lstrip("$")
-    if 1 <= len(text) <= 5 and text.isalpha() and lookup_stock(text):
-        await update.message.reply_text(
-            f"Did you mean <code>/add {text}</code>?", parse_mode=ParseMode.HTML)
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bare ticker as a shortcut for /add, otherwise point at /help."""
+    text = (update.message.text or "").strip().upper()
+    if text.isalpha() and 1 <= len(text) <= 5 and get_stock_by_ticker(text):
+        context.args = [text]
+        await add_command(update, context)
         return
-    await update.message.reply_text("Send /help to see what I can do.")
+    await update.message.reply_text("Use /help to see what I can do.")
 
 
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = (update.inline_query.query or "").strip()
+    if not query:
+        return
+    results = search_stocks_by_prefix(query)
+    if not results:
+        return
+    await update.inline_query.answer(
+        [
+            InlineQueryResultArticle(
+                id=s["ticker"],
+                title=s["ticker"],
+                description=s.get("sector") or "",
+                input_message_content=InputTextMessageContent(f"/add {s['ticker']}"),
+            )
+            for s in results
+        ],
+        cache_time=60,
+    )
+
+
+async def on_error(update, context):
+    log.error("[BOT] unhandled error: %s", context.error, exc_info=context.error)
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 def main():
-    if not TELEGRAM_TOKEN:
-        raise SystemExit("TELEGRAM_TOKEN is not set")
+    log.info("[BOT] starting — %d authorised user(s), max watchlist %d",
+             len(AUTHORIZED_USERNAMES), MAX_WATCHLIST)
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # concurrent_updates: PTB processes updates sequentially by default, so one
+    # user's Supabase round-trip blocks everyone else's command behind it.
+    app = (Application.builder()
+           .token(TELEGRAM_TOKEN)
+           .concurrent_updates(True)
+           .build())
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("add", add_command))
     app.add_handler(CommandHandler("remove", remove_command))
-    app.add_handler(CommandHandler(["list", "watchlist"], list_command))
-    app.add_handler(CommandHandler("settings", settings_command))
-    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                   handle_text_message))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
+    app.add_error_handler(on_error)
 
-    logger.info("[BOT] Starting watchlist bot (max watchlist = %d)", MAX_WATCHLIST)
-    app.run_polling(drop_pending_updates=True)
+    # run_polling() is SYNCHRONOUS in python-telegram-bot v20+ — it builds and
+    # owns the event loop itself. Awaiting it inside asyncio.run() raises
+    # RuntimeError and kills the process on startup.
+    #
+    # Keep this service at 1 REPLICA. Telegram hands each update to whichever
+    # poller asks first, so a second replica silently eats half the commands.
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
