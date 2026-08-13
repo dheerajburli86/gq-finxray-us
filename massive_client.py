@@ -124,10 +124,20 @@ def _get(path, params=None, timeout=20, retries=2):
 
 
 def _results(data, default=None):
-    """Massive wraps payloads in {'results': ...}. Unwrap safely."""
-    if data and isinstance(data.get("results"), (list, dict)):
+    """Massive wraps payloads in {'results': ...}. Unwrap safely.
+
+    Guards the dict check BEFORE calling .get(). Several Massive endpoints return
+    a bare JSON array rather than the wrapper object, and a list is truthy, so
+    the previous `data.get("results")` raised AttributeError on exactly those
+    responses — surfacing as an unrelated crash inside whichever poller asked.
+    A bare array is already the payload, so pass it straight through.
+    """
+    fallback = [] if default is None else default
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("results"), (list, dict)):
         return data["results"]
-    return default if default is not None else []
+    return fallback
 
 
 # ── Snapshots ─────────────────────────────────────────────────────────────────

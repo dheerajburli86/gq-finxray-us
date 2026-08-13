@@ -137,6 +137,17 @@ def esc(text):
     return html.escape(str(text or ""), quote=False)
 
 
+def esc_attr(text):
+    """Escape for use INSIDE an HTML attribute value, e.g. href="...".
+
+    esc() passes quote=False, so a double quote survives untouched. Filing URLs
+    come from scraped/third-party data; one stray `"` closes the href early,
+    corrupts the anchor, and Telegram rejects the entire message with "can't
+    parse entities" — losing the alert rather than degrading it.
+    """
+    return html.escape(str(text or ""), quote=True)
+
+
 def _source_link(extra):
     """Find whatever URL the poller stored, under any of the keys used across pollers."""
     for key in ("url", "filing_url", "source_url", "link", "article_url"):
@@ -189,8 +200,10 @@ def build_message(alert, reason=None):
         lines.append(f"<b>{esc(headline)}</b>")
 
     # ── Body ─────────────────────────────────────────────────────────────────
+    summary_idx = None
     if summary:
         lines.append("")
+        summary_idx = len(lines)          # remembered so it can absorb any trim
         lines.append(esc(summary))
 
     # ── Provenance ───────────────────────────────────────────────────────────
@@ -199,7 +212,7 @@ def build_message(alert, reason=None):
 
     url = _source_link(extra)
     if url:
-        lines.append(f'🔗 <a href="{esc(url)}">View source</a>')
+        lines.append(f'🔗 <a href="{esc_attr(url)}">View source</a>')
 
     # ── Footer ───────────────────────────────────────────────────────────────
     lines.append("")
@@ -211,10 +224,40 @@ def build_message(alert, reason=None):
 
     msg = "\n".join(lines)
 
-    # Telegram hard-caps a message at 4096 characters. Truncate the body rather
-    # than let the API reject the whole alert.
+    # Telegram hard-caps a message at 4096 characters.
+    #
+    # Slicing the assembled HTML at a fixed offset (the old msg[:3990]) cuts
+    # wherever it lands — including inside `<a href="...">` or an `<i>` pair.
+    # Telegram then rejects the whole message with "can't parse entities" and the
+    # alert is lost outright, which is the opposite of what truncating is for.
+    #
+    # The summary is the only unbounded line and, unlike every other line, it is
+    # plain escaped text with no tags of its own — so it is the one place a cut
+    # is safe. Trim it and keep the provenance, disclaimer and footer intact.
+    if len(msg) > 4000 and summary_idx is not None:
+        overhead = len(msg) - len(lines[summary_idx])
+        room = 3900 - overhead
+        if room > 0:
+            # Trim the RAW text and re-escape. Cutting the already-escaped string
+            # could land inside an entity ("&amp;" -> "&am"), which is exactly the
+            # kind of malformed markup that makes Telegram reject the message.
+            cut = summary[:room]
+            while cut and len(esc(cut)) > room:
+                cut = cut[:-1]
+            lines[summary_idx] = esc(cut.rstrip()) + "…"
+            msg = "\n".join(lines)
+
+    # Belt and braces: if something unforeseen is still oversized, drop whole
+    # trailing lines (each carries balanced tags) rather than slice mid-tag.
     if len(msg) > 4000:
-        msg = msg[:3990] + "\n…"
+        kept, used = [], 0
+        for line in lines:
+            if used + len(line) + 1 > 3900:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        kept.append("…")
+        msg = "\n".join(kept)
     return msg
 
 

@@ -56,6 +56,7 @@ def poll_fmp_news():
         new_articles = 0
         duplicates = 0
         errors = 0
+        skipped_unattributed = 0
 
         for i in range(0, len(ticker_list), BATCH_SIZE):
             batch = ticker_list[i:i + BATCH_SIZE]
@@ -75,8 +76,17 @@ def poll_fmp_news():
                         duplicates += 1
                         continue
 
-                    # Extract fields
-                    ticker = article.get('symbol', 'MARKET').upper()
+                    # Extract fields.
+                    #
+                    # No 'MARKET' fallback. Delivery is watchlist-only, so a row
+                    # written with ticker='MARKET' is summarised at full LLM cost
+                    # and then dropped at delivery with no audience. An article
+                    # FMP cannot attribute to a symbol is not routable; skip it
+                    # here rather than paying to process it.
+                    ticker = (article.get('symbol') or '').upper().strip()
+                    if not ticker:
+                        skipped_unattributed += 1
+                        continue
                     url = article.get('url')
                     title = article.get('title', '')
                     text = article.get('text', '')
@@ -95,7 +105,12 @@ def poll_fmp_news():
                             "source": source,
                             "filing_type": filing_type,
                             "filing_url": url,
-                            "filing_date": pub_date,
+                            # Column is `filed_at`. `filing_date` does not exist
+                            # on raw_filings, so PostgREST rejected the whole
+                            # insert (PGRST204) and the except below logged it as
+                            # a generic failure — every FMP news article was
+                            # being dropped at the point of storage.
+                            "filed_at": pub_date,
                             "content_hash": content_hash,
                             "raw_text": text or title,
                             "status": "PENDING",
@@ -116,7 +131,8 @@ def poll_fmp_news():
                 errors += 1
 
         cache_info = cache_size()
-        logger.info(f"[FMP NEWS] Done — {new_articles} new, {duplicates} dup, {errors} errors. Cache: {cache_info} URLs")
+        logger.info(f"[FMP NEWS] Done — {new_articles} new, {duplicates} dup, "
+                    f"{skipped_unattributed} unattributed, {errors} errors. Cache: {cache_info} URLs")
 
     except Exception as e:
         logger.error(f"[FMP NEWS] Poll failed: {e}")

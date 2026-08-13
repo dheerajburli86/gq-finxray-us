@@ -375,6 +375,13 @@ def _store(summary, extra):
 def run_macro_policy_roundup():
     """Build and store one macro digest. Never raises — a scheduler calls this."""
     try:
+        # Publishes with ticker="MARKET", which has no audience under
+        # watchlist-only delivery. Building it anyway costs several FMP calls
+        # and an LLM summary for a row nobody receives.
+        from delivery import broadcast_enabled
+        if not broadcast_enabled():
+            logger.info("[MACRO] Skipped — market-wide delivery is disabled")
+            return
         if _already_sent_today():
             logger.info("[MACRO] Digest already published today; skipping.")
             return

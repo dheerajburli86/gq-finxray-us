@@ -132,20 +132,53 @@ def _pace_before_call():
         time.sleep(MIN_CALL_GAP_SECONDS - elapsed)
 
 
-def call_deepinfra(prompt, retries=3, max_tokens=1000):
-    """A 429 gets its own longer, capped wait; other failures get short backoff."""
+# google/gemini-2.5-flash is a REASONING model: its internal thinking tokens are
+# billed against `max_tokens` before a single visible word is emitted. The old
+# 600-token cap was being consumed by thinking, so the summary itself was cut off
+# mid-sentence — sometimes mid-word ("...a new stake in SpaceX (SP"). The
+# validator then rejected the fragment as 'too_short' or 'incomplete' and the
+# item was flagged instead of sent. That single mis-sized cap accounts for the
+# overwhelming majority of rows in flagged_summaries: the model was never wrong,
+# it was being gagged mid-sentence.
+#
+# Two defences, because either alone is fragile:
+#   1. Ask the provider to stop thinking at all (reasoning_effort="none"). Not
+#      every deployment honours it, so a 400 falls back to plain requests.
+#   2. Treat finish_reason=="length" as a retryable condition and re-ask with a
+#      bigger budget, rather than handing a known-truncated string to the
+#      validator and calling it a content failure.
+TOKEN_CEILING = 4000
+_reasoning_param_supported = [True]
+
+
+def _looks_truncated(text):
+    """A visible answer that stops without terminal punctuation was cut off."""
+    return bool(text) and not text.rstrip().endswith((".", "!", "?", '"', ")"))
+
+
+def call_deepinfra(prompt, retries=3, max_tokens=1500):
+    """A 429 gets its own longer, capped wait; other failures get short backoff.
+
+    Truncated generations are retried with a larger budget instead of being
+    passed downstream as content failures.
+    """
     headers = {"Authorization": f"Bearer {DEEPINFRA_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": DEEPINFRA_MODEL,
-               "messages": [{"role": "user", "content": prompt}],
-               "max_tokens": max_tokens}
 
     normal_attempt = 0
     rate_limit_attempt = 0
+    budget = max_tokens
+    truncation_retries = 0
 
     while True:
+        payload = {"model": DEEPINFRA_MODEL,
+                   "messages": [{"role": "user", "content": prompt}],
+                   "max_tokens": budget}
+        if _reasoning_param_supported[0]:
+            payload["reasoning_effort"] = "none"
+
         _pace_before_call()
         try:
-            r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=30)
+            r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=60)
         except Exception as e:
             _last_call_at[0] = time.monotonic()
             normal_attempt += 1
@@ -159,10 +192,29 @@ def call_deepinfra(prompt, retries=3, max_tokens=1000):
 
         if r.status_code == 200:
             resp = r.json()
-            text = (resp["choices"][0]["message"]["content"] or "").strip()
+            choice = resp["choices"][0]
+            text = (choice["message"].get("content") or "").strip()
+            # Closed thinking block: drop it. Unclosed (because the cap landed
+            # inside the block): everything after the opener is thought, not
+            # answer, so there is no usable content at all.
             text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            if "<think>" in text:
+                text = ""
             _record_token_usage(resp.get("usage"))
+
+            cut = choice.get("finish_reason") == "length" or _looks_truncated(text)
+            if cut and truncation_retries < 2 and budget < TOKEN_CEILING:
+                truncation_retries += 1
+                budget = min(budget * 2, TOKEN_CEILING)
+                print(f"[DEEPINFRA] Output truncated — retrying with max_tokens={budget}")
+                continue
             return text
+
+        # Deployment rejected reasoning_effort — drop it and retry once.
+        if r.status_code == 400 and _reasoning_param_supported[0] and "reasoning" in r.text.lower():
+            print("[DEEPINFRA] reasoning_effort unsupported here — disabling and retrying")
+            _reasoning_param_supported[0] = False
+            continue
 
         if r.status_code == 429:
             rate_limit_attempt += 1
@@ -287,24 +339,36 @@ def classify_failure(summary, max_words, min_words=MIN_WORDS):
 
 
 # ── S.1 / S.3 ─────────────────────────────────────────────────────────────────
-def generate_s1(company_name, raw_text, filing_type="", sub_summary=""):
+def generate_s1(company_name, raw_text, filing_type="", sub_summary="",
+                min_word_count=MIN_WORDS, target_word_count=None):
+    """First-pass summary.
+
+    `target_word_count` must be the SAME ceiling the validator will judge against.
+    It previously always asked for STARTING_TARGET (75) while classify_failure()
+    measured against min(75, max_target) — so for any short source the model was
+    instructed to write 75 words and then rejected as 'too_long' for obeying.
+    """
+    target = STARTING_TARGET if target_word_count is None else target_word_count
     if filing_type == "NEWS":
-        prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT])
+        prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT],
+                            target_word_count=target, min_word_count=min_word_count)
     elif filing_type == "EARNINGS_TRANSCRIPT":
         prompt = s1t_prompt(company_name, sub_summary, raw_text[:TRANSCRIPT_CHAR_LIMIT],
-                            target_word_count=STARTING_TARGET, min_word_count=MIN_WORDS)
+                            target_word_count=target, min_word_count=min_word_count)
     else:
         prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
-                            target_word_count=STARTING_TARGET, min_word_count=MIN_WORDS)
-    return call_deepinfra(prompt, max_tokens=600)
+                            target_word_count=target, min_word_count=min_word_count)
+    return call_deepinfra(prompt, max_tokens=1500)
 
 
 def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=MIN_WORDS):
     char_limit = TRANSCRIPT_CHAR_LIMIT if filing_type == "EARNINGS_TRANSCRIPT" else NEWS_CHAR_LIMIT
+    # For NEWS, min_words is already proportional from word_bounds(). For others, use passed value.
+    effective_min = min_words if min_words else MIN_WORDS
     prompt = f"""You are a financial analyst. Write a summary of the following content using exactly {target_words} words.
 
 Rules:
-- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {min_words} words and never more than {target_words} words.
+- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {effective_min} words and never more than {target_words} words.
 - Do not pad the summary with filler phrases, restated facts, or generic commentary just to reach the word count -- every added word must carry real information from the content below.
 - Must end with a complete sentence ending in . ! or ?
 - Do not start with "This", "The following", "Summary:", "Note:" or similar
@@ -316,18 +380,22 @@ Content:
 {raw_text[:char_limit]}
 
 Return only the summary. Nothing else."""
-    return call_deepinfra(prompt, max_tokens=700)
+    return call_deepinfra(prompt, max_tokens=1500)
 
 
 def store_flagged_summary(filing_id, ticker, company_name, final_summary, failure_reason,
-                          attempts, source="SEC_EDGAR", filing_type=""):
+                          attempts, source="SEC_EDGAR", filing_type="", max_target_reached=None):
+    """`max_target_reached` used to be logged as the MAX_TARGET constant (always
+    100), which made the column useless for diagnosis — every row claimed the
+    ladder had run to the top even when it never ran at all. Log the real one."""
     try:
         fid, fname = resolve_feature(source, filing_type)
         supabase.table("flagged_summaries").insert({
             "filing_id": filing_id, "ticker": ticker, "company_name": company_name,
             "final_summary": final_summary,
             "final_word_count": count_words(final_summary) if final_summary else 0,
-            "max_target_reached": MAX_TARGET, "failure_reason": failure_reason,
+            "max_target_reached": MAX_TARGET if max_target_reached is None else max_target_reached,
+            "failure_reason": failure_reason,
             "attempts": attempts, "feature_id": fid, "feature_name": fname,
             "source": source, "filing_type": filing_type,
         }).execute()
@@ -342,7 +410,8 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     min_words, max_target = word_bounds(raw_text, filing_type)
     target = min(STARTING_TARGET, max_target)
 
-    raw = generate_s1(company_name, raw_text, filing_type, sub_summary)
+    raw = generate_s1(company_name, raw_text, filing_type, sub_summary,
+                      min_word_count=min_words, target_word_count=target)
     summary = standardize_numbers(clean_summary(raw)) if raw else None
     failure = classify_failure(summary, target, min_words)
     attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
@@ -362,7 +431,7 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
 
     print(f"[SUMMARY] Ladder exhausted ({failure}) — flagging, not sending")
     store_flagged_summary(filing_id, ticker, company_name, summary, failure,
-                          attempts_log, source, filing_type)
+                          attempts_log, source, filing_type, max_target_reached=max_target)
     return None, len(attempts_log)
 
 

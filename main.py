@@ -69,6 +69,7 @@ from ipo_poller import run_ipo_poller
 from earnings_transcript_poller import run_earnings_transcript_poller
 from news_roundup import run_etf_xray
 from etf_flow_poller import run_etf_flow_poller
+from earnings_alerts import poll_earnings_for_tickers
 from heatmap_generator import (run_sector_heatmap_midday, run_sector_heatmap_afternoon,
                                run_sector_heatmap_weekly, run_sector_heatmap_monthly)
 from watchlist_heatmap import run_watchlist_heatmap_midday, run_watchlist_heatmap_eod
@@ -138,6 +139,7 @@ def run_scheduler():
     # ── Results, earnings calendar, insider (Features 3, 4, 5) ───────────────
     schedule.every(30).minutes.do(safe_job(process_pending_snapshots, "result_snapshot"))
     schedule.every(60).minutes.do(safe_job(poll_fmp_events, "poll_fmp_events"))
+    schedule.every(4).hours.do(safe_job(poll_earnings_for_tickers, "earnings_alerts"))
 
     # ── Technical (Feature 6) — every 30 min inside market hours ─────────────
     schedule.every(30).minutes.do(safe_job(run_technical_poller, "technical_poller"))

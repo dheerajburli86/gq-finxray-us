@@ -34,6 +34,11 @@ Runs once a day via the scheduler in main.py.
 import os
 import logging
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
+
+# US Eastern. The rest of the codebase (etf_flow_poller, watchlist_heatmap,
+# technical_poller) already anchors market dates here; this module did not.
+ET = ZoneInfo("America/New_York")
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -125,10 +130,21 @@ def parse_listing_date(start_date_str):
         return None
 
 
+def _today_et():
+    """Today's date in US Eastern.
+
+    This module used bare date.today(). On a UTC server, from about 20:00 ET the
+    UTC date has already rolled over, so an IPO listing later *today* in market
+    terms tested as "already listed" and was dropped — permanently, because the
+    poller runs once a day and the date is only further in the past next time.
+    """
+    return datetime.now(ET).date()
+
+
 def timing_label(listing_date):
     if not listing_date:
         return "date to be confirmed"
-    delta = (listing_date - date.today()).days
+    delta = (listing_date - _today_et()).days
     if delta == 0:
         return "today"
     if delta == 1:
@@ -222,12 +238,20 @@ def process_ipo(ipo):
         return False
 
     listing_date = parse_listing_date(start_date_raw)
-    if listing_date and listing_date < date.today():
+    if listing_date and listing_date < _today_et():
         # FMP keeps recently priced deals in the window; a "heads-up" about a
         # listing that already happened is worse than no alert.
         return False
 
-    signature = f"{start_date_raw}|{ipo.get('priceRange', '')}|{ipo.get('shares', '')}"
+    # Build the signature from NORMALISED values. FMP returns `shares` as a bare
+    # number, a comma-formatted string ("12,500,000") or null for the same
+    # unchanged listing on different days (this module's own docstring documents
+    # that inconsistency). Hashing the raw field meant a representation flip
+    # produced a "new" signature and re-alerted an IPO the user had already seen.
+    # priceRange is a band string ("$18.00-$20.00"), so normalise whitespace and
+    # case rather than coercing it to a number.
+    price_sig = " ".join(str(ipo.get("priceRange") or "").split()).upper()
+    signature = f"{start_date_raw}|{price_sig}|{shares}"
     seen = already_sent(ticker, signature)
     if seen is None or seen:
         return False

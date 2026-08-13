@@ -171,6 +171,12 @@ def _headline(rows):
 def run_etf_xray():
     """Daily structured ETF snapshot. Never raises."""
     try:
+        # ETF Xray publishes with ticker="MARKET" and so has no audience under
+        # watchlist-only delivery. Skip before spending a quote call per ETF.
+        from delivery import broadcast_enabled
+        if not broadcast_enabled():
+            logger.info("[ETF XRAY] Skipped — market-wide delivery is disabled")
+            return
         if _already_sent_today():
             logger.info("[ETF XRAY] Already sent today — skipping")
             return

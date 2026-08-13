@@ -51,23 +51,35 @@ IMPACT_CHOICES = {"high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
 
 
 # ── User + watchlist persistence ──────────────────────────────────────────────
-def get_or_create_user(chat_id, username=None, user_id=None, display_name=None):
-    """Idempotent registration keyed on chat_id. Returns the user row, or None."""
+def get_or_create_user(chat_id, username=None, user_id=None, display_name=None,
+                       reactivate=False):
+    """Idempotent registration keyed on chat_id. Returns the user row, or None.
+
+    `reactivate` must be True ONLY for /start. Every command handler calls this
+    function, and it used to force is_active=True unconditionally — so a user who
+    sent /stop was silently resubscribed the moment they sent /list or /settings
+    to check that the stop had worked. Opting out has to survive the user looking
+    at their own settings.
+    """
     chat_id = str(chat_id)
     try:
         found = (supabase.table("users").select("*")
                  .eq("telegram_chat_id", chat_id).limit(1).execute()).data
         if found:
             user = found[0]
-            patch = {"is_active": True}
+            patch = {"is_active": True} if reactivate else {}
             if username and user.get("telegram_username") != username:
                 patch["telegram_username"] = username
             if display_name and user.get("display_name") != display_name:
                 patch["display_name"] = display_name
             if user_id and user.get("telegram_user_id") != str(user_id):
                 patch["telegram_user_id"] = str(user_id)
-            supabase.table("users").update(patch).eq("id", user["id"]).execute()
-            user.update(patch)
+            # An empty patch is now possible (a returning user with no changed
+            # profile fields and no reactivation); PostgREST rejects an empty
+            # UPDATE body, so only write when there is something to write.
+            if patch:
+                supabase.table("users").update(patch).eq("id", user["id"]).execute()
+                user.update(patch)
             _ensure_prefs(user["id"])
             return user
 
@@ -129,9 +141,20 @@ def get_watchlist(user_id):
 
 def add_ticker(user_id, ticker, company_name=None):
     """Returns 'added' | 'exists' | 'error'."""
+    ticker = ticker.upper()
     try:
+        # There is no UNIQUE(user_id, ticker) constraint on watchlists, so the
+        # duplicate branch below could never fire and `/add AAPL` twice inserted
+        # two rows. Delivery joins per row, so the user then received every AAPL
+        # alert twice. Check before inserting.
+        existing = (supabase.table("watchlists").select("id")
+                    .eq("user_id", user_id).eq("ticker", ticker)
+                    .limit(1).execute()).data
+        if existing:
+            return "exists"
+
         supabase.table("watchlists").insert({
-            "user_id": user_id, "ticker": ticker.upper(), "company_name": company_name,
+            "user_id": user_id, "ticker": ticker, "company_name": company_name,
         }).execute()
         return "added"
     except Exception as e:
@@ -160,6 +183,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username=tg.username,
         user_id=tg.id,
         display_name=tg.full_name,
+        reactivate=True,   # /start is the ONLY command that resubscribes.
     )
     if not user:
         await update.message.reply_text("Couldn't set up your account just now. Try /start again in a moment.")

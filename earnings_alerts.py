@@ -30,14 +30,31 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 POLLER_NAME = "earnings_alerts"
 
 
-def get_earnings_for_ticker(ticker):
+def get_earnings_for_ticker(ticker, days_back=7, days_forward=1):
     """
-    Fetch earnings calendar for a single ticker.
+    Fetch earnings calendar events for a single ticker.
     Returns list of earnings events (scheduled + actual).
+
+    NOTE: this module is not currently registered in main.py — nothing calls it.
+    It is kept working so that wiring it up is a one-line change rather than a
+    debugging session.
+
+    The previous implementation called fmp_client.get_earnings_calendar(ticker),
+    but that function's signature is (from_date, to_date) and the endpoint has no
+    per-symbol filter. Every call raised TypeError, was swallowed by the except
+    below, and returned [] — so the module reported "no earnings misses" forever
+    while never actually looking. Fetch the window, then filter by symbol here.
     """
     try:
-        data = fmp_client.get_earnings_calendar(ticker)
-        return data if isinstance(data, list) else []
+        today = datetime.now(timezone.utc).date()
+        data = fmp_client.get_earnings_calendar(
+            (today - timedelta(days=days_back)).isoformat(),
+            (today + timedelta(days=days_forward)).isoformat(),
+        )
+        if not isinstance(data, list):
+            return []
+        want = (ticker or "").upper()
+        return [e for e in data if (e.get("symbol") or "").upper() == want]
     except Exception as e:
         logger.error(f"[EARNINGS] Failed to fetch {ticker}: {e}")
         return []

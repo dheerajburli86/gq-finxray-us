@@ -430,6 +430,17 @@ def save_heatmap_record(filing_type, summary, sectors, sent, failed):
 
 
 # ══ Shared run body ═══════════════════════════════════════════════════════════
+def _broadcast_ok(slot):
+    """Sector heatmaps are market-wide. Under watchlist-only delivery they have
+    no audience, so rendering one burns FMP calls and CPU for an image that
+    deliver_photo_sync() drops. Check before doing any of that work."""
+    from delivery import broadcast_enabled
+    if broadcast_enabled():
+        return True
+    logger.info("[HEATMAP] %s skipped — market-wide delivery is disabled", slot)
+    return False
+
+
 def _publish(slot, period, headline, sectors):
     period_label = PERIOD_LABELS.get(period, "Today")
 
@@ -460,6 +471,8 @@ def _publish(slot, period, headline, sectors):
 def _run_daily(slot, headline):
     """Body shared by the midday and afternoon slots. Never raises."""
     try:
+        if not _broadcast_ok(slot):
+            return
         if heatmap_already_sent(slot):
             logger.info("[HEATMAP] %s already sent today; skipping", slot)
             return
@@ -490,6 +503,8 @@ def run_sector_heatmap_afternoon():
 
 def run_sector_heatmap_weekly():
     try:
+        if not _broadcast_ok(SLOT_WEEKLY):
+            return
         today = datetime.now(ET).date()
         if not is_last_trading_day_of_week(today):
             logger.info("[HEATMAP] %s skipped — %s is not the last trading day of its week",
@@ -514,6 +529,8 @@ def run_sector_heatmap_weekly():
 
 def run_sector_heatmap_monthly():
     try:
+        if not _broadcast_ok(SLOT_MONTHLY):
+            return
         today = datetime.now(ET).date()
         if not is_last_trading_day_of_month(today):
             logger.info("[HEATMAP] %s skipped — %s is not the last trading day of its month",

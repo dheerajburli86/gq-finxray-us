@@ -26,9 +26,9 @@ FIXES OVER THE PREVIOUS VERSION
   and disappeared with the container.
 * Dedup is one batched query and fails closed.
 
-The ETF universe is deliberately fixed and market-wide (feature_map marks
-feature 7 `market_wide=True`), so these alerts are not watchlist-scoped —
-delivery.py routes them to users who have not opted out of market-wide messages.
+ETF flow alerts (feature 7) are now watchlist-scoped. Only users whose watchlist
+contains an ETF will receive alerts about that ETF's flows. If the ETF ticker is
+not on any user's watchlist, the alert will be skipped by the delivery layer.
 """
 
 import os
@@ -242,6 +242,24 @@ def run_etf_flow_poller():
             logger.info("[ETF FLOW] Only %.0f%% of the session's expected volume has elapsed — "
                         "too early for a reliable volume comparison. Skipping.", elapsed * 100)
             return
+
+        # Delivery is watchlist-only, so an alert for an ETF nobody watches is
+        # written and then dropped with no audience. This poller used to report
+        # "N alerts written" either way, making total non-delivery invisible.
+        try:
+            from watchlist_util import get_watched_tickers
+            watched = get_watched_tickers() or set()
+            covered = sorted({e.upper() for e in ETF_UNIVERSE} & {w.upper() for w in watched})
+            if not covered:
+                logger.info("[ETF FLOW] None of the %d tracked ETFs (%s) is on any "
+                            "watchlist — nothing written would reach a user. Skipping.",
+                            len(ETF_UNIVERSE), ", ".join(sorted(ETF_UNIVERSE)))
+                return
+            logger.info("[ETF FLOW] %d/%d tracked ETFs are watched: %s",
+                        len(covered), len(ETF_UNIVERSE), ", ".join(covered))
+        except Exception as e:
+            # Visibility only — never let this check block the run.
+            logger.warning("[ETF FLOW] Watchlist coverage check failed (%s); continuing.", e)
 
         sent = load_sent_today()
         if sent is None:

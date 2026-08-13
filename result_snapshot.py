@@ -369,8 +369,17 @@ def queue_snapshot(snapshot):
     """Write the snapshot to raw_filings as PENDING. Returns True on insert."""
     ticker = snapshot["ticker"]
     period_slug = re.sub(r"[^A-Za-z0-9]+", "_", snapshot["period"]).strip("_")
-    # Link to FMP financials page so users can verify and explore more
-    filing_url = f"https://site.financialmodelingprep.com/financials/{ticker.upper()}"
+    # Link to FMP financials page so users can verify and explore more.
+    #
+    # raw_filings.filing_url carries a UNIQUE constraint on the column ALONE
+    # (not the composite UNIQUE(filing_url, ticker) this code assumed). A URL
+    # that was constant per ticker therefore let exactly ONE snapshot per ticker
+    # ever insert — every later quarter collided and was swallowed by the
+    # "duplicate" branch below as if it had already been queued. period_slug was
+    # computed for this purpose and then never used. The fragment keeps the link
+    # clickable (browsers ignore #...) while making the row unique per period.
+    filing_url = (f"https://site.financialmodelingprep.com/financials/"
+                  f"{ticker.upper()}#{period_slug}")
     text = snapshot["raw_text"]
 
     try:

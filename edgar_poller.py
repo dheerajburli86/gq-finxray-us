@@ -507,10 +507,24 @@ def _entry_text(entry, tag):
 
 
 def _parse_title(title, form_type):
-    """'8-K - ACME CORP (0000012345) (Filer)' -> ('ACME CORP', '0000012345')."""
-    m = re.match(rf"{re.escape(form_type)}\s*-\s*(.+?)\s*\((\d+)\)", title or "")
+    """'8-K - ACME CORP (0000012345) (Filer)' -> ('ACME CORP', '0000012345').
+
+    The `(?:/A)?` matters. EDGAR titles amendments as '8-K/A - ACME CORP (...)',
+    and the old pattern required a '-' immediately after the form type, so it
+    failed on every amendment. A failed parse returns an empty CIK, which makes
+    get_ticker_from_cik() return None, which makes the caller `continue` — so
+    amended filings were dropped in silence with no log line. Amendments are
+    frequently the material event (a restated 10-K, a corrected 8-K), so this
+    was discarding exactly the filings most worth alerting on.
+    """
+    m = re.match(rf"{re.escape(form_type)}(?:/A)?\s*-\s*(.+?)\s*\((\d+)\)", title or "")
     if m:
         return m.group(1).strip(), m.group(2)
+    # Last resort: pull any parenthesised CIK so the entry is still routable.
+    m = re.match(r"[^-]+-\s*(.+?)\s*\((\d+)\)", title or "")
+    if m:
+        return m.group(1).strip(), m.group(2)
+    logger.warning("[EDGAR] Could not parse title, dropping entry: %r", title)
     return (title or "").strip(), ""
 
 

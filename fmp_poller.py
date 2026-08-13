@@ -26,14 +26,17 @@ WHAT CHANGED, AND WHY
 
 import os
 import time
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from supabase import create_client
 
 import fmp_client
+from fmp_client import FMPError
 from feature_map import tag_extra
 from watchlist_util import get_watched_tickers, log_poller_error
+from news_deduplicator import should_send, cache_size
 
 load_dotenv()
 
@@ -154,20 +157,50 @@ def store_alert(ticker, summary, impact, filing_type, extra, headline=None, url=
         return False
 
 
-# ── 1. Ticker news ────────────────────────────────────────────────────────────
+# ── 1. Ticker news (batch-optimized) ──────────────────────────────────────────
 def poll_ticker_news(tickers):
+    """
+    Batch ticker news polling with deduplication.
+
+    Instead of N requests (one per ticker), batches up to 50 tickers per request.
+    For 50 tickers, this is ~150 API calls/min, well under the 750 calls/min limit.
+    Deduplicates by URL with 5-minute TTL cache to prevent duplicate alerts.
+    """
     total = 0
-    for ticker in sorted(tickers):
+    duplicates = 0
+    BATCH_SIZE = 50
+    ticker_list = sorted(tickers)
+
+    # Batch tickers into groups of BATCH_SIZE
+    for i in range(0, len(ticker_list), BATCH_SIZE):
+        batch = ticker_list[i:i + BATCH_SIZE]
+        symbols = ",".join(batch)
+
         try:
-            articles = fmp_client.get_stock_news(ticker, limit=10) or []
+            articles = fmp_client.get_stock_news(symbols, limit=250) or []
+        except FMPError as e:
+            # Quota exhausted or key rejected: every remaining batch will fail
+            # the same way after burning its full retry/backoff budget. The
+            # scheduler is single-threaded, so grinding through them delays the
+            # 30-second SEC pollers behind this job. Abandon the run instead.
+            print(f"[FMP] News aborted at batch {i//BATCH_SIZE + 1} — {e}")
+            break
         except Exception as e:
-            print(f"[FMP] News fetch failed for {ticker}: {e}")
+            print(f"[FMP] News fetch failed for batch {i//BATCH_SIZE + 1}: {e}")
             continue
 
         for article in articles:
-            url = article.get("url") or ""
-            if not url or news_already_stored(url):
+            # Dedup check using URL-based cache
+            if not should_send(article):
+                duplicates += 1
                 continue
+
+            url = article.get("url") or ""
+            if not url:
+                continue
+
+            ticker = article.get("symbol", "MARKET").upper()
+
             if store_news(
                 ticker=ticker,
                 title=article.get("title", ""),
@@ -177,7 +210,9 @@ def poll_ticker_news(tickers):
                 source_site=article.get("site", "FMP"),
             ):
                 total += 1
-        time.sleep(0.15)
+
+    cache_info = cache_size()
+    print(f"[FMP NEWS] Dedup cache: {cache_info} URLs cached")
     return total
 
 
@@ -258,6 +293,11 @@ def poll_insider_transactions(tickers):
     for ticker in sorted(tickers):
         try:
             txns = fmp_client.get_insider_trading(ticker, limit=10) or []
+        except FMPError as e:
+            # One ticker per request: with hundreds watched, continuing past a
+            # quota failure costs minutes of retries and starves other jobs.
+            print(f"[FMP] Insider run aborted at {ticker} — {e}")
+            break
         except Exception as e:
             print(f"[FMP] Insider fetch failed for {ticker}: {e}")
             continue
@@ -318,7 +358,8 @@ def poll_insider_transactions(tickers):
             if value >= LARGE_TRADE_THRESHOLD_USD and not large_trade_already_sent(ticker, insider, txn_date):
                 big_summary = (f"Major insider trade in {ticker}: {insider}{f' ({role})' if role else ''} "
                                f"{action} {value_str} ({shares_str} shares @ {price_str}) on {txn_date}. "
-                               f"Insider transactions exceeding $1M signal material conviction — {'significant profit-taking' if action.lower() == 'sold' else 'substantial confidence'} from company leadership.")
+                               f"Insider transactions exceeding ${LARGE_TRADE_THRESHOLD_USD / 1_000_000:,.0f}M "
+                               f"signal material conviction — {'significant profit-taking' if action.lower() == 'sold' else 'substantial confidence'} from company leadership.")
                 store_alert(ticker, big_summary, "HIGH", "BULK_DEAL",
                             {"insider_name": insider, "transaction_type": action.upper(),
                              "shares": shares_str, "price": price_str, "value": value_str,

@@ -15,9 +15,10 @@ Each function now writes exactly ONE row to `alerts`:
     source="MACRO_ROUNDUP", filing_type="MACRO_BRIEFING",
     ticker="MARKET", impact="MEDIUM", delivered=False
 
-feature_map resolves that pair to feature 13, which is market_wide, so
-delivery.py fans it out to active users who have `receive_market_wide` on —
-and to nobody else. Nothing here imports telegram.
+feature_map resolves that pair to feature 13 (Macro & Policy Digest), which is
+now watchlist-scoped like all features. With ticker="MARKET", these alerts will
+be dropped by ai_pipeline Stage 0 watchlist gate since "MARKET" is not on any
+user's watchlist. Macro alerts are no longer broadcast to all users.
 
 WHY THERE IS NO 6,353-TICKER LOOP
 ---------------------------------
@@ -314,6 +315,15 @@ def _guard(report_type):
     """Decorator-free helper: wraps a report body so a scheduler can call it."""
     def wrap(fn):
         def inner():
+            # These five reports publish with ticker="MARKET". Since the
+            # watchlist-only migration that audience is empty, so every run
+            # spent FMP quota and LLM tokens building a message that delivery
+            # discarded. Stop before doing the work; flip GQ_ENABLE_MARKET_WIDE
+            # to bring them back.
+            from delivery import broadcast_enabled
+            if not broadcast_enabled():
+                logger.info("[REPORTS] %s skipped — market-wide delivery is disabled", report_type)
+                return False
             try:
                 return fn()
             except Exception as e:

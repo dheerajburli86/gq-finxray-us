@@ -262,7 +262,12 @@ def _build_patterns(ticker):
         # "Snap Inc", "Sunrun Inc." — only meaningful for word-shaped tickers,
         # harmless for the rest. Ticker word matched case-insensitively, the
         # corporate suffix case-sensitively so "co" in prose cannot trigger it.
-        re.compile(rf"(?i:\b{t}\b)\s+(?:{_CORP_SUFFIX})"),
+        # The trailing \b is load-bearing. Without it "Corp\.?" matched the first
+        # four letters of "Corporate", so text like "...discussed IT Corporate
+        # spending..." registered as a STRONG hit for ticker IT (Gartner) — and
+        # strong hits bypass the COMMON_WORD_TICKERS filter entirely, so the
+        # article was attributed to a company it never mentioned.
+        re.compile(rf"(?i:\b{t}\b)\s+(?:{_CORP_SUFFIX})\b"),
     ]
     plain = re.compile(rf"\b{t}\b")
     return strong, plain
@@ -475,6 +480,16 @@ def _chunked(seq, size):
         yield seq[i:i + size]
 
 
+def _row_url(url, ticker):
+    """The filing_url actually stored for one (article, ticker) pair.
+
+    raw_filings.filing_url is UNIQUE on that column alone, but one article
+    legitimately produces one row per company it names. The fragment keeps those
+    rows distinct while still resolving to the same article in a browser.
+    """
+    return f"{url}#t={(ticker or '').upper()}" if url else url
+
+
 def find_existing(urls, hashes):
     """
     One batched lookup for a whole feed instead of one SELECT per article.
@@ -485,12 +500,16 @@ def find_existing(urls, hashes):
     """
     url_pairs, hash_pairs = set(), set()
     try:
-        for chunk in _chunked(urls, 50):
+        for chunk in _chunked(sorted(urls), 50):
             rows = (supabase.table("raw_filings")
                     .select("filing_url, ticker")
                     .in_("filing_url", chunk).execute()).data or []
             for r in rows:
-                url_pairs.add((r.get("filing_url"), (r.get("ticker") or "").upper()))
+                # Normalise the stored value back to the bare article URL so
+                # callers keep testing (article_url, ticker) exactly as before,
+                # regardless of whether the row predates the per-ticker suffix.
+                bare = (r.get("filing_url") or "").split("#t=")[0]
+                url_pairs.add((bare, (r.get("ticker") or "").upper()))
     except Exception as e:
         logger.error("[NEWS] URL dedup lookup failed: %s", e)
         log_poller_error(POLLER_NAME, "find_existing:url", e)
@@ -514,13 +533,21 @@ def find_existing(urls, hashes):
 def store_news(source_key, ticker, title, body, url, filed_at_iso, sector, chash, feed_name):
     """Insert one PENDING row. Returns True when a row was actually created."""
     try:
+        # The real constraint is UNIQUE(filing_url) on that column ALONE, not the
+        # UNIQUE(filing_url, ticker) the code below assumed. One article can name
+        # up to MAX_TICKERS_PER_ARTICLE companies and is stored once per ticker —
+        # so every ticker after the first hit a genuine unique violation, was
+        # written off as an expected duplicate, and watchers of the 2nd and 3rd
+        # company never saw the story. The per-ticker fragment restores that fan-
+        # out; browsers ignore it, so the link still resolves to the article.
+        row_url = _row_url(url, ticker)
         supabase.table("raw_filings").insert({
             "source": source_key,
             "filing_type": "NEWS",
             "ticker": ticker,
             "company_name": ticker,
             "raw_text": f"{title}\n\n{body}".strip(),
-            "filing_url": url,
+            "filing_url": row_url,
             "filed_at": filed_at_iso,
             "status": "PENDING",
             "content_hash": chash,
@@ -625,7 +652,13 @@ def poll_news_source(source, watched, cutoff):
 
     # Pass 2: one batched dedup read for the whole feed.
     try:
-        seen_urls, seen_hashes = find_existing({c["url"] for c in candidates},
+        # Look up both the bare URL (rows written before the per-ticker suffix
+        # existed) and every per-ticker form we might be about to write, so the
+        # batched read still pre-filters instead of leaving every duplicate to be
+        # discovered by a failed INSERT.
+        lookup_urls = {c["url"] for c in candidates}
+        lookup_urls |= {_row_url(c["url"], t) for c in candidates for t in c["tickers"]}
+        seen_urls, seen_hashes = find_existing(lookup_urls,
                                                {c["hash"] for c in candidates})
     except Exception:
         # Fail closed. Continuing without dedup would re-ingest the entire feed

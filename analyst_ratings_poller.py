@@ -353,7 +353,14 @@ def _process_ticker(ticker, company_name):
             f"across {snap['analyst_count']} analysts. No alert sent — this is the "
             f"reference point future rating and target changes are measured against."
         )
-        _insert_alert(ticker, summary, "LOW", baseline_extra, delivered=True)
+        # The return value MUST be checked. The baseline row is the only record
+        # that this ticker has ever been observed; if the insert fails and we
+        # still report success, the next run finds no prior row, writes another
+        # baseline, and the ticker re-baselines forever without ever alerting.
+        # Reporting the failure lets the caller count it and retry next cycle.
+        if not _insert_alert(ticker, summary, "LOW", baseline_extra, delivered=True):
+            logger.error("[ANALYST] Baseline insert failed for %s — will retry next run", ticker)
+            return "error"
         return "baseline"
 
     should_alert, rating_changed, target_pct = _evaluate(snap, prior)

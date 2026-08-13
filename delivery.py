@@ -57,6 +57,27 @@ ADMIN_CHANNEL_ID = os.getenv("TELEGRAM_ADMIN_CHANNEL_ID") or None
 
 ET = ZoneInfo("America/New_York")
 
+# Market-wide broadcast switch.
+#
+# Since the 2026-08-11 watchlist-only migration, an alert with ticker="MARKET"
+# has no audience: resolve_audience() returns [] and the row is marked delivered
+# without reaching anyone. Several producers (sector heatmap, ETF Xray, macro
+# digest, the five daily market reports) never stopped emitting those alerts, so
+# they were paying for FMP calls, LLM tokens and image rendering to build
+# messages that were discarded at the last step.
+#
+# Producers must check broadcast_enabled() BEFORE doing that work. Flipping
+# GQ_ENABLE_MARKET_WIDE=true re-enables the path in one place if the product
+# decision is ever reversed — at which point resolve_audience() must also be
+# taught to honour user_preferences.receive_market_wide.
+BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "false").strip().lower()
+                     in ("1", "true", "yes"))
+
+
+def broadcast_enabled():
+    """True when market-wide (ticker='MARKET') alerts can actually be delivered."""
+    return BROADCAST_ENABLED
+
 IMPACT_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
 # Telegram permits ~30 messages/second across all chats. Stay comfortably under.
@@ -121,8 +142,16 @@ def _fetch_watchers(tickers):
 
     Chunked at 200 tickers per request because PostgREST puts the `in.()` list in
     the URL and a 6,300-item list would exceed the server's URI length limit.
+
+    Returns (watchers, unresolved) where `unresolved` is the set of tickers whose
+    lookup FAILED. That distinction matters: a failed chunk used to be silently
+    skipped, which made every ticker in it look like it had no watchers. The
+    caller then recorded "no_audience" and marked the alert delivered forever, so
+    a momentary database blip permanently destroyed real alerts. Callers must
+    leave unresolved tickers pending instead of concluding nobody wants them.
     """
     watchers = {}
+    unresolved = set()
     tickers = [t for t in tickers if t]
     for i in range(0, len(tickers), 200):
         chunk = tickers[i:i + 200]
@@ -133,10 +162,11 @@ def _fetch_watchers(tickers):
                     .execute()).data or []
         except Exception as e:
             logger.error(f"[DELIVERY] Watchlist lookup failed for chunk {i}: {e}")
+            unresolved.update(chunk)
             continue
         for r in rows:
             watchers.setdefault((r.get("ticker") or "").upper(), set()).add(r["user_id"])
-    return watchers
+    return watchers, unresolved
 
 
 def _fetch_existing_deliveries(alert_ids):
@@ -279,7 +309,8 @@ async def deliver_pending_alerts():
         (a.get("ticker") or "").upper()
         for a in alerts
     }
-    watchers = _fetch_watchers(sorted(t for t in tickers if t and t not in ("MARKET", "UNKNOWN")))
+    watchers, unresolved = _fetch_watchers(
+        sorted(t for t in tickers if t and t not in ("MARKET", "UNKNOWN")))
 
     alert_ids   = [a["id"] for a in alerts]
     already     = _fetch_existing_deliveries(alert_ids)
@@ -288,48 +319,68 @@ async def deliver_pending_alerts():
     bot = Bot(token=TELEGRAM_TOKEN)
     ledger = []
     fanned = []
-    stats = {"sent": 0, "failed": 0, "skipped": 0, "no_audience": 0}
+    stats = {"sent": 0, "failed": 0, "skipped": 0, "no_audience": 0, "deferred": 0, "errored": 0}
 
     for alert in alerts:
         aid = alert["id"]
-        audience = resolve_audience(alert, users, watchers)
 
-        if not audience:
-            stats["no_audience"] += 1
-            fanned.append(aid)
+        # A ticker whose watchlist lookup errored is UNKNOWN, not unwatched.
+        # Leave the alert pending so the next cycle can route it properly rather
+        # than burning it as "nobody wanted this".
+        if (alert.get("ticker") or "").upper() in unresolved:
+            stats["deferred"] += 1
             continue
 
-        text = build_message(alert, reason=delivery_reason(alert))
+        # One malformed alert must not take down the cycle. Without this, a bad
+        # `extra` payload raised out of build_message() before _record() and
+        # _mark_fanned_out() ever ran, so every already-sent message in the batch
+        # was re-sent from scratch on the next 30-second pass — a duplicate storm
+        # that repeated until the offending row was manually removed.
+        try:
+            audience = resolve_audience(alert, users, watchers)
 
-        for user, reason in audience:
-            uid = user["user_id"]
-            if (aid, uid) in already:
+            if not audience:
+                stats["no_audience"] += 1
+                fanned.append(aid)
                 continue
 
-            if sent_today.get(uid, 0) >= user["max_alerts_per_day"]:
-                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                               "status": "SKIPPED", "reason": "daily_cap_reached"})
-                stats["skipped"] += 1
-                continue
+            text = build_message(alert, reason=delivery_reason(alert))
 
-            ok, err = await _send_one(bot, user["chat_id"], text)
-            if ok:
-                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                               "status": "SENT", "reason": reason})
-                sent_today[uid] = sent_today.get(uid, 0) + 1
-                stats["sent"] += 1
-            else:
-                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                               "status": "FAILED", "reason": reason, "error": err})
-                stats["failed"] += 1
+            for user, reason in audience:
+                uid = user["user_id"]
+                if (aid, uid) in already:
+                    continue
 
-            await asyncio.sleep(SEND_GAP_SECONDS)
+                if sent_today.get(uid, 0) >= user["max_alerts_per_day"]:
+                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                                   "status": "SKIPPED", "reason": "daily_cap_reached"})
+                    stats["skipped"] += 1
+                    continue
 
-        # Optional admin mirror, off unless explicitly configured.
-        if ADMIN_CHANNEL_ID:
-            await _send_one(bot, ADMIN_CHANNEL_ID, text)
+                ok, err = await _send_one(bot, user["chat_id"], text)
+                if ok:
+                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                                   "status": "SENT", "reason": reason})
+                    sent_today[uid] = sent_today.get(uid, 0) + 1
+                    stats["sent"] += 1
+                else:
+                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                                   "status": "FAILED", "reason": reason, "error": err})
+                    stats["failed"] += 1
 
-        fanned.append(aid)
+                await asyncio.sleep(SEND_GAP_SECONDS)
+
+            # Optional admin mirror, off unless explicitly configured.
+            if ADMIN_CHANNEL_ID:
+                await _send_one(bot, ADMIN_CHANNEL_ID, text)
+
+            fanned.append(aid)
+        except Exception as e:
+            # Mark it fanned out anyway: it is structurally broken, and retrying
+            # it forever would block the queue behind a row that can never send.
+            logger.exception("[DELIVERY] Alert %s failed to process, skipping: %s", aid, e)
+            stats["errored"] += 1
+            fanned.append(aid)
 
         # Flush periodically so a crash loses at most a few ledger rows.
         if len(ledger) >= 50:
@@ -340,8 +391,10 @@ async def deliver_pending_alerts():
     _mark_fanned_out(fanned)
 
     if any(stats.values()):
-        logger.info("[DELIVERY] %d alerts fanned out — sent=%d failed=%d skipped=%d no_audience=%d",
-                    len(fanned), stats["sent"], stats["failed"], stats["skipped"], stats["no_audience"])
+        logger.info("[DELIVERY] %d alerts fanned out — sent=%d failed=%d skipped=%d "
+                    "no_audience=%d deferred=%d errored=%d",
+                    len(fanned), stats["sent"], stats["failed"], stats["skipped"],
+                    stats["no_audience"], stats["deferred"], stats["errored"])
 
 
 async def deliver_photo(image_path, caption, source, filing_type,
@@ -376,6 +429,7 @@ async def deliver_photo(image_path, caption, source, filing_type,
     ledger = []
 
     for user in targets:
+        ok = False
         try:
             with open(image_path, "rb") as fh:
                 await bot.send_photo(
@@ -384,25 +438,29 @@ async def deliver_photo(image_path, caption, source, filing_type,
                     caption=caption[:1024],   # Telegram caps captions at 1024 chars
                     parse_mode=ParseMode.HTML,
                 )
-            sent += 1
+            ok = True
         except RetryAfter as e:
             await asyncio.sleep(float(e.retry_after) + 0.5)
             try:
                 with open(image_path, "rb") as fh:
                     await bot.send_photo(chat_id=user["chat_id"], photo=fh,
                                          caption=caption[:1024], parse_mode=ParseMode.HTML)
-                sent += 1
+                ok = True
             except Exception as e2:
                 logger.warning("[DELIVERY] Photo retry failed for %s: %s", user["chat_id"], e2)
-                failed += 1
         except Exception as e:
             logger.warning("[DELIVERY] Photo send failed for %s: %s", user["chat_id"], e)
-            failed += 1
+
+        sent += 1 if ok else 0
+        failed += 0 if ok else 1
 
         if alert_id:
+            # Status must reflect THIS user's send. It previously read the
+            # running `sent` counter, so once any user succeeded every later
+            # recipient was logged SENT even when their delivery had failed.
             ledger.append({
                 "alert_id": alert_id, "user_id": user["user_id"], "chat_id": user["chat_id"],
-                "status": "SENT" if sent else "FAILED",
+                "status": "SENT" if ok else "FAILED",
                 "reason": "personal watchlist heatmap" if user_id else "market-wide heatmap",
             })
         await asyncio.sleep(SEND_GAP_SECONDS)

@@ -412,7 +412,11 @@ def check_52_week(index, sent):
             ))
             sent.add((ticker, "52W_HIGH"))
 
-        elif year_low and session_low <= year_low and (ticker, "52W_LOW") not in sent:
+        # Independent `if`, not `elif`: a session that gaps down and then reverses
+        # can print both a new 52-week low and a new 52-week high, and the second
+        # signal is exactly the one worth knowing about. The `elif` silently
+        # dropped it.
+        if year_low and session_low <= year_low and (ticker, "52W_LOW") not in sent:
             below = _pct(year_low, session_low)
             summary = (
                 f"{ticker} dropped to a new 52-week low: ${session_low:,.2f} (down {below:.1f}% from "

@@ -318,8 +318,20 @@ def _run(slot):
                                  {"stage": "render", "user_id": uid})
                 continue
 
-            caption = _caption(rows, slot, total_watched, omitted)
-            sent, failed = deliver_photo_sync(path, caption, SOURCE, slot, user_id=uid)
+            # Delivery is the most failure-prone step in this loop and was the
+            # only one left unguarded: a single user's send raising (timeout,
+            # Telegram error) propagated out of the whole `for user` loop, so
+            # every user after them silently got nothing for that slot — and
+            # because the slot runs once a day, they were never retried.
+            try:
+                caption = _caption(rows, slot, total_watched, omitted)
+                sent, failed = deliver_photo_sync(path, caption, SOURCE, slot, user_id=uid)
+            except Exception as e:
+                stats["failed"] += 1
+                logger.error("[WL-HEATMAP] Delivery failed for user %s: %s", uid, e)
+                log_poller_error("watchlist_heatmap", slot, e,
+                                 {"stage": "deliver", "user_id": uid})
+                continue
 
             if sent == 0:
                 stats["failed"] += 1
