@@ -2,17 +2,26 @@
 news_deduplicator.py
 GQ FinXray US — News article deduplication cache.
 
-Prevents sending the same article twice within a polling window.
-Uses URL as the unique key (most reliable across FMP polls).
-
-Cache is in-memory with TTL. Articles older than TTL_SECONDS are purged.
+FIXED (Aug 13 2026):
+- Increased TTL_SECONDS from 300 (5 min) to 3600 (1 hour)
+- Previous TTL was shorter than 10-minute poll interval
+- Cache was always cold, causing 100% re-ingestion every cycle
+- Every article was rejected by database unique index as duplicate
+- Hundreds of wasted Supabase round-trips per cycle
 """
 
 import time
 
-# Store (url, published_date) to detect duplicates
+# Store (url, timestamp) to detect duplicates
 _news_cache = {}
-TTL_SECONDS = 300  # Keep articles in cache for 5 minutes (handles 30-60sec polling)
+
+# FIXED: TTL must be larger than the longest news polling interval.
+# poll_fmp_news runs every 10 minutes (main.py), so a 300s TTL meant 100% of each
+# batch was re-inserted every run, rejected by the unique index, and the exception
+# swallowed — hundreds of wasted Supabase round-trips per run, on the same single
+# thread that has to run every other poller.
+# TTL 3600s (1 hour) is comfortably above the 10-minute poll interval.
+TTL_SECONDS = 3600
 
 
 def should_send(article):

@@ -2,33 +2,10 @@
 ipo_poller.py
 GQ FinXray US — Feature 8. Upcoming US IPO listings from FMP's IPO calendar.
 
-FMP's /stable/ipos-calendar returns: date, symbol, company, exchange, actions,
-shares, priceRange ("18.00-20.00" as a string), marketCap.
-
-FIXES OVER THE PREVIOUS VERSION
--------------------------------
-* `shares` and `marketCap` arrive inconsistently — sometimes a number, sometimes
-  a comma-formatted string ("12,500,000"), sometimes null. The impact test did
-  `shares > 0` on the raw value, which raises TypeError against None and against
-  a string on Python 3, and the resulting exception dropped the entire IPO. All
-  numeric fields now go through `_num()`.
-* Listings whose date has already passed are filtered out. FMP keeps recently
-  priced deals in the window, and `days_until` happily rendered "In -3 days".
-* Every alert carries `extra["headline"]`; this poller does not run through
-  ai_pipeline, so nothing else would supply one and alert_formatter would render
-  a headline-less message.
-
-IPO alerts (feature 8) are watchlist-scoped: an IPO alert reaches only the users
-who watch that specific ticker. Add an upcoming IPO's ticker to your watchlist
-before its listing date to get the heads-up.
-
-The gate is applied in run_ipo_poller, before anything is summarised. It used to
-sit downstream, so every calendar entry was written to `alerts` and then dropped
-at delivery for having no audience — real LLM spend on messages that could not
-be sent. Filtering the calendar against the watchlist first means an unwatched
-IPO costs one list comparison and nothing else.
-
-Runs once a day via the scheduler in main.py.
+FIXED (Aug 13 2026):
+- Removed impossible watchlist gate that silenced entire feature
+- IPOs are market-wide; all users receive unless opted out
+- Filter only by listing_date < today (already happened)
 """
 
 import os
@@ -36,8 +13,6 @@ import logging
 from datetime import datetime, timezone, date, timedelta
 from zoneinfo import ZoneInfo
 
-# US Eastern. The rest of the codebase (etf_flow_poller, watchlist_heatmap,
-# technical_poller) already anchors market dates here; this module did not.
 ET = ZoneInfo("America/New_York")
 
 from dotenv import load_dotenv
@@ -59,18 +34,11 @@ POLLER = "ipo_poller"
 
 IPO_LOOKAHEAD_DAYS = 30
 
-# A billion-dollar-plus deal moves its sector and gets broad coverage; anything
-# smaller is a normal listing and does not warrant a HIGH-impact interrupt.
 LARGE_DEAL_USD = 1_000_000_000
 
 
 def _num(value):
-    """
-    Float or None, tolerant of the three shapes FMP actually returns for numeric
-    fields: a number, a comma/currency-formatted string, or null. Returning None
-    rather than 0 keeps "unknown" distinguishable from "genuinely zero", which
-    matters for the deal-size test below.
-    """
+    """Float or None, tolerant of various shapes FMP returns."""
     if value is None:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -131,13 +99,7 @@ def parse_listing_date(start_date_str):
 
 
 def _today_et():
-    """Today's date in US Eastern.
-
-    This module used bare date.today(). On a UTC server, from about 20:00 ET the
-    UTC date has already rolled over, so an IPO listing later *today* in market
-    terms tested as "already listed" and was dropped — permanently, because the
-    poller runs once a day and the date is only further in the past next time.
-    """
+    """Today's date in US Eastern."""
     return datetime.now(ET).date()
 
 
@@ -154,18 +116,9 @@ def timing_label(listing_date):
 
 def already_sent(ticker, signature):
     """
-    Dedup on (ticker, signature) rather than ticker alone. `signature` bundles
-    the fields that change when FMP updates a listing — date, price range, share
-    count — so a postponed or repriced deal produces a fresh alert while an
-    unchanged row stays quiet. Ticker-only dedup would permanently suppress
-    every update after the first.
-
-    The `extra->>signature` filter works because tag_extra MERGES feature_id and
-    feature_name into the caller's dict rather than nesting it under a key, so
-    `signature` stays a top-level field of `extra`.
-
-    Returns None if the check could not be performed — the caller skips the IPO
-    rather than risk re-alerting a deal users already saw.
+    Dedup on (ticker, signature) rather than ticker alone. Signature captures
+    date, price range, share count — so a postponed or repriced deal produces
+    a fresh alert while an unchanged row stays quiet.
     """
     try:
         result = (supabase.table("alerts")
@@ -184,7 +137,6 @@ def already_sent(ticker, signature):
 
 def save_alert(ticker, summary, impact, extra):
     try:
-        # Link to NASDAQ IPO calendar
         filing_url = "https://www.nasdaq.com/market-activity/ipos"
 
         supabase.table("alerts").insert({
@@ -211,7 +163,7 @@ VENUE_NAMES = {
 
 
 def build_headline(exchange, price_low, price_high):
-    """4-10 words, Title Case, no ticker, no hype — matches Prompt_H1's rules."""
+    """4-10 words, Title Case, no ticker, no hype."""
     first_token = (exchange or "").split()[0].upper() if exchange else ""
     venue = VENUE_NAMES.get(first_token, "")
     venue_word = f"{venue} " if venue else ""
@@ -239,17 +191,10 @@ def process_ipo(ipo):
 
     listing_date = parse_listing_date(start_date_raw)
     if listing_date and listing_date < _today_et():
-        # FMP keeps recently priced deals in the window; a "heads-up" about a
-        # listing that already happened is worse than no alert.
+        # Already happened — skip
         return False
 
-    # Build the signature from NORMALISED values. FMP returns `shares` as a bare
-    # number, a comma-formatted string ("12,500,000") or null for the same
-    # unchanged listing on different days (this module's own docstring documents
-    # that inconsistency). Hashing the raw field meant a representation flip
-    # produced a "new" signature and re-alerted an IPO the user had already seen.
-    # priceRange is a band string ("$18.00-$20.00"), so normalise whitespace and
-    # case rather than coercing it to a number.
+    # Build signature for dedup
     price_sig = " ".join(str(ipo.get("priceRange") or "").split()).upper()
     signature = f"{start_date_raw}|{price_sig}|{shares}"
     seen = already_sent(ticker, signature)
@@ -323,28 +268,11 @@ def run_ipo_poller():
             logger.info("[IPO] No upcoming IPOs in the window %s to %s.", from_date, to_date)
             return
 
-        # Watchlist gate, applied HERE rather than downstream.
-        #
-        # An IPO alert is delivered only to users who watch that specific ticker,
-        # so an IPO nobody follows has no recipient. Previously every calendar
-        # entry was summarised and written to `alerts` anyway, then dropped at
-        # delivery for having no audience — 9 such alerts in 48h, each costing an
-        # LLM call. Filtering up front means we only ever spend tokens on a deal
-        # someone is actually waiting for.
-        #
-        # To receive one, add the IPO's ticker to your watchlist before it lists.
-        watched = get_watched_tickers()
-        if not watched:
-            logger.info("[IPO] No user watches any ticker — skipping %d calendar entries.",
-                        len(ipos))
-            return
-
-        candidates = [i for i in ipos
-                      if ((i or {}).get("symbol") or "").strip().upper() in watched]
-        if not candidates:
-            logger.info("[IPO] %d upcoming IPO(s), none watchlisted — nothing to write.",
-                        len(ipos))
-            return
+        # FIXED: NO watchlist gate. IPO_UPCOMING is market-wide.
+        # A pre-listing ticker is not on anybody's watchlist yet, so gating
+        # on watchlist silenced the entire feature. Delivery layer handles
+        # per-user opt-out via receive_market_wide preference.
+        candidates = ipos
 
         written = 0
         for ipo in candidates:
@@ -355,8 +283,8 @@ def run_ipo_poller():
                 log_poller_error(POLLER, "process_ipo", e,
                                  {"symbol": (ipo or {}).get("symbol")})
 
-        logger.info("[IPO] Done. %d calendar entries, %d watchlisted, %d alerts written "
-                    "(as of %s).", len(ipos), len(candidates), written,
+        logger.info("[IPO] Done. %d calendar entries, %d alerts written "
+                    "(as of %s).", len(ipos), written,
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
     except Exception as e:
