@@ -79,9 +79,17 @@ def word_bounds(raw_text, filing_type):
     that depth.
     """
     if filing_type == "NEWS":
-        # News has hard constraints: 70-word floor is aspirational, 100-word ceiling is firm.
-        # The proportional logic below is explicitly disabled for news.
-        return MIN_WORDS, MAX_TARGET
+        # News has flexible minimums based on source length.
+        # Short snippets (18-50 words) can't justify 70-word summaries; accept 35+.
+        # Medium articles (50-150 words) can do 50+.
+        # Longer articles (150+ words) can do the full 70+.
+        src_words = len((raw_text or "").split())
+        if src_words < 50:
+            return 35, MAX_TARGET  # Short snippet: accept 35-100 words
+        elif src_words < 150:
+            return 50, MAX_TARGET  # Medium: accept 50-100 words
+        else:
+            return MIN_WORDS, MAX_TARGET  # Long: full 70-100 range
 
     # Long-form content: SEC filings, transcripts, earnings announcements.
     # These genuinely have >200 words, so we can ask for richer summaries.
