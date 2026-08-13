@@ -79,9 +79,17 @@ def word_bounds(raw_text, filing_type):
     that depth.
     """
     if filing_type == "NEWS":
-        # News has hard constraints: 70-word floor is aspirational, 100-word ceiling is firm.
-        # The proportional logic below is explicitly disabled for news.
-        return MIN_WORDS, MAX_TARGET
+        # News has flexible minimums based on source length.
+        # Short snippets (18-50 words) can't justify 70-word summaries; accept 35+.
+        # Medium articles (50-150 words) can do 50+.
+        # Longer articles (150+ words) can do the full 70+.
+        src_words = len((raw_text or "").split())
+        if src_words < 50:
+            return 35, MAX_TARGET  # Short snippet: accept 35-100 words
+        elif src_words < 150:
+            return 50, MAX_TARGET  # Medium: accept 50-100 words
+        else:
+            return MIN_WORDS, MAX_TARGET  # Long: full 70-100 range
 
     # Long-form content: SEC filings, transcripts, earnings announcements.
     # These genuinely have >200 words, so we can ask for richer summaries.
@@ -145,16 +153,46 @@ def _pace_before_call():
 #   2. Treat finish_reason=="length" as a retryable condition and re-ask with a
 #      bigger budget, rather than handing a known-truncated string to the
 #      validator and calling it a content failure.
-TOKEN_CEILING = 4000
+TOKEN_CEILING = 12000
+
+# `reasoning_effort="none"` is advisory only. DeepInfra accepts-and-ignores params
+# it does not implement (no 400), so this flag can never detect a silent no-op --
+# never rely on it to bound cost. The budget floor below is the real defence.
 _reasoning_param_supported = [True]
+
+# Gemini bills thinking against max_tokens but returns it in NEITHER `content` nor
+# a <think> block, so an over-thought call arrives as content:"" + finish:"length"
+# -- indistinguishable from a dead call unless you look at finish_reason.
+#
+# Every caller therefore gets: (its answer budget) + (a reserve for thinking).
+# `_thinking_floor` is LEARNED: the first over-think raises it for the whole
+# process, so the discovery ladder is paid once at startup rather than on every
+# call. Without this, a caller asking for 120 tokens (the headline prompt) can
+# never return content at all -- it ladders 120/240/480, never reaches the floor,
+# and gives up, burning three paid calls per filing indefinitely.
+ANSWER_HEADROOM = 500
+_thinking_floor = [1500]
+
+
+def _budget_for(answer_tokens):
+    """Total max_tokens to request: room for the answer plus the learned reserve."""
+    return min(TOKEN_CEILING, max(answer_tokens or 0, ANSWER_HEADROOM) + _thinking_floor[0])
 
 
 def _looks_truncated(text):
-    """A visible answer that stops without terminal punctuation was cut off."""
-    return bool(text) and not text.rstrip().endswith((".", "!", "?", '"', ")"))
+    """A visible answer that stops without terminal punctuation was cut off.
+
+    Only mark as truncated if the last 50 chars have no sentence-ending punctuation.
+    This avoids false positives from quotes or parens wrapping complete sentences.
+    """
+    if not text:
+        return False
+    tail = text.rstrip()
+    # JSON payloads end in } or ]; prose ends in . ! ? and may be wrapped in " or ).
+    return not tail.endswith((".", "!", "?", '"', ")", "}", "]"))
 
 
-def call_deepinfra(prompt, retries=3, max_tokens=1500):
+def call_deepinfra(prompt, retries=3, max_tokens=3000):
     """A 429 gets its own longer, capped wait; other failures get short backoff.
 
     Truncated generations are retried with a larger budget instead of being
@@ -164,7 +202,8 @@ def call_deepinfra(prompt, retries=3, max_tokens=1500):
 
     normal_attempt = 0
     rate_limit_attempt = 0
-    budget = max_tokens
+    answer_tokens = max_tokens
+    budget = _budget_for(answer_tokens)
     truncation_retries = 0
 
     while True:
@@ -199,13 +238,29 @@ def call_deepinfra(prompt, retries=3, max_tokens=1500):
             if "<think>" in text:
                 text = ""
             _record_token_usage(resp.get("usage"))
+            hit_cap = choice.get("finish_reason") == "length"
 
-            cut = choice.get("finish_reason") == "length" or _looks_truncated(text)
-            if cut and truncation_retries < 2 and budget < TOKEN_CEILING:
+            # Empty + hit_cap means thinking ate the whole budget. Raise the floor
+            # for EVERY later call, not just this retry -- that is what stops the
+            # ladder from being re-paid on each request.
+            if not text and hit_cap:
+                if _thinking_floor[0] < TOKEN_CEILING:
+                    _thinking_floor[0] = min(TOKEN_CEILING, max(_thinking_floor[0] * 2, budget))
+                    print(f"[DEEPINFRA] Thinking consumed the whole budget — "
+                          f"raising thinking floor to {_thinking_floor[0]} for all calls")
+
+            # Retry only when nothing usable survived. A `length` finish that still
+            # yielded a complete, properly-terminated answer (the cap landed after
+            # the answer) is not worth a second paid call.
+            cut = not text or _looks_truncated(text)
+            if cut and truncation_retries < 3 and budget < TOKEN_CEILING:
                 truncation_retries += 1
-                budget = min(budget * 2, TOKEN_CEILING)
-                print(f"[DEEPINFRA] Output truncated — retrying with max_tokens={budget}")
+                budget = max(_budget_for(answer_tokens), min(budget * 2, TOKEN_CEILING))
+                print(f"[DEEPINFRA] No usable output — retrying with max_tokens={budget}")
                 continue
+            if not text:
+                print(f"[DEEPINFRA] Gave up after {truncation_retries} budget escalation(s) "
+                      f"at max_tokens={budget}")
             return text
 
         # Deployment rejected reasoning_effort — drop it and retry once.
@@ -356,7 +411,7 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary="",
     else:
         prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
                             target_word_count=target, min_word_count=min_word_count)
-    return call_deepinfra(prompt, max_tokens=1500)
+    return call_deepinfra(prompt, max_tokens=3000)
 
 
 def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=MIN_WORDS):
@@ -378,7 +433,7 @@ Content:
 {raw_text[:char_limit]}
 
 Return only the summary. Nothing else."""
-    return call_deepinfra(prompt, max_tokens=1500)
+    return call_deepinfra(prompt, max_tokens=3000)
 
 
 def store_flagged_summary(filing_id, ticker, company_name, final_summary, failure_reason,
@@ -461,17 +516,20 @@ def get_watched_tickers():
     changes only when someone runs /add or /remove.
     """
     now = time.monotonic()
-    if _watchlist_cache["tickers"] and (now - _watchlist_cache["at"]) < _WATCHLIST_TTL:
+    if (now - _watchlist_cache["at"]) < _WATCHLIST_TTL and _watchlist_cache["tickers"]:
+        print(f"[WATCHLIST] Cache hit: {len(_watchlist_cache['tickers'])} tickers (age={now - _watchlist_cache['at']:.1f}s)")
         return _watchlist_cache["tickers"]
     try:
         rows = supabase.table("watchlists").select("ticker").execute().data or []
         tickers = {(r.get("ticker") or "").upper() for r in rows if r.get("ticker")}
         _watchlist_cache.update({"tickers": tickers, "at": now})
+        print(f"[WATCHLIST] Loaded {len(tickers)} tickers: {sorted(tickers)}")
         return tickers
     except Exception as e:
         print(f"[ERROR] Could not load watchlist for gating: {e}")
         # Fail closed. Returning everything here would summarise the entire
         # market on a transient database error.
+        print(f"[WATCHLIST] Fallback to cached tickers: {len(_watchlist_cache['tickers'])} ({sorted(_watchlist_cache['tickers']) if _watchlist_cache['tickers'] else 'empty'})")
         return _watchlist_cache["tickers"]
 
 
