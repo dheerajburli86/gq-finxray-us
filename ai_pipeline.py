@@ -165,8 +165,9 @@ def _looks_truncated(text):
     """
     if not text:
         return False
-    tail = text.rstrip()[-50:] if len(text) > 50 else text.rstrip()
-    return "." not in tail and "!" not in tail and "?" not in tail
+    tail = text.rstrip()
+    # JSON payloads end in } or ]; prose ends in . ! ? and may be wrapped in " or ).
+    return not tail.endswith((".", "!", "?", '"', ")", "}", "]"))
 
 
 def call_deepinfra(prompt, retries=3, max_tokens=3000):
