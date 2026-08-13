@@ -216,7 +216,10 @@ def call_deepinfra(prompt, retries=3, max_tokens=3000):
                 text = ""
             _record_token_usage(resp.get("usage"))
 
-            cut = choice.get("finish_reason") == "length" or _looks_truncated(text)
+            # Only retry when nothing usable survived. A `length` finish that still
+            # yielded a complete, properly-terminated answer (the cap landed in the
+            # thinking block, not the answer) is not worth a second paid call.
+            cut = not text or _looks_truncated(text)
             if cut and truncation_retries < 2 and budget < TOKEN_CEILING:
                 truncation_retries += 1
                 budget = min(budget * 2, TOKEN_CEILING)
