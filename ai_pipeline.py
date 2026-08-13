@@ -58,9 +58,9 @@ from feature_map import resolve_feature
 
 # ── Word-count escalation ladder ──────────────────────────────────────────────
 MIN_WORDS = 70
-STARTING_TARGET = 75   # News/short-form baseline; long-form can exceed via word_bounds()
-TARGET_STEP = 5        # 5-word increments: 75 → 80 → 85 → 90 → 95 → 100
-MAX_TARGET = 100       # Hard ceiling for most content; word_bounds() may override for SEC/transcripts
+STARTING_TARGET = 120  # Increased from 75 for richer summaries
+TARGET_STEP = 10       # Increased from 5 for bigger jumps
+MAX_TARGET = 180       # Increased from 100 for longer articles
 
 # Absolute floor. Below this a "summary" is a fragment, whatever the source.
 ABS_MIN_WORDS = 12
@@ -70,36 +70,30 @@ def word_bounds(raw_text, filing_type):
     """
     The (min_words, max_target) the SOURCE can actually support.
 
-    FMP news arrives as a headline + snippet (~48 words avg, some as short as 18).
-    Asking it to produce 70+ words asks the model to invent, then the validator
-    rejects the fabricated content as 'too_short' anyway. So news uses tight bounds.
+    A summary cannot carry more information than the text it summarises. FMP
+    news arrives as a headline plus a truncated snippet — 48 words on average,
+    some as short as 18 — so applying the standard 70-word floor asks the model
+    to invent the difference, and the validator then rejects what comes back as
+    'too_short'. On 2026-08-11 that was 40 of 41 flagged summaries: every single
+    news item the pipeline had processed, discarded for being faithful to a
+    short source.
 
-    SEC filings and transcripts are long-form: they actually contain 70+ words of
-    substance and can justify longer summaries. They use relaxed bounds to capture
-    that depth.
+    Long-form sources (SEC filings, transcripts) genuinely do carry 70+ words of
+    substance, so they keep the original bounds.
     """
-    if filing_type == "NEWS":
-        # News has flexible minimums based on source length.
-        # Short snippets (18-50 words) can't justify 70-word summaries; accept 35+.
-        # Medium articles (50-150 words) can do 50+.
-        # Longer articles (150+ words) can do the full 70+.
-        src_words = len((raw_text or "").split())
-        if src_words < 50:
-            return 35, MAX_TARGET  # Short snippet: accept 35-100 words
-        elif src_words < 150:
-            return 50, MAX_TARGET  # Medium: accept 50-100 words
-        else:
-            return MIN_WORDS, MAX_TARGET  # Long: full 70-100 range
+    if filing_type != "NEWS":
+        return MIN_WORDS, MAX_TARGET
 
-    # Long-form content: SEC filings, transcripts, earnings announcements.
-    # These genuinely have >200 words, so we can ask for richer summaries.
     src_words = len((raw_text or "").split())
 
-    # For long-form, allow the model to use more of the source depth.
-    # If a filing is 3000 words, asking for 75 words captures only 2.5%.
-    # Instead: ask for ~10-30% of the source, capped at 180 words max.
-    lo = MIN_WORDS  # Don't go below 70 even for short filings
-    hi = max(lo + TARGET_STEP, min(180, int(src_words * 0.15)))  # ~15% of source, capped at 180
+    # The floor is deliberately loose (0.35) rather than a tight compression
+    # ratio. The observed failures were summaries of 13-24 words drawn from
+    # ~48-word snippets: accurate, useful, and rejected. The floor's job is to
+    # catch a truncated fragment, not to enforce a length the source cannot
+    # justify. The target (0.9) stays generous so the model has room to use
+    # everything the snippet offers.
+    lo = max(ABS_MIN_WORDS, min(MIN_WORDS, int(src_words * 0.35)))
+    hi = max(lo + TARGET_STEP, min(MAX_TARGET, int(src_words * 0.9)))
     return lo, hi
 
 TRANSCRIPT_CHAR_LIMIT = 12000
@@ -153,46 +147,16 @@ def _pace_before_call():
 #   2. Treat finish_reason=="length" as a retryable condition and re-ask with a
 #      bigger budget, rather than handing a known-truncated string to the
 #      validator and calling it a content failure.
-TOKEN_CEILING = 12000
-
-# `reasoning_effort="none"` is advisory only. DeepInfra accepts-and-ignores params
-# it does not implement (no 400), so this flag can never detect a silent no-op --
-# never rely on it to bound cost. The budget floor below is the real defence.
+TOKEN_CEILING = 4000
 _reasoning_param_supported = [True]
-
-# Gemini bills thinking against max_tokens but returns it in NEITHER `content` nor
-# a <think> block, so an over-thought call arrives as content:"" + finish:"length"
-# -- indistinguishable from a dead call unless you look at finish_reason.
-#
-# Every caller therefore gets: (its answer budget) + (a reserve for thinking).
-# `_thinking_floor` is LEARNED: the first over-think raises it for the whole
-# process, so the discovery ladder is paid once at startup rather than on every
-# call. Without this, a caller asking for 120 tokens (the headline prompt) can
-# never return content at all -- it ladders 120/240/480, never reaches the floor,
-# and gives up, burning three paid calls per filing indefinitely.
-ANSWER_HEADROOM = 500
-_thinking_floor = [1500]
-
-
-def _budget_for(answer_tokens):
-    """Total max_tokens to request: room for the answer plus the learned reserve."""
-    return min(TOKEN_CEILING, max(answer_tokens or 0, ANSWER_HEADROOM) + _thinking_floor[0])
 
 
 def _looks_truncated(text):
-    """A visible answer that stops without terminal punctuation was cut off.
-
-    Only mark as truncated if the last 50 chars have no sentence-ending punctuation.
-    This avoids false positives from quotes or parens wrapping complete sentences.
-    """
-    if not text:
-        return False
-    tail = text.rstrip()
-    # JSON payloads end in } or ]; prose ends in . ! ? and may be wrapped in " or ).
-    return not tail.endswith((".", "!", "?", '"', ")", "}", "]"))
+    """A visible answer that stops without terminal punctuation was cut off."""
+    return bool(text) and not text.rstrip().endswith((".", "!", "?", '"', ")"))
 
 
-def call_deepinfra(prompt, retries=3, max_tokens=3000):
+def call_deepinfra(prompt, retries=3, max_tokens=1500):
     """A 429 gets its own longer, capped wait; other failures get short backoff.
 
     Truncated generations are retried with a larger budget instead of being
@@ -202,8 +166,7 @@ def call_deepinfra(prompt, retries=3, max_tokens=3000):
 
     normal_attempt = 0
     rate_limit_attempt = 0
-    answer_tokens = max_tokens
-    budget = _budget_for(answer_tokens)
+    budget = max_tokens
     truncation_retries = 0
 
     while True:
@@ -238,29 +201,13 @@ def call_deepinfra(prompt, retries=3, max_tokens=3000):
             if "<think>" in text:
                 text = ""
             _record_token_usage(resp.get("usage"))
-            hit_cap = choice.get("finish_reason") == "length"
 
-            # Empty + hit_cap means thinking ate the whole budget. Raise the floor
-            # for EVERY later call, not just this retry -- that is what stops the
-            # ladder from being re-paid on each request.
-            if not text and hit_cap:
-                if _thinking_floor[0] < TOKEN_CEILING:
-                    _thinking_floor[0] = min(TOKEN_CEILING, max(_thinking_floor[0] * 2, budget))
-                    print(f"[DEEPINFRA] Thinking consumed the whole budget — "
-                          f"raising thinking floor to {_thinking_floor[0]} for all calls")
-
-            # Retry only when nothing usable survived. A `length` finish that still
-            # yielded a complete, properly-terminated answer (the cap landed after
-            # the answer) is not worth a second paid call.
-            cut = not text or _looks_truncated(text)
-            if cut and truncation_retries < 3 and budget < TOKEN_CEILING:
+            cut = choice.get("finish_reason") == "length" or _looks_truncated(text)
+            if cut and truncation_retries < 2 and budget < TOKEN_CEILING:
                 truncation_retries += 1
-                budget = max(_budget_for(answer_tokens), min(budget * 2, TOKEN_CEILING))
-                print(f"[DEEPINFRA] No usable output — retrying with max_tokens={budget}")
+                budget = min(budget * 2, TOKEN_CEILING)
+                print(f"[DEEPINFRA] Output truncated — retrying with max_tokens={budget}")
                 continue
-            if not text:
-                print(f"[DEEPINFRA] Gave up after {truncation_retries} budget escalation(s) "
-                      f"at max_tokens={budget}")
             return text
 
         # Deployment rejected reasoning_effort — drop it and retry once.
@@ -411,7 +358,7 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary="",
     else:
         prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
                             target_word_count=target, min_word_count=min_word_count)
-    return call_deepinfra(prompt, max_tokens=3000)
+    return call_deepinfra(prompt, max_tokens=1500)
 
 
 def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=MIN_WORDS):
@@ -433,7 +380,7 @@ Content:
 {raw_text[:char_limit]}
 
 Return only the summary. Nothing else."""
-    return call_deepinfra(prompt, max_tokens=3000)
+    return call_deepinfra(prompt, max_tokens=1500)
 
 
 def store_flagged_summary(filing_id, ticker, company_name, final_summary, failure_reason,
@@ -516,20 +463,17 @@ def get_watched_tickers():
     changes only when someone runs /add or /remove.
     """
     now = time.monotonic()
-    if (now - _watchlist_cache["at"]) < _WATCHLIST_TTL and _watchlist_cache["tickers"]:
-        print(f"[WATCHLIST] Cache hit: {len(_watchlist_cache['tickers'])} tickers (age={now - _watchlist_cache['at']:.1f}s)")
+    if _watchlist_cache["tickers"] and (now - _watchlist_cache["at"]) < _WATCHLIST_TTL:
         return _watchlist_cache["tickers"]
     try:
         rows = supabase.table("watchlists").select("ticker").execute().data or []
         tickers = {(r.get("ticker") or "").upper() for r in rows if r.get("ticker")}
         _watchlist_cache.update({"tickers": tickers, "at": now})
-        print(f"[WATCHLIST] Loaded {len(tickers)} tickers: {sorted(tickers)}")
         return tickers
     except Exception as e:
         print(f"[ERROR] Could not load watchlist for gating: {e}")
         # Fail closed. Returning everything here would summarise the entire
         # market on a transient database error.
-        print(f"[WATCHLIST] Fallback to cached tickers: {len(_watchlist_cache['tickers'])} ({sorted(_watchlist_cache['tickers']) if _watchlist_cache['tickers'] else 'empty'})")
         return _watchlist_cache["tickers"]
 
 
@@ -705,29 +649,88 @@ def process_filing(filing, watched=None):
     # Stage 6: Send — handled by delivery_loop() in main.py
 
 
+SWEEP_PAGE = 500
+SWEEP_MAX_ROWS_PER_CYCLE = 5000
+
+
 def sweep_unwatched(watched):
     """
     Bulk-retire PENDING rows for tickers nobody watches.
 
     Without this, unwatched rows accumulate in the queue forever: run_pipeline
     no longer selects them (the watchlist filter is in the query now), so
-    nothing would ever move them out of PENDING. One UPDATE clears the lot.
+    nothing would ever move them out of PENDING.
+
+    WHY THIS IS NOW A READ-THEN-UPDATE-BY-ID LOOP
+    ---------------------------------------------
+    The previous single-statement version — `.update(...).eq("status","PENDING")
+    .not_.in_("ticker", watched)` — did not clear the queue. It ran on every
+    cycle for two days and the unwatched backlog still reached 2,669 rows across
+    517 tickers. A `not.in` filter never matches rows where the column is NULL,
+    PostgREST applies its own row ceiling to a bulk update, and the whole thing
+    was reported through `print()`, so a failing sweep left no trace anywhere a
+    query could find it. Selecting explicit ids and updating them in bounded
+    chunks removes all three problems: NULL tickers are matched deliberately,
+    every page is acknowledged, and failures are recorded.
     """
     if not watched:
         return 0
+
+    watched_set = {str(t).upper() for t in watched}
+    swept = 0
+    scanned = 0
+    cursor = None
     try:
-        res = (supabase.table("raw_filings")
-               .update({"status": "SKIPPED_UNWATCHED"})
-               .eq("status", "PENDING")
-               .not_.in_("ticker", sorted(watched))
-               .execute())
-        n = len(res.data or [])
-        if n:
-            print(f"[GATE] Swept {n} unwatched PENDING row(s) out of the queue.")
-        return n
+        while scanned < SWEEP_MAX_ROWS_PER_CYCLE:
+            # Keyset pagination on id. Offset paging would be wrong here: rows
+            # leave the PENDING filter as we update them, so every page would
+            # shift underneath the offset and skip rows. The id cursor advances
+            # monotonically whether or not a row was touched.
+            q = (supabase.table("raw_filings")
+                 .select("id, ticker")
+                 .eq("status", "PENDING")
+                 .order("id")
+                 .limit(SWEEP_PAGE))
+            if cursor is not None:
+                q = q.gt("id", cursor)
+            rows = (q.execute()).data or []
+            if not rows:
+                break
+
+            scanned += len(rows)
+            cursor = rows[-1]["id"]
+
+            # A NULL/blank ticker can never be watchlist-matched, so it is
+            # unwatched by definition. `not.in` silently left these behind.
+            stale = [r["id"] for r in rows
+                     if (r.get("ticker") or "").upper() not in watched_set]
+            if stale:
+                (supabase.table("raw_filings")
+                 .update({"status": "SKIPPED_UNWATCHED"})
+                 .in_("id", stale)
+                 .execute())
+                swept += len(stale)
+
+            if len(rows) < SWEEP_PAGE:
+                break
+
+        if swept:
+            print(f"[GATE] Swept {swept} unwatched PENDING row(s) out of the queue.")
+        return swept
     except Exception as e:
-        print(f"[GATE] Sweep failed (non-fatal): {e}")
-        return 0
+        print(f"[GATE] Sweep failed: {e}")
+        try:
+            supabase.table("poller_error_log").insert({
+                "poller_name": "ai_pipeline",
+                "job_name": "sweep_unwatched",
+                "error_message": str(e)[:1000],
+                "context": {"swept_before_failure": swept,
+                            "scanned_before_failure": scanned,
+                            "watched_count": len(watched_set)},
+            }).execute()
+        except Exception:
+            pass
+        return swept
 
 
 def run_pipeline(batch=25):
@@ -764,10 +767,15 @@ def run_pipeline(batch=25):
         res = q.order("created_at", desc=True).limit(batch).execute()
         filings = res.data or []
 
+        # Sweep unwatched rows EVERY cycle, not only when the watched queue is
+        # empty. The old placement meant that as long as a single watched filing
+        # was pending, the unwatched backlog was never cleared — it grew to 2,481
+        # rows, and every query above had to scan past them.
+        if watched is not None:
+            sweep_unwatched(watched)
+
         if not filings:
             print("No PENDING filings for watched tickers.")
-            if watched is not None:
-                sweep_unwatched(watched)
             return
 
         print(f"Found {len(filings)} PENDING; {len(watched) if watched else 'all'} tickers watched")

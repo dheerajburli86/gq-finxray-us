@@ -104,21 +104,48 @@ ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 SEC_MIN_GAP_SECONDS = 0.2
 SEC_MAX_BACKOFF_SECONDS = 120.0
 
+# ── Wall-clock ceilings ───────────────────────────────────────────────────────
+# A single sec_get must never be able to monopolise the thread that called it.
+# The old defaults — timeout=20, retries=3, backoff starting at 5s — could burn
+# 20+5+20+10+20 = 75 seconds on one unreachable URL. poll_sec_8k and
+# poll_sec_form4 run every 30 seconds on the SAME thread as every other feature,
+# so two timing-out SEC feeds were enough to starve technical, ETF, analyst,
+# heatmap and roundup jobs indefinitely while the process still looked healthy.
+SEC_CONNECT_TIMEOUT = float(os.getenv("SEC_CONNECT_TIMEOUT", "5"))
+SEC_READ_TIMEOUT = float(os.getenv("SEC_READ_TIMEOUT", "10"))
+SEC_DEFAULT_TIMEOUT = (SEC_CONNECT_TIMEOUT, SEC_READ_TIMEOUT)
+# Hard ceiling on one sec_get call including retries and throttle waiting.
+SEC_REQUEST_BUDGET_SECONDS = float(os.getenv("SEC_REQUEST_BUDGET_SECONDS", "25"))
+
 _sec_lock = threading.Lock()
 _sec_state = {"last_at": 0.0, "blocked_until": 0.0}
 _session = requests.Session()
 
 
-def _sec_throttle():
-    """Block until it is this caller's turn to talk to sec.gov."""
+def _sec_throttle(deadline=None):
+    """
+    Block until it is this caller's turn to talk to sec.gov.
+
+    Returns True when the slot was acquired, False when `deadline` passed first.
+    The deadline matters: `_apply_backoff` can push `blocked_until` out by as
+    much as 120 seconds after a 403, and the previous version of this function
+    would sit in that penalty box for the full window — on the scheduler thread,
+    blocking every unrelated feature. Now the caller gives up and returns None,
+    and the next scheduled cycle picks it up once the block has expired.
+    """
     while True:
         with _sec_lock:
             now = time.monotonic()
             if now >= _sec_state["blocked_until"] and (now - _sec_state["last_at"]) >= SEC_MIN_GAP_SECONDS:
                 _sec_state["last_at"] = now
-                return
+                return True
             wait = max(_sec_state["blocked_until"] - now,
                        SEC_MIN_GAP_SECONDS - (now - _sec_state["last_at"]))
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            wait = min(wait, remaining)
         time.sleep(min(max(wait, 0.01), 5.0))
 
 
@@ -130,24 +157,60 @@ def _apply_backoff(seconds, reason):
     logger.warning("[EDGAR] Backing off SEC requests for %.0fs (%s)", seconds, reason)
 
 
-def sec_get(url, timeout=20, retries=3):
+def sec_get(url, timeout=None, retries=2, budget=None):
     """
     Throttled, backoff-aware GET against sec.gov. Returns a Response or None.
 
     403/429/503 are treated as rate limiting: the whole process pauses for an
     exponentially growing window before retrying, rather than the old behaviour
     of logging and returning immediately into the next 30-second cycle.
+
+    Every path out of this function is bounded by `budget` seconds of wall clock.
+    Giving up early is correct here — EDGAR feeds are polled on a 30-second to
+    10-minute cadence, so anything this call cannot get now it will get on the
+    next cycle, and holding the thread costs every other feature in the process.
     """
-    backoff = 5.0
+    if timeout is None:
+        timeout = SEC_DEFAULT_TIMEOUT
+    elif isinstance(timeout, (int, float)):
+        # Callers pass a single number meaning "read timeout". Connecting must
+        # stay short regardless: a connect that hangs is a dead host, not a slow
+        # document, and waiting 20s on it is pure lost scheduler time.
+        timeout = (min(float(timeout), SEC_CONNECT_TIMEOUT), float(timeout))
+
+    deadline = time.monotonic() + (budget if budget is not None else SEC_REQUEST_BUDGET_SECONDS)
+    backoff = 2.0
+    last_error = None
+
     for attempt in range(1, retries + 1):
-        _sec_throttle()
+        if time.monotonic() >= deadline:
+            log_poller_error(POLLER_NAME, "sec_get",
+                             f"Wall-clock budget exhausted after {attempt - 1} attempt(s)"
+                             + (f": {last_error}" if last_error else ""),
+                             {"url": url, "budget_seconds": budget or SEC_REQUEST_BUDGET_SECONDS})
+            return None
+
+        if not _sec_throttle(deadline):
+            logger.warning("[EDGAR] Skipping %s — SEC backoff window outlasts this call's budget", url)
+            return None
+
         try:
             r = _session.get(url, headers=HEADERS, timeout=timeout)
         except Exception as e:
-            if attempt == retries:
-                logger.warning("[EDGAR] GET %s failed after %d attempts: %s", url, retries, e)
+            last_error = e
+            if attempt == retries or time.monotonic() >= deadline:
+                # This branch used to be a logger.warning and nothing else.
+                # Connection and read timeouts are the most common EDGAR failure
+                # mode by a wide margin, and because they never reached
+                # poller_error_log, a poller timing out on every single cycle
+                # was indistinguishable from one that simply had no new filings.
+                logger.warning("[EDGAR] GET %s failed after %d attempt(s): %s", url, attempt, e)
+                log_poller_error(POLLER_NAME, "sec_get",
+                                 f"{type(e).__name__}: {e}",
+                                 {"url": url, "attempts": attempt,
+                                  "connect_timeout": timeout[0], "read_timeout": timeout[1]})
                 return None
-            time.sleep(min(backoff, SEC_MAX_BACKOFF_SECONDS))
+            time.sleep(max(0.0, min(backoff, SEC_MAX_BACKOFF_SECONDS, deadline - time.monotonic())))
             backoff *= 2
             continue
 
@@ -172,8 +235,10 @@ def sec_get(url, timeout=20, retries=3):
 
         logger.warning("[EDGAR] %s returned HTTP %s", url, r.status_code)
         if attempt == retries:
+            log_poller_error(POLLER_NAME, "sec_get", f"HTTP {r.status_code} after {retries} attempts",
+                             {"url": url, "status_code": r.status_code})
             return None
-        time.sleep(min(backoff, SEC_MAX_BACKOFF_SECONDS))
+        time.sleep(max(0.0, min(backoff, SEC_MAX_BACKOFF_SECONDS, deadline - time.monotonic())))
         backoff *= 2
     return None
 
@@ -183,7 +248,7 @@ def load_cik_map():
     """Load SEC's full CIK↔ticker file. Called once at startup by main.py."""
     global CIK_MAP
     try:
-        r = sec_get(EDGAR_CIK_URL, timeout=30)
+        r = sec_get(EDGAR_CIK_URL, timeout=30, budget=60)
         if r is None:
             logger.error("[EDGAR] Could not download the CIK map; keeping %d cached entries",
                          len(CIK_MAP))
@@ -257,8 +322,7 @@ def fetch_filing_text(index_url, form_type=""):
     acc_nodash = accession.replace("-", "")
 
     primary_doc = None
-    r = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}-index.json",
-                timeout=15)
+    r = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}-index.json")
     if r is not None:
         try:
             files = r.json().get("directory", {}).get("item", [])
@@ -282,16 +346,14 @@ def fetch_filing_text(index_url, form_type=""):
         )
 
     if primary_doc:
-        r2 = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{primary_doc}",
-                     timeout=20)
+        r2 = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{primary_doc}")
         if r2 is not None:
             text = clean_html_text(r2.text)
             if len(text) > 300:
                 return text[:MAX_FILING_CHARS]
 
     # Fallback: the complete submission text file.
-    r3 = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}.txt",
-                 timeout=25)
+    r3 = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}.txt")
     if r3 is None:
         return ""
     raw = r3.text
@@ -322,8 +384,7 @@ def fetch_form4_text(index_url, company_name, insider_name):
         return ""
     acc_nodash = accession.replace("-", "")
 
-    r = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}.txt",
-                timeout=20)
+    r = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}.txt")
     if r is None:
         return ""
 
@@ -550,7 +611,7 @@ def poll_edgar_generic(url, form_type, label):
                 logger.error("[EDGAR] %s: cannot resolve tickers without a CIK map; skipping.", label)
                 return
 
-        r = sec_get(url, timeout=20)
+        r = sec_get(url)
         if r is None:
             return
 
@@ -658,7 +719,7 @@ def poll_sec_form4():
                 logger.error("[EDGAR] Form 4: cannot resolve tickers without a CIK map; skipping.")
                 return
 
-        r = sec_get(EDGAR_FORM4_URL, timeout=20)
+        r = sec_get(EDGAR_FORM4_URL)
         if r is None:
             return
 

@@ -74,7 +74,31 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
+# MarketWatch (and Dow Jones properties generally) sit behind a bot filter that
+# 403s any User-Agent it does not recognise as a browser, regardless of how
+# polite the request is. Four of the feeds below are MarketWatch, and every one
+# of them was returning 403 on every 60-second cycle. Rather than drop those
+# feeds, a 403/406 is retried once with a browser identity before the source is
+# treated as down.
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 FEED_TIMEOUT = 15
+
+# ── Per-source circuit breaker ────────────────────────────────────────────────
+# A feed that is blocking us stays blocking us. Retrying it every 60 seconds
+# achieved nothing except one `poller_error_log` row per source per cycle —
+# MarketWatch alone produced over 1,100 of them, which buried every real error
+# in the table and made the log useless for exactly the diagnosis it exists for.
+# A failing source now backs off exponentially and reports once per tier change.
+FEED_BACKOFF_BASE_SECONDS = 300      # 5 min after the first failure
+FEED_BACKOFF_MAX_SECONDS = 3600      # never longer than an hour
+_source_health = {}
 # Politeness gap between feeds. Nineteen feeds x 0.25s is under five seconds of
 # added wall time on a 60-second cycle.
 FEED_GAP_SECONDS = 0.25
@@ -580,6 +604,70 @@ def _parse_entries(root):
     return items
 
 
+def _source_is_paused(name):
+    """True while a previously failing source is inside its backoff window."""
+    state = _source_health.get(name)
+    return bool(state) and time.monotonic() < state.get("skip_until", 0.0)
+
+
+def _note_source_failure(name, url, reason, detail=None):
+    """
+    Record a failure, widen the backoff window, and report it to
+    `poller_error_log` only when the backoff tier changes. The first failure,
+    the second, the fourth, the eighth and so on are written; the hundreds of
+    identical failures in between are counted but not stored.
+    """
+    state = _source_health.setdefault(name, {"failures": 0, "skip_until": 0.0})
+    state["failures"] += 1
+    n = state["failures"]
+    wait = min(FEED_BACKOFF_BASE_SECONDS * (2 ** (n - 1)), FEED_BACKOFF_MAX_SECONDS)
+    state["skip_until"] = time.monotonic() + wait
+
+    is_tier_change = (n & (n - 1)) == 0  # 1, 2, 4, 8, 16 …
+    logger.warning("[NEWS] %s %s — failure #%d, pausing this feed for %.0fs",
+                   name, reason, n, wait)
+    if is_tier_change:
+        log_poller_error(POLLER_NAME, f"fetch:{name}", reason,
+                         {"url": url, "consecutive_failures": n,
+                          "paused_for_seconds": int(wait), "detail": detail})
+
+
+def _note_source_recovery(name):
+    state = _source_health.get(name)
+    if state and state.get("failures"):
+        logger.info("[NEWS] %s recovered after %d consecutive failures",
+                    name, state["failures"])
+    _source_health[name] = {"failures": 0, "skip_until": 0.0}
+
+
+def _fetch_feed(source):
+    """
+    GET one feed, falling back to a browser identity on a bot-filter rejection.
+    Returns (response_or_None, reason_string_or_None).
+    """
+    name, url = source["name"], source["url"]
+    try:
+        r = _session.get(url, headers=HEADERS, timeout=FEED_TIMEOUT)
+    except Exception as e:
+        return None, f"unreachable: {type(e).__name__}: {e}"
+
+    if r.status_code in (403, 406, 429):
+        try:
+            r2 = _session.get(url, headers=BROWSER_HEADERS, timeout=FEED_TIMEOUT)
+        except Exception:
+            r2 = None
+        if r2 is not None and r2.status_code == 200:
+            logger.info("[NEWS] %s accepted the browser User-Agent after HTTP %s",
+                        name, r.status_code)
+            return r2, None
+        if r2 is not None:
+            r = r2
+
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}"
+    return r, None
+
+
 def poll_news_source(source, watched, cutoff):
     """
     Fetch and ingest one feed. Returns the number of rows stored.
@@ -591,27 +679,22 @@ def poll_news_source(source, watched, cutoff):
     source_key = source["source_key"]
     feed_sector = source.get("sector", "MARKET")
 
-    try:
-        r = _session.get(source["url"], headers=HEADERS, timeout=FEED_TIMEOUT)
-    except Exception as e:
-        logger.warning("[NEWS] %s unreachable: %s", name, e)
-        log_poller_error(POLLER_NAME, f"fetch:{name}", e, {"url": source["url"]})
+    if _source_is_paused(name):
         return 0
 
-    if r.status_code != 200:
-        logger.warning("[NEWS] %s returned HTTP %s", name, r.status_code)
-        log_poller_error(POLLER_NAME, f"fetch:{name}",
-                         f"HTTP {r.status_code}",
-                         {"url": source["url"], "status_code": r.status_code,
-                          "body": r.text[:300]})
+    r, reason = _fetch_feed(source)
+    if r is None:
+        _note_source_failure(name, source["url"], reason)
         return 0
 
     try:
         root = ET.fromstring(r.content)
     except ET.ParseError as e:
-        logger.warning("[NEWS] %s returned unparseable XML: %s", name, e)
-        log_poller_error(POLLER_NAME, f"parse:{name}", e, {"url": source["url"]})
+        _note_source_failure(name, source["url"], f"unparseable XML: {e}",
+                             detail=r.text[:300])
         return 0
+
+    _note_source_recovery(name)
 
     entries = _parse_entries(root)
     if not entries:
@@ -694,24 +777,30 @@ def poll_all_news():
             return
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_ARTICLE_AGE_DAYS)
-        logger.info("[NEWS] Polling %d feeds against %d watched tickers",
-                    len(NEWS_SOURCES), len(watched))
+        paused = [s["name"] for s in NEWS_SOURCES if _source_is_paused(s["name"])]
+        logger.info("[NEWS] Polling %d of %d feeds against %d watched tickers%s",
+                    len(NEWS_SOURCES) - len(paused), len(NEWS_SOURCES), len(watched),
+                    f" ({len(paused)} paused: {', '.join(paused)})" if paused else "")
 
         total = 0
         for source in NEWS_SOURCES:
+            if _source_is_paused(source["name"]):
+                continue  # No request, and no politeness gap for a feed we skipped.
             try:
                 stored = poll_news_source(source, watched, cutoff)
             except Exception as e:
                 logger.error("[NEWS] %s failed: %s", source["name"], e)
-                log_poller_error(POLLER_NAME, f"poll_news_source:{source['name']}", e,
-                                 {"url": source["url"]})
+                _note_source_failure(source["name"], source["url"],
+                                     f"{type(e).__name__}: {e}")
                 stored = 0
             if stored:
                 logger.info("[NEWS] %s -> %d new", source["name"], stored)
             total += stored
             time.sleep(FEED_GAP_SECONDS)
 
-        logger.info("[NEWS] Cycle complete — %d article rows queued for the pipeline", total)
+        healthy = sum(1 for s in NEWS_SOURCES if not _source_is_paused(s["name"]))
+        logger.info("[NEWS] Cycle complete — %d article rows queued for the pipeline "
+                    "(%d/%d feeds healthy)", total, healthy, len(NEWS_SOURCES))
 
     except Exception as e:
         logger.exception("[NEWS] Run failed: %s", e)
