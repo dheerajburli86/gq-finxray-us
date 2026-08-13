@@ -161,7 +161,7 @@ def _looks_truncated(text):
     return "." not in tail and "!" not in tail and "?" not in tail
 
 
-def call_deepinfra(prompt, retries=3, max_tokens=1500):
+def call_deepinfra(prompt, retries=3, max_tokens=3000):
     """A 429 gets its own longer, capped wait; other failures get short backoff.
 
     Truncated generations are retried with a larger budget instead of being
@@ -363,7 +363,7 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary="",
     else:
         prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
                             target_word_count=target, min_word_count=min_word_count)
-    return call_deepinfra(prompt, max_tokens=1500)
+    return call_deepinfra(prompt, max_tokens=3000)
 
 
 def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=MIN_WORDS):
@@ -385,7 +385,7 @@ Content:
 {raw_text[:char_limit]}
 
 Return only the summary. Nothing else."""
-    return call_deepinfra(prompt, max_tokens=1500)
+    return call_deepinfra(prompt, max_tokens=3000)
 
 
 def store_flagged_summary(filing_id, ticker, company_name, final_summary, failure_reason,
