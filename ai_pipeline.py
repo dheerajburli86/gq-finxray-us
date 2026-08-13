@@ -150,8 +150,15 @@ _reasoning_param_supported = [True]
 
 
 def _looks_truncated(text):
-    """A visible answer that stops without terminal punctuation was cut off."""
-    return bool(text) and not text.rstrip().endswith((".", "!", "?", '"', ")"))
+    """A visible answer that stops without terminal punctuation was cut off.
+
+    Only mark as truncated if the last 50 chars have no sentence-ending punctuation.
+    This avoids false positives from quotes or parens wrapping complete sentences.
+    """
+    if not text:
+        return False
+    tail = text.rstrip()[-50:] if len(text) > 50 else text.rstrip()
+    return "." not in tail and "!" not in tail and "?" not in tail
 
 
 def call_deepinfra(prompt, retries=3, max_tokens=1500):
