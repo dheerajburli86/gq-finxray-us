@@ -96,6 +96,47 @@ def word_bounds(raw_text, filing_type):
     hi = max(lo + TARGET_STEP, min(MAX_TARGET, int(src_words * 0.9)))
     return lo, hi
 
+# How many PENDING rows to consider when assembling a batch. Larger than the
+# batch itself so that when one poller has queued a burst there is still other
+# content visible to round-robin against.
+CANDIDATE_POOL = 150
+
+
+def _diversify_by_filing_type(rows, limit):
+    """
+    Pick `limit` rows from `rows`, cycling through filing_type rather than
+    taking a straight prefix.
+
+    `rows` arrives newest-first, and that order is preserved *within* each type,
+    so the newest transcript still beats an older transcript -- it just no longer
+    beats every other feature in the queue.
+    """
+    if len(rows) <= limit:
+        return rows
+
+    buckets = {}
+    for r in rows:
+        buckets.setdefault(r.get("filing_type") or "UNKNOWN", []).append(r)
+
+    if len(buckets) <= 1:
+        return rows[:limit]
+
+    out, depth = [], 0
+    while len(out) < limit:
+        progressed = False
+        for filing_type in sorted(buckets):
+            bucket = buckets[filing_type]
+            if depth < len(bucket):
+                out.append(bucket[depth])
+                progressed = True
+                if len(out) >= limit:
+                    break
+        if not progressed:
+            break
+        depth += 1
+    return out
+
+
 TRANSCRIPT_CHAR_LIMIT = 12000
 FILING_CHAR_LIMIT = 8000
 NEWS_CHAR_LIMIT = 6000
@@ -780,8 +821,24 @@ def run_pipeline(batch=25):
             # Only ever pull rows that can produce a deliverable alert.
             q = q.in_("ticker", sorted(watched))
 
-        res = q.order("created_at", desc=True).limit(batch).execute()
-        filings = res.data or []
+        # Pull a wider candidate pool than we intend to process, then round-robin
+        # across filing_type to build the actual batch.
+        #
+        # WHY: pollers queue in bursts. sweep_watchlist_transcripts() loops the
+        # whole watchlist and inserts one row per ticker, so 20 transcripts land
+        # within seconds of each other. Taking the newest 25 rows straight off
+        # created_at DESC therefore produced a batch that was 100% transcripts.
+        # The pipeline processes serially (~30-60s per filing), emitting ONE alert
+        # at a time, so delivery -- which runs every 30s -- saw nothing but
+        # transcripts for the next twenty minutes. Interleaving at the delivery
+        # stage cannot fix that: by then the alerts are already trickling out
+        # one-by-one and there is nothing left to interleave against.
+        #
+        # Round-robin here means a burst of 20 transcripts contributes only
+        # batch/n_types rows to any one cycle; the rest wait their turn while
+        # news, snapshots and filings get processed alongside them.
+        res = q.order("created_at", desc=True).limit(CANDIDATE_POOL).execute()
+        filings = _diversify_by_filing_type(res.data or [], batch)
 
         # Sweep unwatched rows EVERY cycle, not only when the watched queue is
         # empty. The old placement meant that as long as a single watched filing
