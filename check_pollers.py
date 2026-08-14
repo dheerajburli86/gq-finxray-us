@@ -2,13 +2,23 @@
 """Quick check: what are the pollers actually producing?"""
 
 import os
-from dotenv import load_dotenv
-import requests
+import sys
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except:
+    pass
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("ERROR: SUPABASE_URL and SUPABASE_KEY not set")
+    print("Set them via environment variables or .env file")
+    sys.exit(1)
+
+import requests
 
 headers = {
     "apikey": SUPABASE_KEY,
