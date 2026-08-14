@@ -126,7 +126,6 @@ NEWS_SOURCES = [
     {"name": "MarketWatch Top Stories", "url": "https://feeds.marketwatch.com/marketwatch/topstories", "source_key": "MARKETWATCH", "sector": "MARKET"},
     {"name": "MarketWatch Market Pulse", "url": "https://feeds.marketwatch.com/marketwatch/marketpulse", "source_key": "MARKETWATCH", "sector": "MARKET"},
     {"name": "Yahoo Finance",       "url": "https://finance.yahoo.com/news/rssindex",               "source_key": "YAHOO",       "sector": "MARKET"},
-    {"name": "Nasdaq Originals",    "url": "https://www.nasdaq.com/feed/nasdaq-originals/rss.xml",  "source_key": "NASDAQ",      "sector": "MARKET"},
     {"name": "Investor's Business Daily", "url": "https://www.investors.com/feed/",                 "source_key": "IBD",         "sector": "MARKET"},
     {"name": "Fortune Business",    "url": "https://fortune.com/feed",                              "source_key": "FORTUNE",     "sector": "MARKET"},
 
@@ -142,8 +141,6 @@ NEWS_SOURCES = [
     {"name": "CNBC Industrials",    "url": "https://www.cnbc.com/id/10000113/device/rss/rss.html", "source_key": "CNBC", "sector": "INDUSTRIALS"},
     {"name": "CNBC Real Estate",    "url": "https://www.cnbc.com/id/10000115/device/rss/rss.html", "source_key": "CNBC", "sector": "REAL_ESTATE"},
 
-    # ── Macro ─────────────────────────────────────────────────────────────────
-    {"name": "MarketWatch Economy", "url": "https://feeds.marketwatch.com/marketwatch/economy-politics", "source_key": "MARKETWATCH", "sector": "MACRO"},
 ]
 
 SECTOR_KEYWORDS = {
