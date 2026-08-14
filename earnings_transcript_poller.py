@@ -107,7 +107,7 @@ def _available_periods(ticker):
     try:
         available = fmp_client.get_transcript_dates(ticker)
     except Exception as e:
-        logger.warning("[TRANSCRIPT] transcripts-dates lookup failed for %s: %s", ticker, e)
+        logger.warning("[TRANSCRIPT] Transcript dates lookup failed for %s: %s", ticker, e)
         return []
 
     parsed = []
@@ -182,7 +182,7 @@ def get_best_transcript(ticker, filed_at_iso, form_type="10-Q"):
     try:
         available = fmp_client.get_transcript_dates(ticker)
     except Exception as e:
-        logger.warning("[TRANSCRIPT] transcripts-dates lookup failed for %s: %s", ticker, e)
+        logger.warning("[TRANSCRIPT] Transcript dates lookup failed for %s: %s", ticker, e)
         available = []
 
     parsed = []

@@ -192,8 +192,11 @@ def get_latest_transcripts(limit=50):
 
 
 def get_transcript_dates(ticker):
-    """List of (year, quarter, date) tuples available for a ticker."""
-    data = _get("transcripts-dates-by-symbol", {"symbol": ticker})
+    """List of transcript dates available for a ticker (FMP Ultimate only).
+
+    Returns list of dicts with 'quarter', 'fiscalYear', 'date'.
+    """
+    data = _get("earning-call-transcript-dates", {"symbol": ticker})
     return data if isinstance(data, list) else []
 
 
