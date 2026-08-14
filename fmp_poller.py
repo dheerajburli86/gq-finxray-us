@@ -156,7 +156,7 @@ def poll_ticker_news(tickers):
         return 0
     total = 0
     for ticker in tickers:
-        articles = fmp_client.get_stock_news(ticker, limit=10)
+        articles = fmp_client.get_stock_news(ticker, limit=3)
         for article in articles:
             url = article.get("url", "")
             if not url or news_already_stored(url):
@@ -175,7 +175,7 @@ def poll_ticker_news(tickers):
 # ── 2. Broad market news sweep ────────────────────────────────────────────────
 def poll_market_news():
     total = 0
-    articles = fmp_client.get_general_news(limit=25)
+    articles = fmp_client.get_general_news(limit=10)
     for article in articles:
         url = article.get("url", "")
         if not url or news_already_stored(url):
