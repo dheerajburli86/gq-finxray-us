@@ -370,15 +370,20 @@ def _startup_pass(lane_name):
 
     # 1. Every interval job runs once, now — no waiting out a full interval.
     interval_kicked = 0
-    for e in entries:
+    for i, e in enumerate(entries):
         if e["spec"][0] == "at":
-            logger.debug("[STARTUP %s] Skipping daily job: %s (%s)", lane_name, e["name"], e["spec"])
+            logger.debug("[STARTUP %s] [%d/%d] Skipping daily job: %s (%s)", lane_name, i+1, len(entries), e["name"], e["spec"])
             continue
-        logger.info("[STARTUP %s] kicking %s (%s)", lane_name, e["name"], e["spec"])
-        interval_kicked += 1
-        e["job"]()
+        logger.info("[STARTUP %s] [%d/%d] kicking %s (%s)", lane_name, i+1, len(entries), e["name"], e["spec"])
+        try:
+            interval_kicked += 1
+            e["job"]()
+            logger.info("[STARTUP %s] [%d/%d] %s completed", lane_name, i+1, len(entries), e["name"])
+        except Exception as ex:
+            logger.error("[STARTUP %s] [%d/%d] %s FAILED: %s", lane_name, i+1, len(entries), e["name"], ex)
+            log_job_error(f"startup_{lane_name}_{e['name']}", ex)
 
-    logger.info("[STARTUP %s] Kicked %d interval jobs", lane_name, interval_kicked)
+    logger.info("[STARTUP %s] Kicked %d interval jobs (total entries: %d)", lane_name, interval_kicked, len(entries))
 
     # 2. Daily jobs whose slot already passed today, that have not run today,
     #    and that are still meaningful late, get caught up.
