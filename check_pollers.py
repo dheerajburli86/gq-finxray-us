@@ -21,10 +21,10 @@ print("POLLER OUTPUT CHECK")
 print("=" * 80)
 
 # Check raw_filings by type
-print("\n1. RAW_FILINGS BY TYPE (last 200):")
+print("\n1. RAW_FILINGS BY TYPE (last 500):")
 print("-" * 80)
-url = f"{SUPABASE_URL}/rest/v1/raw_filings?select=filing_type,count&order=created_at.desc&limit=200"
-resp = requests.get(url, headers={**headers, "Prefer": "count=exact"})
+url = f"{SUPABASE_URL}/rest/v1/raw_filings?select=filing_type&order=created_at.desc&limit=500"
+resp = requests.get(url, headers=headers)
 if resp.status_code == 200:
     rows = resp.json()
     type_counts = {}
@@ -35,13 +35,13 @@ if resp.status_code == 200:
     for ft in sorted(type_counts.keys()):
         print(f"  {ft:<20} {type_counts[ft]:>5} entries")
 else:
-    print(f"Error: {resp.status_code}")
+    print(f"Error: {resp.status_code} - {resp.text[:200]}")
 
 # Check alerts by feature
-print("\n2. ALERTS BY FEATURE (last 50):")
+print("\n2. ALERTS BY FEATURE (last 100):")
 print("-" * 80)
-url = f"{SUPABASE_URL}/rest/v1/alerts?select=extra,count&order=created_at.desc&limit=50"
-resp = requests.get(url, headers={**headers, "Prefer": "count=exact"})
+url = f"{SUPABASE_URL}/rest/v1/alerts?select=extra&order=created_at.desc&limit=100"
+resp = requests.get(url, headers=headers)
 if resp.status_code == 200:
     rows = resp.json()
     feature_counts = {}
@@ -61,27 +61,31 @@ if resp.status_code == 200:
     for feat in sorted(feature_counts.keys()):
         print(f"  {feat:<40} {feature_counts[feat]:>5} alerts")
 else:
-    print(f"Error: {resp.status_code}")
+    print(f"Error: {resp.status_code} - {resp.text[:200]}")
 
 # Check poller_runs to see which jobs ran
-print("\n3. POLLER JOBS (last 20 runs):")
+print("\n3. POLLER JOBS (last 30 runs):")
 print("-" * 80)
-url = f"{SUPABASE_URL}/rest/v1/poller_runs?select=job_name,lane,status&order=started_at.desc&limit=20"
-resp = requests.get(url, headers=headers)
-if resp.status_code == 200:
-    rows = resp.json()
-    seen = set()
-    for r in rows:
-        job = r.get("job_name", "?")
-        lane = r.get("lane", "?")
-        status = r.get("status", "?")
-        key = (job, lane)
-        if key not in seen:
-            status_emoji = "✓" if status == "OK" else "⚠" if status == "SLOW" else "❌"
-            print(f"  {status_emoji} {job:<30} [{lane:<6}] {status}")
-            seen.add(key)
-else:
-    print(f"Error: {resp.status_code}")
+url = f"{SUPABASE_URL}/rest/v1/poller_runs?select=job_name,lane,status&order=started_at.desc&limit=30"
+try:
+    resp = requests.get(url, headers=headers, timeout=10)
+    if resp.status_code == 200:
+        rows = resp.json()
+        seen = set()
+        for r in rows:
+            job = r.get("job_name", "?")
+            lane = r.get("lane", "?")
+            status = r.get("status", "?")
+            key = (job, lane)
+            if key not in seen:
+                status_emoji = "✓" if status == "OK" else "⚠" if status == "SLOW" else "❌"
+                print(f"  {status_emoji} {job:<30} [{lane:<6}] {status}")
+                seen.add(key)
+    else:
+        print(f"Error: {resp.status_code}")
+        print(f"Response: {resp.text[:300]}")
+except Exception as e:
+    print(f"Exception: {e}")
 
 print("\n" + "=" * 80)
 print("INTERPRETATION:")
