@@ -122,6 +122,33 @@ SEND_GAP_SECONDS = 0.05
 BATCH_LIMIT = 100
 
 
+def _interleave_by_filing_type(alerts):
+    """
+    Reorder alerts to cycle through filing types instead of draining one type at a time.
+
+    Prevents "20 transcripts in a row" by grouping by filing_type and interleaving.
+    If alerts = [A1, A2, A3, B1, B2, B3, C1, C2], groups by type and cycles:
+    [A1, B1, C1, A2, B2, C2, A3, B3] so variety goes out instead of A's then B's then C's.
+    """
+    from collections import defaultdict
+    by_type = defaultdict(list)
+    for alert in alerts:
+        filing_type = alert.get("filing_type", "UNKNOWN")
+        by_type[filing_type].append(alert)
+
+    if len(by_type) <= 1:
+        return alerts  # No interleaving needed if only one type
+
+    interleaved = []
+    max_len = max(len(v) for v in by_type.values())
+    for i in range(max_len):
+        for filing_type in sorted(by_type.keys()):
+            if i < len(by_type[filing_type]):
+                interleaved.append(by_type[filing_type][i])
+
+    return interleaved
+
+
 # ── Loading ───────────────────────────────────────────────────────────────────
 def _fetch_undelivered(limit=BATCH_LIMIT):
     try:
@@ -357,6 +384,10 @@ async def deliver_pending_alerts():
     alerts = _fetch_undelivered()
     if not alerts:
         return
+
+    # Reorder to cycle through filing types instead of draining one type at a time.
+    # Prevents 20 transcripts in a row by interleaving: transcript, news, snapshot, transcript, ...
+    alerts = _interleave_by_filing_type(alerts)
 
     users = _fetch_active_users()
     if not users:
