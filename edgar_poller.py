@@ -618,6 +618,8 @@ def poll_edgar_generic(url, form_type, label):
                 logger.error("[EDGAR] %s: cannot resolve tickers without a CIK map; skipping.", label)
                 return
 
+        logger.debug("[EDGAR] %s poll: CIK_MAP has %d entries, watching %d tickers", label, len(CIK_MAP), len(watched))
+
         r = sec_get(url)
         if r is None:
             return
@@ -630,6 +632,8 @@ def poll_edgar_generic(url, form_type, label):
 
         entries = root.findall("atom:entry", ATOM_NS)
         candidates = []
+        skipped_no_ticker = 0
+        skipped_not_watched = 0
         for entry in entries:
             title = _entry_text(entry, "title")
             filing_url = _entry_link(entry)
@@ -638,8 +642,12 @@ def poll_edgar_generic(url, form_type, label):
 
             company_name, cik = _parse_title(title, form_type)
             ticker = get_ticker_from_cik(cik)
-            if not ticker or ticker not in watched:
-                continue  # gate BEFORE spending SEC bandwidth on the document
+            if not ticker:
+                skipped_no_ticker += 1
+                continue
+            if ticker not in watched:
+                skipped_not_watched += 1
+                continue
 
             filed = parse_atom_date(_entry_text(entry, "updated"))
             candidates.append({
@@ -653,7 +661,8 @@ def poll_edgar_generic(url, form_type, label):
             })
 
         if not candidates:
-            logger.info("[EDGAR] %s: %d entries, none watchlisted.", label, len(entries))
+            logger.warning("[EDGAR] %s: %d total entries, %d skipped (no ticker), %d skipped (not watched), 0 candidates.",
+                          label, len(entries), skipped_no_ticker, skipped_not_watched)
             return
 
         try:
