@@ -366,12 +366,19 @@ def _startup_pass(lane_name):
     entries = _lane_jobs.get(lane_name, [])
     now_et = datetime.now(ET)
 
+    logger.info("[STARTUP %s] Total entries for startup pass: %d", lane_name, len(entries))
+
     # 1. Every interval job runs once, now — no waiting out a full interval.
+    interval_kicked = 0
     for e in entries:
         if e["spec"][0] == "at":
+            logger.debug("[STARTUP %s] Skipping daily job: %s (%s)", lane_name, e["name"], e["spec"])
             continue
-        logger.info("[STARTUP %s] kicking %s", lane_name, e["name"])
+        logger.info("[STARTUP %s] kicking %s (%s)", lane_name, e["name"], e["spec"])
+        interval_kicked += 1
         e["job"]()
+
+    logger.info("[STARTUP %s] Kicked %d interval jobs", lane_name, interval_kicked)
 
     # 2. Daily jobs whose slot already passed today, that have not run today,
     #    and that are still meaningful late, get caught up.
@@ -460,6 +467,12 @@ async def main():
     """)
 
     build_schedule()
+
+    # Debug: log all jobs in the registry
+    for lname in ("sec", "news", "market"):
+        jobs_list = _lane_jobs.get(lname, [])
+        job_names = [j["name"] for j in jobs_list]
+        logger.info("[BOOT] Lane %s registry: %d jobs: %s", lname, len(jobs_list), job_names)
 
     for lane_name in ("sec", "news", "market"):
         threading.Thread(target=run_lane, args=(lane_name,),
