@@ -362,33 +362,59 @@ def _startup_pass(lane_name):
          heatmaps simply do not happen.
 
     Neither logs anything. Both look identical to a quiet market.
+
+    NOTE: The market lane jobs are mostly network-bound and can block for
+    minutes. Running them sequentially at startup would prevent the lane from
+    ever entering its main loop. They will fire on their scheduled intervals
+    instead — the trade-off is that the first alert in a session may be delayed
+    by up to the job's interval, but the lane stays responsive. SEC and news
+    lanes are fast enough to kick at startup.
     """
-    entries = _lane_jobs.get(lane_name, [])
-    now_et = datetime.now(ET)
+    # Market lane jobs are expensive and can block. Skip interval job kicks for market.
+    # Still catch up missed daily slots (they're scheduled by time, not interval).
+    if lane_name == "market":
+        logger.info("[STARTUP %s] Skipping interval job kicks (market jobs are network-bound)",
+                    lane_name)
+        entries = _lane_jobs.get(lane_name, [])
+        now_et = datetime.now(ET)
+        # Jump directly to daily catch-up, skip interval section
+        daily_jobs_only = [e for e in entries if e["spec"][0] == "at"]
+        logger.info("[STARTUP %s] Will attempt catch-up on %d daily jobs", lane_name,
+                    len(daily_jobs_only))
+    else:
+        # SEC and news lanes: kick all interval jobs, then catch up missed dailies
+        entries = _lane_jobs.get(lane_name, [])
+        now_et = datetime.now(ET)
+        logger.info("[STARTUP %s] Total entries for startup pass: %d", lane_name, len(entries))
 
-    logger.info("[STARTUP %s] Total entries for startup pass: %d", lane_name, len(entries))
+        # 1. Every interval job runs once, now — no waiting out a full interval.
+        interval_kicked = 0
+        for i, e in enumerate(entries):
+            if e["spec"][0] == "at":
+                logger.debug("[STARTUP %s] [%d/%d] Skipping daily job: %s (%s)",
+                             lane_name, i+1, len(entries), e["name"], e["spec"])
+                continue
+            logger.info("[STARTUP %s] [%d/%d] kicking %s (%s)", lane_name, i+1,
+                        len(entries), e["name"], e["spec"])
+            try:
+                interval_kicked += 1
+                e["job"]()
+                logger.info("[STARTUP %s] [%d/%d] %s completed", lane_name, i+1,
+                            len(entries), e["name"])
+            except Exception as ex:
+                logger.error("[STARTUP %s] [%d/%d] %s FAILED: %s", lane_name, i+1,
+                             len(entries), e["name"], ex)
+                log_job_error(f"startup_{lane_name}_{e['name']}", ex)
 
-    # 1. Every interval job runs once, now — no waiting out a full interval.
-    interval_kicked = 0
-    for i, e in enumerate(entries):
-        if e["spec"][0] == "at":
-            logger.debug("[STARTUP %s] [%d/%d] Skipping daily job: %s (%s)", lane_name, i+1, len(entries), e["name"], e["spec"])
-            continue
-        logger.info("[STARTUP %s] [%d/%d] kicking %s (%s)", lane_name, i+1, len(entries), e["name"], e["spec"])
-        try:
-            interval_kicked += 1
-            e["job"]()
-            logger.info("[STARTUP %s] [%d/%d] %s completed", lane_name, i+1, len(entries), e["name"])
-        except Exception as ex:
-            logger.error("[STARTUP %s] [%d/%d] %s FAILED: %s", lane_name, i+1, len(entries), e["name"], ex)
-            log_job_error(f"startup_{lane_name}_{e['name']}", ex)
+        logger.info("[STARTUP %s] Kicked %d interval jobs (total entries: %d)", lane_name,
+                    interval_kicked, len(entries))
+        daily_jobs_only = [e for e in entries if e["spec"][0] == "at"]
 
-    logger.info("[STARTUP %s] Kicked %d interval jobs (total entries: %d)", lane_name, interval_kicked, len(entries))
-
-    # 2. Daily jobs whose slot already passed today, that have not run today,
+    # 2. Daily jobs catch-up (for all lanes, but market does NOT run interval kicks above)
+    #    Daily jobs whose slot already passed today, that have not run today,
     #    and that are still meaningful late, get caught up.
-    for e in entries:
-        if e["spec"][0] != "at" or not e["catchup"]:
+    for e in daily_jobs_only:
+        if not e["catchup"]:
             continue
         try:
             hh, mm = (int(x) for x in e["spec"][1].split(":"))
