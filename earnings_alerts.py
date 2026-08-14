@@ -106,8 +106,30 @@ def poll_earnings_for_tickers():
         new_alerts = 0
         misses_found = 0
 
-        for ticker in sorted(watched):
-            earnings = get_earnings_for_ticker(ticker)
+        # /stable/earnings-calendar has no per-symbol filter, so it returns the
+        # whole market for the window. get_earnings_for_ticker() downloads that
+        # entire payload and throws away everything but one symbol -- calling it
+        # per ticker fetched the same market-wide calendar once for every watched
+        # name. Fetch the window once and index it.
+        today = datetime.now(timezone.utc).date()
+        try:
+            calendar = fmp_client.get_earnings_calendar(
+                (today - timedelta(days=7)).isoformat(),
+                (today + timedelta(days=1)).isoformat(),
+            ) or []
+        except Exception as e:
+            logger.error(f"[EARNINGS] Calendar fetch failed: {e}")
+            return
+
+        watched_upper = {str(t).upper() for t in watched}
+        by_ticker = {}
+        for ev in calendar:
+            sym = (ev.get("symbol") or "").upper()
+            if sym in watched_upper:
+                by_ticker.setdefault(sym, []).append(ev)
+
+        for ticker in sorted(by_ticker):
+            earnings = by_ticker[ticker]
             if not earnings:
                 continue
 
@@ -135,50 +157,72 @@ def poll_earnings_for_tickers():
                 if not surprise:
                     continue  # Not yet announced
 
-                if surprise['is_miss']:
-                    misses_found += 1
-                    logger.info(
-                        f"[EARNINGS] {ticker} MISS: "
-                        f"actual={surprise['eps_actual']}, "
-                        f"est={surprise['eps_estimate']}, "
-                        f"beat={surprise['beat_amount']}"
-                    )
+                # A beat is exactly as newsworthy as a miss, and this module is
+                # named for surprise detection in both directions. Reporting only
+                # misses discarded half of every earnings season.
+                is_miss = surprise['is_miss']
+                filing_type = "EARNINGS_MISS" if is_miss else "EARNINGS_BEAT"
+                verb = "missed" if is_miss else "beat"
+                gap = abs(surprise['beat_amount'])
 
-                    # Store as alert
-                    try:
-                        supabase.table("raw_filings").insert({
-                            "ticker": ticker,
-                            "company_name": event.get('symbol', ticker),
-                            "source": "FMP",
-                            "filing_type": "EARNINGS_MISS",
-                            "filing_url": "",
-                            "filing_date": announcement_date,
-                            "content_hash": f"{ticker}-{announcement_date}-earnings",
-                            "raw_text": (
-                                f"EPS Miss: {ticker} reported ${surprise['eps_actual']} "
-                                f"vs estimate ${surprise['eps_estimate']} "
-                                f"(beat: ${surprise['beat_amount']})"
-                            ),
-                            "status": "PENDING",
-                            "extra": tag_extra(
-                                {
-                                    "eps_actual": surprise['eps_actual'],
-                                    "eps_estimate": surprise['eps_estimate'],
-                                    "beat_amount": surprise['beat_amount'],
-                                },
-                                "FMP",
-                                "EARNINGS_MISS"
-                            ),
-                        }).execute()
-                        new_alerts += 1
-                    except Exception as e:
+                if is_miss:
+                    misses_found += 1
+                logger.info(
+                    f"[EARNINGS] {ticker} {filing_type}: "
+                    f"actual={surprise['eps_actual']}, "
+                    f"est={surprise['eps_estimate']}, "
+                    f"delta={surprise['beat_amount']:+.4f}"
+                )
+
+                try:
+                    # NOTE: the column is `filed_at`, not `filing_date` -- there is
+                    # no `filing_date` column on raw_filings, so every insert here
+                    # used to fail with an undefined-column error that was
+                    # swallowed by the warning below. This feature has never
+                    # written a row.
+                    supabase.table("raw_filings").insert({
+                        "ticker": ticker,
+                        "company_name": event.get('symbol', ticker),
+                        "source": "FMP",
+                        "filing_type": filing_type,
+                        "filing_url": (
+                            "https://site.financialmodelingprep.com/calendar/earnings"
+                            f"?symbol={ticker}#{announcement_date}"
+                        ),
+                        "filed_at": announcement_date,
+                        "content_hash": f"{ticker}-{announcement_date}-{filing_type}",
+                        "raw_text": (
+                            f"{ticker} reported quarterly earnings per share of "
+                            f"${surprise['eps_actual']} against a consensus estimate of "
+                            f"${surprise['eps_estimate']}, {verb} expectations by "
+                            f"${gap:.4f} per share."
+                        ),
+                        "status": "PENDING",
+                        "extra": tag_extra(
+                            {
+                                "eps_actual": surprise['eps_actual'],
+                                "eps_estimate": surprise['eps_estimate'],
+                                "beat_amount": surprise['beat_amount'],
+                                "announcement_date": announcement_date,
+                                "source_name": "FMP Earnings Calendar",
+                            },
+                            "FMP",
+                            filing_type,
+                        ),
+                    }).execute()
+                    new_alerts += 1
+                except Exception as e:
+                    if "duplicate" not in str(e).lower() and "unique" not in str(e).lower():
                         logger.warning(f"[EARNINGS] Failed to insert {ticker}: {e}")
 
         logger.info(f"[EARNINGS] Done — {new_alerts} new alerts, {misses_found} misses found")
 
     except Exception as e:
         logger.error(f"[EARNINGS] Poll failed: {e}")
-        log_poller_error(POLLER_NAME, str(e))
+        # log_poller_error takes (poller_name, job_name, error). Calling it with
+        # two arguments raised TypeError from inside this handler, replacing the
+        # real failure with a stack trace about the logger itself.
+        log_poller_error(POLLER_NAME, "poll_earnings_for_tickers", e)
 
 
 if __name__ == "__main__":

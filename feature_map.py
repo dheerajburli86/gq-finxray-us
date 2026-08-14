@@ -46,7 +46,11 @@ FEATURES = {
         "name": "Earnings Calendar Heads-Up",
         "detail": "24h-ahead earnings date/time + EPS estimate alert for watchlisted tickers.",
         "sources": {"FMP_NEWS", "FMP"},
-        "filing_types": {"EARNINGS_CALENDAR"},
+        # EARNINGS_MISS/EARNINGS_BEAT are emitted by earnings_alerts.py. They were
+        # absent here, so ("FMP", "EARNINGS_MISS") fell through both passes --
+        # "FMP" belongs to features 3, 4 and 5, so the single-candidate shortcut
+        # could not fire -- and every EPS-surprise alert was tagged "Unmapped".
+        "filing_types": {"EARNINGS_CALENDAR", "EARNINGS_MISS", "EARNINGS_BEAT"},
         "market_wide": False,
     },
     5: {

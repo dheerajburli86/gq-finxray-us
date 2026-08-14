@@ -231,8 +231,19 @@ def safe_job(fn, name=None, budget_seconds=120, lane_name=None):
 #   sec     — five EDGAR feeds, externally rate-limited and prone to timeouts
 #   news    — RSS/Atom sweep plus FMP news, dozens of third-party hosts
 #   market  — everything driven by market data and by the clock
+#   events  — FMP calendar/insider sweeps, which iterate the whole watchlist
+#
+# `events` exists because `poll_fmp_events` measured 3687s against a 300s budget
+# while registered every 60 minutes — it occupied the market lane essentially
+# continuously. The lane's other jobs are all fast (technical 0.1s, etf_flow
+# 0.1s, ipo 2.3s, analyst_ratings 20.4s, result_snapshot 0.5s, transcript 0.4s)
+# yet each managed only 1-2 runs in 24h because they spent the day queued behind
+# that one job. Lanes only isolate a stall if the slow job is not sharing a lane
+# with everything it can starve.
 # ══════════════════════════════════════════════════════════════════════════════
-LANE_BUDGETS = {"sec": 60, "news": 90, "market": 300}
+LANE_NAMES = ("sec", "news", "market", "events")
+
+LANE_BUDGETS = {"sec": 60, "news": 90, "market": 300, "events": 900}
 
 _lane_schedulers = {}
 _lane_jobs = {}
@@ -284,15 +295,23 @@ def build_schedule():
     register("sec", ("every", 5, "minutes"), poll_sec_10k, "poll_sec_10k")
     register("sec", ("every", 10, "minutes"), poll_sec_s1, "poll_sec_s1")
 
-    # ── Lane: news — News (Feature 2) ────────────────────────────────────────
+    # ── Lane: news — RSS/Atom sweep (Feature 2) ──────────────────────────────
+    # poll_all_news is registered every 60 seconds but managed 28 runs in 24h
+    # instead of ~1440: it shared this lane with poll_fmp_news, which measured
+    # 7072s against a 90s budget. The RSS sweep is the primary news source and
+    # now has the lane to itself.
     register("news", ("every", 60, "seconds"), poll_all_news, "poll_all_news")
-    register("news", ("every", 10, "minutes"), poll_fmp_news, "poll_fmp_news")
 
-    # ── Lane: market — Results, earnings calendar, insider (Features 3, 4, 5) ─
+    # ── Lane: market — Result snapshots (Feature 3) ──────────────────────────
     register("market", ("every", 30, "minutes"), process_pending_snapshots, "result_snapshot")
-    register("market", ("every", 60, "minutes"), poll_fmp_events, "poll_fmp_events")
+
+    # ── Lane: events — watchlist-wide FMP sweeps (Features 4, 5) ─────────────
+    # Isolated from `market`: poll_fmp_events runs long enough to starve every
+    # other market-data job when they share a thread.
+    register("events", ("every", 10, "minutes"), poll_fmp_news, "poll_fmp_news")
+    register("events", ("every", 60, "minutes"), poll_fmp_events, "poll_fmp_events")
     # Feature 5 was imported but never registered — it could not run at all.
-    register("market", ("every", 4, "hours"), poll_earnings_for_tickers, "earnings_alerts")
+    register("events", ("every", 4, "hours"), poll_earnings_for_tickers, "earnings_alerts")
 
     # ── Technical (Feature 6) — every 30 min, guarded to market hours inside ──
     register("market", ("every", 30, "minutes"), run_technical_poller, "technical_poller")
@@ -370,51 +389,54 @@ def _startup_pass(lane_name):
     by up to the job's interval, but the lane stays responsive. SEC and news
     lanes are fast enough to kick at startup.
     """
-    # Market lane jobs are expensive and can block. Skip interval job kicks for market.
-    # Still catch up missed daily slots (they're scheduled by time, not interval).
-    if lane_name == "market":
-        logger.info("[STARTUP %s] Skipping interval job kicks (market jobs are network-bound)",
-                    lane_name)
-        entries = _lane_jobs.get(lane_name, [])
-        now_et = datetime.now(ET)
-        # Jump directly to daily catch-up, skip interval section
-        daily_jobs_only = [e for e in entries if e["spec"][0] == "at"]
-        logger.info("[STARTUP %s] Will attempt catch-up on %d daily jobs", lane_name,
-                    len(daily_jobs_only))
+    # `events` owns the watchlist-wide FMP sweeps, the only jobs measured in
+    # thousands of seconds. Kicking those at boot would hold the lane out of its
+    # schedule loop for the better part of an hour, so they wait for their slot.
+    #
+    # The market lane gets its kick back. It was skipped when poll_fmp_events
+    # lived here and could block for 61 minutes; with that job moved to `events`
+    # every remaining market job measured under 25 seconds, and the skip had
+    # become the thing keeping them quiet — `every(30).minutes` does not run at
+    # registration, so on a platform that redeploys often a 30-minute job can go
+    # a whole day without firing. Features 3 and 11 in particular are useless if
+    # their first sweep is half an hour after boot.
+    entries = _lane_jobs.get(lane_name, [])
+
+    # NOTE: the interval-kick branch used to end in `return`, so only the one
+    # lane that skipped the kick ever reached the daily catch-up below. That put
+    # the two halves of this function in permanent opposition: whichever lane got
+    # its intervals kicked silently lost its `.at()` catch-up. The market lane
+    # owns every daily job in the system — both heatmaps, IPO, ETF Xray, the
+    # macro digest and all five market reports — so it must run both passes.
+    if lane_name == "events":
+        logger.info("[STARTUP events] Skipping interval kick (watchlist-wide FMP sweeps "
+                    "run long) — will fire on schedule")
     else:
-        # SEC and news lanes: kick all interval jobs, then catch up missed dailies
-        entries = _lane_jobs.get(lane_name, [])
-        now_et = datetime.now(ET)
         logger.info("[STARTUP %s] Total entries for startup pass: %d", lane_name, len(entries))
 
         # 1. Every interval job runs once, now — no waiting out a full interval.
         interval_kicked = 0
         for i, e in enumerate(entries):
             if e["spec"][0] == "at":
-                logger.debug("[STARTUP %s] [%d/%d] Skipping daily job: %s (%s)",
-                             lane_name, i+1, len(entries), e["name"], e["spec"])
+                logger.debug("[STARTUP %s] [%d/%d] Skipping daily job: %s (%s)", lane_name, i+1, len(entries), e["name"], e["spec"])
                 continue
-            logger.info("[STARTUP %s] [%d/%d] kicking %s (%s)", lane_name, i+1,
-                        len(entries), e["name"], e["spec"])
+            logger.info("[STARTUP %s] [%d/%d] kicking %s (%s)", lane_name, i+1, len(entries), e["name"], e["spec"])
             try:
                 interval_kicked += 1
                 e["job"]()
-                logger.info("[STARTUP %s] [%d/%d] %s completed", lane_name, i+1,
-                            len(entries), e["name"])
+                logger.info("[STARTUP %s] [%d/%d] %s completed", lane_name, i+1, len(entries), e["name"])
             except Exception as ex:
-                logger.error("[STARTUP %s] [%d/%d] %s FAILED: %s", lane_name, i+1,
-                             len(entries), e["name"], ex)
+                logger.error("[STARTUP %s] [%d/%d] %s FAILED: %s", lane_name, i+1, len(entries), e["name"], ex)
                 log_job_error(f"startup_{lane_name}_{e['name']}", ex)
 
-        logger.info("[STARTUP %s] Kicked %d interval jobs (total entries: %d)", lane_name,
-                    interval_kicked, len(entries))
-        daily_jobs_only = [e for e in entries if e["spec"][0] == "at"]
+        logger.info("[STARTUP %s] Kicked %d interval jobs (total entries: %d)", lane_name, interval_kicked, len(entries))
 
-    # 2. Daily jobs catch-up (for all lanes, but market does NOT run interval kicks above)
-    #    Daily jobs whose slot already passed today, that have not run today,
+    now_et = datetime.now(ET)
+
+    # 2. Daily jobs whose slot already passed today, that have not run today,
     #    and that are still meaningful late, get caught up.
-    for e in daily_jobs_only:
-        if not e["catchup"]:
+    for e in entries:
+        if e["spec"][0] != "at" or not e["catchup"]:
             continue
         try:
             hh, mm = (int(x) for x in e["spec"][1].split(":"))
@@ -500,12 +522,12 @@ async def main():
     build_schedule()
 
     # Debug: log all jobs in the registry
-    for lname in ("sec", "news", "market"):
+    for lname in LANE_NAMES:
         jobs_list = _lane_jobs.get(lname, [])
         job_names = [j["name"] for j in jobs_list]
         logger.info("[BOOT] Lane %s registry: %d jobs: %s", lname, len(jobs_list), job_names)
 
-    for lane_name in ("sec", "news", "market"):
+    for lane_name in LANE_NAMES:
         threading.Thread(target=run_lane, args=(lane_name,),
                          daemon=True, name=f"lane-{lane_name}").start()
         logger.info("[BOOT] lane %s: %d jobs registered",

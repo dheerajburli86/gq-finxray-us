@@ -191,6 +191,11 @@ def build_period_label(row):
         year = int(str(year)[:4])
     except (TypeError, ValueError):
         return None
+    # FMP labels an annual statement period="FY", which the plain template
+    # rendered as "FY FY2025" -- and that string reached users in the opening
+    # sentence of every annual snapshot. Quarters are unaffected ("Q2 FY2026").
+    if period == "FY":
+        return f"FY{year}"
     return f"{period} FY{year}"
 
 
@@ -233,10 +238,17 @@ def snapshot_already_queued(ticker, period):
 
 
 # ── Snapshot build ────────────────────────────────────────────────────────────
-def build_result_snapshot(ticker, form_type):
+def build_result_snapshot(ticker, form_type=None, trigger="SEC"):
     """
     Compose the factual text block for one ticker, or None when there is nothing
-    reportable. Costs two FMP calls (income statement + profile).
+    reportable. Costs one FMP call when the period is already queued (the dedup
+    gate runs before the profile lookup), two when it is genuinely new.
+
+    `form_type=None` is the FMP-direct path: no EDGAR filing has been seen, so the
+    form is derived from the period label FMP itself returned rather than asserted.
+    `trigger` only changes the wording of the opening sentence -- an FMP-sourced
+    snapshot must not claim to have been "disclosed in its 10-Q" when this process
+    never saw a 10-Q.
     """
     quarters = fmp_client.get_income_statement(ticker, period="quarter", limit=8) or []
     if len(quarters) < 2:
@@ -298,12 +310,24 @@ def build_result_snapshot(ticker, form_type):
     net_margin = margin(net)
 
     period_end = g(latest, "date")
+
+    # An FY period is an annual statement; anything else is a quarter. When EDGAR
+    # supplied the trigger we already know the form for certain and use it.
+    if form_type is None:
+        form_type = "10-K" if period.startswith("FY") else "10-Q"
     form_label = "annual report (10-K)" if form_type == "10-K" else "quarterly report (10-Q)"
+
+    if trigger == "SEC":
+        provenance = f", disclosed in its {form_label}"
+    else:
+        provenance = (", as reported in its audited annual financial statements"
+                      if form_type == "10-K"
+                      else ", as reported in its quarterly financial statements")
 
     lines = [
         f"{company_name} ({ticker}) reported financial results for {period}"
         + (f", period ended {period_end}" if period_end else "")
-        + f", disclosed in its {form_label}.",
+        + provenance + ".",
         "",
     ]
 
@@ -446,10 +470,68 @@ def _mark(filing, state, done=True):
         log_poller_error(POLLER_NAME, "mark_trigger", e, {"filing_id": filing.get("id")})
 
 
+# ── FMP-direct trigger ────────────────────────────────────────────────────────
+def sweep_watchlist_snapshots():
+    """
+    Poll FMP directly for every watched ticker, independent of SEC EDGAR.
+
+    WHY THIS EXISTS
+    ---------------
+    This feature used to fire only when edgar_poller stored a 10-Q or 10-K and
+    flagged it `needs_result_snapshot`. `raw_filings` has never contained a single
+    10-Q or 10-K row -- only 11 Form 4s, lifetime -- so the trigger query matched
+    nothing on every run since the feature was written and Feature 3 has a
+    lifetime alert count of zero. The SEC path above is kept because it is the
+    fastest signal when EDGAR does deliver, but it can no longer be the only one.
+
+    FMP publishes the income statement on its own schedule regardless of what this
+    process saw on EDGAR, so the statement itself is the trigger. Cost is one FMP
+    call per already-known ticker (the dedup gate in build_result_snapshot runs
+    before the profile lookup) and two for a genuinely new period -- roughly 20-40
+    calls per pass against a 750/min ceiling.
+
+    Dedup is shared with the SEC path: both converge on the same
+    (ticker, period) check and the same UNIQUE filing_url, so a ticker that
+    arrives down both routes is queued exactly once.
+    """
+    watched = sorted(get_watched_tickers())
+    if not watched:
+        logger.info("[SNAPSHOT] FMP sweep: no watchlisted tickers.")
+        return 0
+
+    logger.info("[SNAPSHOT] FMP sweep across %d watched ticker(s)", len(watched))
+    queued = 0
+    for ticker in watched:
+        try:
+            snapshot = build_result_snapshot(ticker, form_type=None, trigger="FMP")
+            if snapshot and queue_snapshot(snapshot):
+                queued += 1
+        except Exception as e:
+            logger.error("[SNAPSHOT] FMP sweep failed for %s: %s", ticker, e)
+            log_poller_error(POLLER_NAME, "sweep_watchlist_snapshots", e, {"ticker": ticker})
+        time.sleep(TICKER_GAP_SECONDS)
+
+    logger.info("[SNAPSHOT] FMP sweep done — %d snapshot(s) queued.", queued)
+    return queued
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def process_pending_snapshots():
-    """One pass. Never raises — a scheduler calls this every 30 minutes."""
+    """
+    One pass. Never raises — a scheduler calls this every 30 minutes.
+
+    Two independent triggers run every pass: the EDGAR-flagged filings below, and
+    the FMP sweep. Either alone is sufficient to produce a snapshot; neither can
+    silence the other, and a failure in one is caught before the other starts.
+    """
     try:
+        try:
+            sweep_watchlist_snapshots()
+        except Exception as e:
+            # The SEC-triggered path below must still run even if FMP is down.
+            logger.exception("[SNAPSHOT] FMP sweep aborted: %s", e)
+            log_poller_error(POLLER_NAME, "sweep_watchlist_snapshots", e)
+
         try:
             filings = (supabase.table("raw_filings")
                        .select("id, ticker, filing_type, extra")

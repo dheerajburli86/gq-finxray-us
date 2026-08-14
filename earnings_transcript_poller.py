@@ -77,6 +77,52 @@ MAX_TICKERS_PER_RUN = 25
 MIN_TRANSCRIPT_CHARS = 200
 TICKER_GAP_SECONDS = 0.5
 
+# How old a fiscal quarter may be and still be worth queueing on the FMP-direct
+# sweep. Without this, the first sweep after deploy would queue the newest
+# transcript FMP holds for every watched ticker even when that is years old --
+# a company that stopped holding calls would produce a "new" alert about a 2023
+# quarter. Two quarters of slack absorbs a late transcript without letting stale
+# history through.
+MAX_TRANSCRIPT_AGE_DAYS = 180
+
+
+def _quarter_end(year, quarter):
+    """Approximate calendar end of a fiscal quarter, for recency checks only."""
+    month = min(12, max(1, quarter * 3))
+    if month == 12:
+        return datetime(year, 12, 31, tzinfo=timezone.utc)
+    return datetime(year, month + 1, 1, tzinfo=timezone.utc) - timedelta(days=1)
+
+
+def _is_recent(year, quarter):
+    try:
+        age = (datetime.now(timezone.utc) - _quarter_end(int(year), int(quarter))).days
+    except (TypeError, ValueError):
+        return False
+    return -95 <= age <= MAX_TRANSCRIPT_AGE_DAYS
+
+
+def _available_periods(ticker):
+    """(year, quarter) pairs FMP lists a transcript for, newest first."""
+    try:
+        available = fmp_client.get_transcript_dates(ticker)
+    except Exception as e:
+        logger.warning("[TRANSCRIPT] transcripts-dates lookup failed for %s: %s", ticker, e)
+        return []
+
+    parsed = []
+    for entry in available or []:
+        year = entry.get("fiscalYear") or entry.get("year")
+        quarter = entry.get("period") or entry.get("quarter")
+        try:
+            year = int(year)
+            quarter = int(str(quarter).upper().replace("Q", ""))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= quarter <= 4:
+            parsed.append((year, quarter))
+    return sorted(set(parsed), reverse=True)
+
 
 def _guess_period(filed_dt):
     period_end_estimate = filed_dt - timedelta(days=FILING_LAG_DAYS)
@@ -282,13 +328,77 @@ def find_recent_10q_10k(watched):
     return out
 
 
+def sweep_watchlist_transcripts(watched):
+    """
+    Poll FMP directly for every watched ticker, independent of SEC EDGAR.
+
+    WHY THIS EXISTS
+    ---------------
+    find_recent_10q_10k() below reads 10-Q/10-K rows out of `raw_filings`.
+    `raw_filings` has never held one: the table's entire SEC history is 11 Form 4
+    rows. So the trigger set was empty on every run since this module was written
+    and Feature 11 has a lifetime alert count of zero.
+
+    FMP publishes a transcript within a day or two of the call, on its own
+    schedule, whether or not EDGAR delivered anything -- so the transcript listing
+    is the trigger. One cheap dates-listing call per ticker, and the full
+    transcript is only pulled for a period we do not already hold and that is
+    recent enough to be news.
+
+    Dedup is shared with the EDGAR path: both go through
+    transcript_already_fetched(ticker, year, quarter) and the same UNIQUE
+    filing_url, so a ticker reached by both routes is queued once.
+    """
+    queued = 0
+    logger.info("[TRANSCRIPT] FMP sweep across %d watched ticker(s)", len(watched))
+
+    for ticker in sorted(watched):
+        try:
+            fresh = [(y, q) for (y, q) in _available_periods(ticker) if _is_recent(y, q)]
+            if not fresh:
+                continue
+
+            # Newest first; stop at the first period we do not already hold.
+            for year, quarter in fresh:
+                if transcript_already_fetched(ticker, year, quarter):
+                    continue
+
+                transcript = fmp_client.get_earnings_transcript(ticker, year, quarter)
+                if not transcript:
+                    logger.info("[TRANSCRIPT] Listed but not yet published: %s Q%s FY%s",
+                                ticker, quarter, year)
+                    break
+
+                if store_transcript_for_pipeline(ticker, ticker, year, quarter, transcript):
+                    queued += 1
+                break
+        except Exception as e:
+            logger.error("[TRANSCRIPT] FMP sweep failed for %s: %s", ticker, e)
+            log_poller_error(POLLER_NAME, "sweep_watchlist_transcripts", e, {"ticker": ticker})
+        time.sleep(TICKER_GAP_SECONDS)
+
+    logger.info("[TRANSCRIPT] FMP sweep done — %d transcript(s) queued.", queued)
+    return queued
+
+
 def run_earnings_transcript_poller():
-    """One pass. Never raises — a scheduler calls this every 30 minutes."""
+    """
+    One pass. Never raises — a scheduler calls this every 30 minutes.
+
+    Two independent triggers run every pass: the FMP sweep, and the EDGAR-filing
+    path. Either alone is sufficient; a failure in one cannot silence the other.
+    """
     try:
         watched = get_watched_tickers()
         if not watched:
             logger.info("[TRANSCRIPT] No watchlisted tickers; nothing to poll.")
             return
+
+        try:
+            sweep_watchlist_transcripts(watched)
+        except Exception as e:
+            logger.exception("[TRANSCRIPT] FMP sweep aborted: %s", e)
+            log_poller_error(POLLER_NAME, "sweep_watchlist_transcripts", e)
 
         filings = find_recent_10q_10k(watched)
         if not filings:
