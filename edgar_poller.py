@@ -247,6 +247,10 @@ def sec_get(url, timeout=None, retries=2, budget=None):
 def load_cik_map():
     """Load SEC's full CIK↔ticker file. Called once at startup by main.py."""
     global CIK_MAP
+    # Reset SEC backoff at startup so a previous rate-limit block doesn't prevent
+    # the CIK map from loading, which would break all subsequent SEC polls.
+    with _sec_lock:
+        _sec_state["blocked_until"] = 0.0
     try:
         r = sec_get(EDGAR_CIK_URL, timeout=30, budget=60)
         if r is None:
