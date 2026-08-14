@@ -30,10 +30,23 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_all_stocks():
-    """Fetch all US stocks (NYSE + NASDAQ) from the stocks table."""
+    """Fetch all US stocks (NYSE + NASDAQ) from the stocks table with pagination."""
     try:
-        result = supabase.table("stocks").select("ticker").execute()
-        return [row["ticker"] for row in result.data if row.get("ticker")]
+        tickers = []
+        page = 0
+        page_size = 1000
+        while True:
+            result = supabase.table("stocks").select("ticker").range(
+                page * page_size, page * page_size + page_size - 1
+            ).execute()
+            rows = result.data or []
+            if not rows:
+                break
+            tickers.extend([row["ticker"] for row in rows if row.get("ticker")])
+            if len(rows) < page_size:
+                break
+            page += 1
+        return tickers
     except Exception as e:
         print(f"[FMP] Failed to fetch stocks list: {e}")
         return []
