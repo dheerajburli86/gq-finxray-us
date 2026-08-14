@@ -39,8 +39,9 @@ THE REARCHITECTURE
 * Dedup is one batched query at the top of the run, and it fails CLOSED: if the
   ledger cannot be read the run emits nothing rather than risk re-sending.
 
-Alerts are written to `alerts` with delivered=False. This module never talks to
-Telegram — delivery.py fans each row out to the users watching that ticker.
+Alerts are written to `raw_filings` with status='PENDING' for processing by ai_pipeline.py.
+The pipeline applies watchlist gating, relevance checks, impact classification, and dedup.
+This module never talks to Telegram — delivery.py fans each final alert out to users.
 """
 
 import os
@@ -226,13 +227,35 @@ def load_sent_today():
 
 
 def _write_alerts(rows):
-    """Bulk insert in chunks so one oversized request cannot lose the whole run."""
+    """Queue alerts for the AI pipeline (raw_filings) instead of direct insertion."""
     written = 0
+    import hashlib
+    import re
+
     for i in range(0, len(rows), 50):
         chunk = rows[i:i + 50]
         try:
-            supabase.table("alerts").insert(chunk).execute()
-            written += len(chunk)
+            # Convert alert format to raw_filings format for pipeline processing
+            filings = []
+            for row in chunk:
+                filing = {
+                    "ticker": row["ticker"],
+                    "company_name": row.get("ticker", "UNKNOWN"),  # Will be resolved in pipeline
+                    "source": SOURCE,
+                    "filing_type": row["filing_type"],
+                    "filing_url": row["filing_url"],
+                    "filed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+                    "raw_text": row["summary"],
+                    "status": "PENDING",
+                    "content_hash": hashlib.sha256(
+                        re.sub(r"\s+", " ", row["summary"].lower()).strip().encode("utf-8", "ignore")
+                    ).hexdigest(),
+                    "extra": row["extra"],
+                }
+                filings.append(filing)
+
+            supabase.table("raw_filings").insert(filings).execute()
+            written += len(filings)
         except Exception as e:
             log_poller_error(POLLER, "write_alerts", e,
                              {"tickers": [r["ticker"] for r in chunk]})
@@ -240,6 +263,7 @@ def _write_alerts(rows):
 
 
 def _build_alert(ticker, alert_type, summary, headline, extra):
+    """Build a raw_filings-compatible alert row for the pipeline."""
     payload = dict(extra or {})
     payload["headline"] = headline
 
@@ -249,10 +273,8 @@ def _build_alert(ticker, alert_type, summary, headline, extra):
     return {
         "ticker": ticker,
         "summary": summary,
-        "impact": ALERT_IMPACT.get(alert_type, "MEDIUM"),
         "source": SOURCE,
         "filing_type": alert_type,
-        "delivered": False,
         "extra": tag_extra(payload, SOURCE, alert_type),
         "filing_url": filing_url,
     }
