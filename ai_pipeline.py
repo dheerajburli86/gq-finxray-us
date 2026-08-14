@@ -613,28 +613,37 @@ def process_filing(filing, watched=None):
     if impact not in ("HIGH", "MEDIUM", "LOW"):
         impact = "LOW"
 
-    # Fallback rules if LLM misses something
+    # Safety net for the few categories the classifier must never grade LOW.
+    #
+    # The previous version promoted LOW -> MEDIUM when the summary contained any
+    # of ["cash flow plummet", "revenue drop", "negative cash flow", "91%",
+    # "decline"] AND any of ["quarter", "year", "%"]. Every result snapshot
+    # contains both "quarter" and "%", so a single occurrence of the word
+    # "decline" anywhere -- including "a decline in costs" -- promoted it. Nothing
+    # financial could settle at LOW, which is a large part of why 71% of all
+    # alerts graded HIGH or MEDIUM. "91%" was a literal left over from one Meta
+    # story and also matched "191%".
+    #
+    # These patterns are now narrow, unambiguous, and none of them appear in a
+    # routine healthy quarter.
     if impact == "LOW":
-        summary_lower = summary.lower()
-        # Catch financial deterioration
-        if any(x in summary_lower for x in ["cash flow plummet", "revenue drop", "negative cash flow", "91%", "decline"]):
-            if any(x in summary_lower for x in ["quarter", "year", "%"]):
-                impact = "MEDIUM"
-        # Catch regulatory/legal issues
-        if any(x in summary_lower for x in ["ftc sued", "ftc lawsuit", "sec lawsuit", "data breach", "data sharing with"]):
+        s = summary.lower()
+        SEVERE = (
+            "bankrupt", "chapter 11", "going concern", "covenant breach",
+            "debt default", "delisting", "restructuring",
+            "dividend cut", "dividend suspend", "suspended its dividend",
+            "guidance cut", "cuts guidance", "lowered its guidance",
+            "withdrew guidance", "withdraws guidance",
+            "data breach", "security breach", "ransomware",
+            "sec charges", "sec sued", "ftc sued", "doj investigation",
+            "accounting irregularit", "restatement", "material weakness",
+        )
+        hit = next((p for p in SEVERE if p in s), None)
+        if hit:
             impact = "MEDIUM"
-        # Catch security incidents
-        if any(x in summary_lower for x in ["hack", "hacking", "security breach", "cyber"]):
-            impact = "MEDIUM"
+            print(f"[IMPACT] Promoted LOW->MEDIUM on severe-category match: {hit!r}")
 
     print(f"[IMPACT] {impact}")
-
-    # ── Stage 4.5: FMP News filter — HIGH impact only ──────────────────────────
-    # Feature 2 (FMP news) needs to be signal-only, not noise. Skip MEDIUM/LOW.
-    if source == "FMP_NEWS" and filing_type == "NEWS" and impact in ("MEDIUM", "LOW"):
-        print(f"[SKIPPED] FMP news below HIGH impact threshold")
-        update_filing_status(filing_id, "PROCESSED")
-        return
 
     # ── Stage 5: Store ──────────────────────────────────────────────────────
     usage = get_token_usage()
