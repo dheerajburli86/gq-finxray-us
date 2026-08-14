@@ -272,6 +272,9 @@ def load_cik_map():
         if mapping:
             CIK_MAP = mapping
             logger.info("[EDGAR] Loaded %d CIK→ticker mappings", len(CIK_MAP))
+            # Debug: log sample tickers to verify map populated
+            sample_tickers = sorted([CIK_MAP[k] for k in list(CIK_MAP.keys())[:50]])
+            logger.info("[EDGAR] Sample tickers: %s", ", ".join(sample_tickers[:20]))
     except Exception as e:
         logger.error("[EDGAR] load_cik_map failed: %s", e)
         log_poller_error(POLLER_NAME, "load_cik_map", e)
