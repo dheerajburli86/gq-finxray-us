@@ -78,12 +78,10 @@ MIN_TRANSCRIPT_CHARS = 200
 TICKER_GAP_SECONDS = 0.5
 
 # How old a fiscal quarter may be and still be worth queueing on the FMP-direct
-# sweep. Without this, the first sweep after deploy would queue the newest
-# transcript FMP holds for every watched ticker even when that is years old --
-# a company that stopped holding calls would produce a "new" alert about a 2023
-# quarter. Two quarters of slack absorbs a late transcript without letting stale
-# history through.
-MAX_TRANSCRIPT_AGE_DAYS = 180
+# sweep. Transcripts are news only when fresh. 45 days allows ~1.5 fiscal quarters
+# of slack (captures late filings and delayed transcripts) without backfilling
+# ancient history. A transcript from 180 days ago is archival, not an alert.
+MAX_TRANSCRIPT_AGE_DAYS = 45
 
 
 def _quarter_end(year, quarter):
