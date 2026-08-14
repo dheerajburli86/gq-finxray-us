@@ -249,15 +249,14 @@ def store_transcript_for_pipeline(ticker, company_name, year, quarter, transcrip
     title = f"{company_name} Q{quarter} FY{year} Earnings Call Transcript"
     # Real FMP link to earnings call transcripts (clickable for users).
     #
-    # The constraint is UNIQUE(filing_url) on the column alone — NOT the
-    # UNIQUE(filing_url, ticker) this comment used to claim. With a URL constant
-    # per ticker only the FIRST transcript per company could ever insert; every
-    # subsequent quarter hit the unique violation and was logged as "already
-    # queued", so the most expensive FMP endpoint was re-fetched every cycle and
-    # its result discarded. The fragment makes it unique per fiscal quarter and
-    # is ignored by browsers, so the link still resolves.
-    filing_url = (f"https://site.financialmodelingprep.com/earnings-call-transcript/"
-                  f"{ticker.upper()}#FY{year}Q{quarter}")
+    # The constraint is UNIQUE(filing_url) on the column alone. The fragment makes
+    # it unique per fiscal quarter so multiple quarters for the same ticker can coexist
+    # without hitting the unique constraint.
+    #
+    # FMP's transcript viewer is at /earnings-call-transcript/{ticker} without
+    # year/quarter in the URL path. The fragment is for database uniqueness only.
+    filing_url = (f"https://www.financialmodelingprep.com/earnings-call-transcript/"
+                  f"{ticker.upper()}?year={year}&quarter={quarter}")
 
     try:
         supabase.table("raw_filings").insert({
