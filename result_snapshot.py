@@ -402,8 +402,8 @@ def queue_snapshot(snapshot):
     # "duplicate" branch below as if it had already been queued. period_slug was
     # computed for this purpose and then never used. The fragment keeps the link
     # clickable (browsers ignore #...) while making the row unique per period.
-    filing_url = (f"https://site.financialmodelingprep.com/financials/"
-                  f"{ticker.upper()}#{period_slug}")
+    filing_url = (f"https://www.financialmodelingprep.com/financials/"
+                  f"{ticker.upper()}?period={period_slug}")
     text = snapshot["raw_text"]
 
     try:
