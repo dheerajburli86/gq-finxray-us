@@ -629,6 +629,13 @@ def process_filing(filing, watched=None):
 
     print(f"[IMPACT] {impact}")
 
+    # ── Stage 4.5: FMP News filter — HIGH impact only ──────────────────────────
+    # Feature 2 (FMP news) needs to be signal-only, not noise. Skip MEDIUM/LOW.
+    if source == "FMP_NEWS" and filing_type == "NEWS" and impact in ("MEDIUM", "LOW"):
+        print(f"[SKIPPED] FMP news below HIGH impact threshold")
+        update_filing_status(filing_id, "PROCESSED")
+        return
+
     # ── Stage 5: Store ──────────────────────────────────────────────────────
     usage = get_token_usage()
     extra.update({
