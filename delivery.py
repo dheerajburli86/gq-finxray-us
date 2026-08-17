@@ -58,19 +58,9 @@ ADMIN_CHANNEL_ID = os.getenv("TELEGRAM_ADMIN_CHANNEL_ID") or None
 ET = ZoneInfo("America/New_York")
 
 # Market-wide broadcast switch.
-#
-# Since the 2026-08-11 watchlist-only migration, an alert with ticker="MARKET"
-# has no audience: resolve_audience() returns [] and the row is marked delivered
-# without reaching anyone. Several producers (sector heatmap, ETF Xray, macro
-# digest, the five daily market reports) never stopped emitting those alerts, so
-# they were paying for FMP calls, LLM tokens and image rendering to build
-# messages that were discarded at the last step.
-#
-# Producers must check broadcast_enabled() BEFORE doing that work. Flipping
-# GQ_ENABLE_MARKET_WIDE=true re-enables the path in one place if the product
-# decision is ever reversed — at which point resolve_audience() must also be
-# taught to honour user_preferences.receive_market_wide.
-BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "true").strip().lower()
+# DISABLED by default for watchlist-only routing. Set GQ_ENABLE_MARKET_WIDE=true
+# to allow market-wide alerts (sector heatmap, ETF Xray, macro digest, market reports).
+BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "false").strip().lower()
                      in ("1", "true", "yes"))
 
 
@@ -79,25 +69,16 @@ def broadcast_enabled():
     return BROADCAST_ENABLED
 
 
-# Features that are market-wide BY NATURE and can never be watchlist-routed.
+# Features that are market-wide BY NATURE.
+# DISABLED for watchlist-only routing. If you want market-wide features again,
+# set GQ_ENABLE_MARKET_WIDE=true and uncomment these sets.
 #
-# IPO_UPCOMING is the important one: a pre-listing ticker is not on anybody's
-# watchlist by definition — it does not trade yet — so gating it on the watchlist
-# silenced the whole feature. Same for the macro digest, ETF Xray, the daily
-# market reports and the sector heatmap: their ticker is "MARKET".
-#
-# These still respect min_impact and muted_features, and still respect the
-# per-user receive_market_wide opt-out. They just do not require a watchlist hit.
+# (Previously: IPO_UPCOMING, MACRO_BRIEFING, ETF_XRAY, MARKET_REPORT, SECTOR_HEATMAP)
 MARKET_WIDE_FILING_TYPES = {
-    "IPO_UPCOMING",
-    "MACRO_BRIEFING",
-    "ETF_XRAY",
-    "MARKET_REPORT",
-    "SECTOR_HEATMAP",
+    # Empty — watchlist-only mode
 }
 MARKET_WIDE_SOURCES = {
-    "FMP_IPO",
-    "MACRO_ROUNDUP",
+    # Empty — watchlist-only mode
     "ETF_XRAY",
     "MARKET_REPORT",
     "SECTOR_HEATMAP",
@@ -120,33 +101,6 @@ IMPACT_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 # Telegram permits ~30 messages/second across all chats. Stay comfortably under.
 SEND_GAP_SECONDS = 0.05
 BATCH_LIMIT = 100
-
-
-def _interleave_by_filing_type(alerts):
-    """
-    Reorder alerts to cycle through filing types instead of draining one type at a time.
-
-    Prevents "20 transcripts in a row" by grouping by filing_type and interleaving.
-    If alerts = [A1, A2, A3, B1, B2, B3, C1, C2], groups by type and cycles:
-    [A1, B1, C1, A2, B2, C2, A3, B3] so variety goes out instead of A's then B's then C's.
-    """
-    from collections import defaultdict
-    by_type = defaultdict(list)
-    for alert in alerts:
-        filing_type = alert.get("filing_type", "UNKNOWN")
-        by_type[filing_type].append(alert)
-
-    if len(by_type) <= 1:
-        return alerts  # No interleaving needed if only one type
-
-    interleaved = []
-    max_len = max(len(v) for v in by_type.values())
-    for i in range(max_len):
-        for filing_type in sorted(by_type.keys()):
-            if i < len(by_type[filing_type]):
-                interleaved.append(by_type[filing_type][i])
-
-    return interleaved
 
 
 # ── Loading ───────────────────────────────────────────────────────────────────
@@ -384,10 +338,6 @@ async def deliver_pending_alerts():
     alerts = _fetch_undelivered()
     if not alerts:
         return
-
-    # Reorder to cycle through filing types instead of draining one type at a time.
-    # Prevents 20 transcripts in a row by interleaving: transcript, news, snapshot, transcript, ...
-    alerts = _interleave_by_filing_type(alerts)
 
     users = _fetch_active_users()
     if not users:
