@@ -179,24 +179,33 @@ def get_insider_trading(ticker, page=0, limit=50):
 
 # ── Earnings call transcripts (Feature 11 — new) ─────────────────────────────
 def get_earnings_transcript(ticker, year, quarter):
-    """Returns full transcript text (list of dicts w/ 'content') or None."""
+    """Returns full transcript text or None.
+
+    NOTE: FMP's /earning-call-transcript endpoint may return 404 for certain
+    tickers or quarters. This is a data gap, not a code bug. FMP does not have
+    transcripts for all US companies, and some quarters may not have been called.
+    Returns None gracefully on any failure.
+    """
+    # Try the direct endpoint first (most common case)
     data = _get("earning-call-transcript", {"symbol": ticker, "year": year, "quarter": quarter})
     if data and isinstance(data, list) and data:
         return data[0]
+    if data and isinstance(data, dict) and data.get("content"):
+        return data
+    # Fallback: if the direct path returns 404 or malformed, return None
+    # (the poller will skip this ticker and try the next one)
     return None
 
 
 def get_latest_transcripts(limit=50):
+    """List of latest available transcripts across all companies."""
     data = _get("latest-transcripts", {"limit": limit})
     return data if isinstance(data, list) else []
 
 
 def get_transcript_dates(ticker):
-    """List of transcript dates available for a ticker (FMP Ultimate only).
-
-    Returns list of dicts with 'quarter', 'fiscalYear', 'date'.
-    """
-    data = _get("earning-call-transcript-dates", {"symbol": ticker})
+    """List of (year, quarter, date) tuples available for a ticker."""
+    data = _get("transcripts-dates-by-symbol", {"symbol": ticker})
     return data if isinstance(data, list) else []
 
 
