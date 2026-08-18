@@ -1,6 +1,6 @@
 """Prompt_S1N_NewsSummarization.py — Summarize news articles"""
 
-def get_prompt(company_name, sub_summary, raw_text, target_word_count=75, min_word_count=70):
+def get_prompt(company_name, sub_summary, raw_text, target_word_count=120, min_word_count=100):
     return f"""You are a financial news analyst. Summarize this news article about {company_name}.
 
 Target: exactly {target_word_count} words
