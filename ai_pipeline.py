@@ -45,9 +45,10 @@ DEEPINFRA_MODEL = "google/gemini-2.5-flash"
 # Escape hatch for a fresh deployment with an empty watchlist, or for backfills.
 PROCESS_ALL_TICKERS = os.getenv("PROCESS_ALL_TICKERS", "false").lower() == "true"
 
-# Duplicacy checker config
+# Duplicacy checker config — TIGHTENED
 DUPLICATE_CHECK_HOURS = 24  # Check last 24 hours for duplicates
-SIMILARITY_THRESHOLD = 0.75  # 75% similarity considered a duplicate
+SIMILARITY_THRESHOLD = 0.72  # Cross-source threshold (tightened from 0.75)
+SAME_SOURCE_THRESHOLD = 0.82  # Same type/source threshold (tightened from 0.85)
 
 from Prompt_P2_GibberishChecker import get_prompt as gibberish_prompt
 from Prompt_V3_RelevanceCheck import get_prompt as relevance_prompt
@@ -67,7 +68,7 @@ TARGET_STEP = 10       # Increased from 5 for bigger jumps
 MAX_TARGET = 180       # Increased from 100 for longer articles
 
 # Absolute floor. Below this a "summary" is a fragment, whatever the source.
-ABS_MIN_WORDS = 12
+ABS_MIN_WORDS = 15  # Raised from 12 to reject fragment summaries more aggressively
 
 
 # ── Duplicacy Checker ───────────────────────────────────────────────────────────
@@ -123,17 +124,15 @@ def check_for_duplicate(ticker, summary, filing_type, source):
             # Same filing type + source = likely exact duplicate, be strict
             if prev_filing_type == filing_type and prev_source == source:
                 similarity = calculate_similarity(summary, prev_summary)
-                if similarity >= 0.85:  # 85% for same type/source
-                    print(f"[DUP] Duplicate found (same type/source): {ticker} "
-                          f"similarity={similarity:.2f} (threshold=0.85)")
+                if similarity >= SAME_SOURCE_THRESHOLD:
+                    print(f"[DUP] Duplicate (same type/source): {ticker} sim={similarity:.2f} (th={SAME_SOURCE_THRESHOLD})")
                     return True
 
             # Different source = cross-source variety, be lenient
             else:
                 similarity = calculate_similarity(summary, prev_summary)
                 if similarity >= SIMILARITY_THRESHOLD:
-                    print(f"[DUP] Duplicate found (cross-source): {ticker} "
-                          f"similarity={similarity:.2f} (threshold={SIMILARITY_THRESHOLD})")
+                    print(f"[DUP] Duplicate (cross-source): {ticker} sim={similarity:.2f} (th={SIMILARITY_THRESHOLD})")
                     return True
 
         return False
@@ -405,6 +404,7 @@ def classify_failure(summary, max_words, min_words=MIN_WORDS):
     if not summary:
         return "empty"
     wc = count_words(summary)
+    # Tightened: strict max_words enforcement (no 20% buffer)
     if wc > max_words:
         return "too_long"
     if wc < min_words:
@@ -413,6 +413,9 @@ def classify_failure(summary, max_words, min_words=MIN_WORDS):
         return "bad_start"
     if last_sentence_incomplete(summary):
         return "incomplete"
+    # Extra check: reject summaries that are too short even if technically passing
+    if wc < ABS_MIN_WORDS + 3:
+        return "fragment"
     return None
 
 

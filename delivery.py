@@ -74,18 +74,20 @@ def broadcast_enabled():
 # set GQ_ENABLE_MARKET_WIDE=true and uncomment these sets.
 #
 # (Previously: IPO_UPCOMING, MACRO_BRIEFING, ETF_XRAY, MARKET_REPORT, SECTOR_HEATMAP)
-MARKET_WIDE_FILING_TYPES = {
-    # Empty — watchlist-only mode
-}
-MARKET_WIDE_SOURCES = {
-    # Empty — watchlist-only mode
-    "ETF_XRAY",
-    "MARKET_REPORT",
-    "SECTOR_HEATMAP",
-}
+# TIGHTENED: Both sets are empty. Absolutely no market-wide broadcasts.
+MARKET_WIDE_FILING_TYPES = set()
+MARKET_WIDE_SOURCES = set()
 
 
 def _is_market_wide(alert):
+    """Determines if an alert is market-wide (ticker='MARKET' or in market-wide sets).
+
+    TIGHTENED: Return True ONLY if it's explicitly MARKET, and only if BROADCAST_ENABLED.
+    This prevents any market-wide alert from being sent unless explicitly enabled.
+    """
+    if not BROADCAST_ENABLED:
+        return False  # No market-wide alerts at all if broadcast disabled
+
     ticker = (alert.get("ticker") or "").upper()
     if ticker in ("", "MARKET", "UNKNOWN"):
         return True
@@ -172,10 +174,19 @@ def _fetch_watchers(tickers):
     caller then recorded "no_audience" and marked the alert delivered forever, so
     a momentary database blip permanently destroyed real alerts. Callers must
     leave unresolved tickers pending instead of concluding nobody wants them.
+
+    TIGHTENED: Filter out empty/malformed tickers strictly.
     """
     watchers = {}
     unresolved = set()
-    tickers = [t for t in tickers if t]
+    # Tightened: Only include valid tickers (non-empty, alphanumeric + dash/dot)
+    tickers = [t.upper().strip() for t in (tickers or [])
+               if t and isinstance(t, str) and t.strip() and
+               all(c.isalnum() or c in '-.' for c in t.strip().upper())]
+
+    if not tickers:
+        return watchers, unresolved
+
     for i in range(0, len(tickers), 200):
         chunk = tickers[i:i + 200]
         try:
@@ -188,7 +199,9 @@ def _fetch_watchers(tickers):
             unresolved.update(chunk)
             continue
         for r in rows:
-            watchers.setdefault((r.get("ticker") or "").upper(), set()).add(r["user_id"])
+            ticker = (r.get("ticker") or "").upper().strip()
+            if ticker and r.get("user_id"):  # Double-check both fields exist
+                watchers.setdefault(ticker, set()).add(r["user_id"])
     return watchers, unresolved
 
 

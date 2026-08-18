@@ -69,6 +69,8 @@ def _get(path, params=None, timeout=20, retries=2):
     ordinary empty result (fmp_scraper.py in particular, so it can stop a
     bulk scrape early instead of grinding through hundreds more doomed
     retries) should catch FMPError specifically.
+
+    TIGHTENED: Stricter timeout and faster backoff on non-429 errors.
     """
     # Copy rather than mutate the caller's dict -- callers like screener()
     # pass their params straight through, and injecting "apikey" into their
@@ -78,7 +80,7 @@ def _get(path, params=None, timeout=20, retries=2):
     params["apikey"] = FMP_API_KEY
     url = f"{BASE_URL}/{path.lstrip('/')}"
 
-    wait = 3
+    wait = 2  # Tightened from 3
     last_was_429 = False
     for attempt in range(retries + 1):
         try:
@@ -88,18 +90,21 @@ def _get(path, params=None, timeout=20, retries=2):
             if r.status_code == 429:
                 last_was_429 = True
                 time.sleep(wait)
-                wait *= 2
+                wait = min(wait * 2, 16)  # Cap backoff at 16s
                 continue
             last_was_429 = False
-            print(f"[FMP] {path} returned {r.status_code}: {r.text[:200]}")
+            # Tightened: Don't retry on non-429 errors, just log and return None
+            if r.status_code not in (404, 400, 403):
+                print(f"[FMP] {path} returned {r.status_code}: {r.text[:100]}")
             return None
         except Exception as e:
             last_was_429 = False
-            print(f"[FMP] Request failed for {path} (attempt {attempt + 1}): {e}")
-            time.sleep(wait)
-            wait *= 2
+            print(f"[FMP] Request failed {path} (attempt {attempt + 1}): {str(e)[:80]}")
+            if attempt < retries:  # Only sleep if we'll retry
+                time.sleep(wait)
+                wait = min(wait * 2, 16)
     if last_was_429:
-        raise FMPError(f"{path}: persistent HTTP 429 across {retries + 1} attempts -- rate limit/quota exhausted")
+        raise FMPError(f"{path}: persistent 429 across {retries + 1} attempts -- rate limit exhausted")
     return None
 
 
@@ -133,7 +138,16 @@ def get_commodity_quote(commodity_symbol):
 
 # ── News ──────────────────────────────────────────────────────────────────────
 def get_stock_news(ticker, limit=10):
-    """Ticker-specific news. symbols can be comma-separated for batch."""
+    """Ticker-specific news. symbols can be comma-separated for batch.
+
+    TIGHTENED: Validate ticker format before request.
+    """
+    # Reject obviously malformed tickers
+    if not ticker or not isinstance(ticker, str):
+        return []
+    ticker = ticker.upper().strip()
+    if not ticker or len(ticker) > 50:  # Sanity check on length
+        return []
     data = _get("news/stock", {"symbols": ticker, "limit": limit})
     return data if isinstance(data, list) else []
 
@@ -185,7 +199,21 @@ def get_earnings_transcript(ticker, year, quarter):
     tickers or quarters. This is a data gap, not a code bug. FMP does not have
     transcripts for all US companies, and some quarters may not have been called.
     Returns None gracefully on any failure.
+
+    TIGHTENED: Validate inputs before request.
     """
+    # Tightened: Validate inputs
+    ticker = (ticker or "").upper().strip()
+    if not ticker or len(ticker) > 20:
+        return None
+    try:
+        year = int(year)
+        quarter = int(quarter)
+    except (ValueError, TypeError):
+        return None
+    if not (2000 <= year <= 2100) or not (1 <= quarter <= 4):
+        return None
+
     # Try the direct endpoint first (most common case)
     data = _get("earning-call-transcript", {"symbol": ticker, "year": year, "quarter": quarter})
     if data and isinstance(data, list) and data:

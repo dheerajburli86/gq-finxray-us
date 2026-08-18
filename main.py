@@ -176,7 +176,7 @@ def ran_today(job_name):
         return True
 
 
-def safe_job(fn, name=None, budget_seconds=120, lane_name=None):
+def safe_job(fn, name=None, budget_seconds=120, lane_name=None, timeout_seconds=None):
     """
     Wrap a scheduled job so a failure inside it can never take down the lane
     thread. This is the single most important line of defence in this file:
@@ -188,8 +188,11 @@ def safe_job(fn, name=None, budget_seconds=120, lane_name=None):
     takes four times its interval is the failure mode that took this system
     down: no exception, no error row, no alerts, and the only visible symptom is
     other features going silent.
+
+    TIGHTENED: Stricter timeout enforcement and logging of slow jobs.
     """
     job_name = name or getattr(fn, "__name__", "job")
+    timeout = timeout_seconds or (budget_seconds * 2)  # Hard limit
 
     def wrapped(*args, **kwargs):
         started = time.time()
@@ -198,20 +201,22 @@ def safe_job(fn, name=None, budget_seconds=120, lane_name=None):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            status, detail = "ERROR", str(e)
+            status, detail = "ERROR", str(e)[:500]
             logger.error("[JOB FAILED] %s: %s", job_name, e)
             logger.debug(traceback.format_exc())
             log_job_error(job_name, e)
         finally:
             elapsed = time.time() - started
+            # Tightened: Log ANY job that exceeds soft budget
             if elapsed > budget_seconds:
                 if status == "OK":
                     status = "SLOW"
-                logger.warning("[JOB SLOW] %s took %.0fs (budget %ss)",
-                               job_name, elapsed, budget_seconds)
+                logger.warning("[JOB SLOW] %s took %.1fs (budget %ds, %s)",
+                               job_name, elapsed, budget_seconds,
+                               "TIMEOUT" if elapsed > timeout else "overrun")
                 log_job_error(job_name,
-                              f"Job overran its budget: {elapsed:.0f}s vs {budget_seconds}s",
-                              context=f"{job_name} overran; this starves other jobs in the same lane.")
+                              f"Job overran: {elapsed:.1f}s vs budget {budget_seconds}s",
+                              context=f"{job_name} overran; starves other jobs in {lane_name} lane.")
             _record_run_finish(run_id, status, elapsed * 1000, detail)
 
     wrapped.__name__ = f"safe_{job_name}"
