@@ -781,10 +781,14 @@ def poll_all_news():
             logger.info("[NEWS] No watchlisted tickers; skipping this cycle.")
             return
 
+        # Convert to uppercase set for strict matching
+        watched_upper = {str(t).upper() for t in watched if t}
+        logger.info("[NEWS] Watched tickers (%d): %s", len(watched_upper), sorted(watched_upper))
+
         cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_ARTICLE_AGE_DAYS)
         paused = [s["name"] for s in NEWS_SOURCES if _source_is_paused(s["name"])]
         logger.info("[NEWS] Polling %d of %d feeds against %d watched tickers%s",
-                    len(NEWS_SOURCES) - len(paused), len(NEWS_SOURCES), len(watched),
+                    len(NEWS_SOURCES) - len(paused), len(NEWS_SOURCES), len(watched_upper),
                     f" ({len(paused)} paused: {', '.join(paused)})" if paused else "")
 
         total = 0
@@ -792,7 +796,7 @@ def poll_all_news():
             if _source_is_paused(source["name"]):
                 continue  # No request, and no politeness gap for a feed we skipped.
             try:
-                stored = poll_news_source(source, watched, cutoff)
+                stored = poll_news_source(source, watched_upper, cutoff)
             except Exception as e:
                 logger.error("[NEWS] %s failed: %s", source["name"], e)
                 _note_source_failure(source["name"], source["url"],
