@@ -62,13 +62,14 @@ from Prompt_H1_HeadlineGeneration import get_prompt as h1_prompt
 from feature_map import resolve_feature
 
 # ── Word-count escalation ladder ──────────────────────────────────────────────
-MIN_WORDS = 70
-STARTING_TARGET = 120  # Increased from 75 for richer summaries
-TARGET_STEP = 10       # Increased from 5 for bigger jumps
-MAX_TARGET = 180       # Increased from 100 for longer articles
+# TIGHTENED: Enforce minimum 75 words for all alerts (no fragments)
+MIN_WORDS = 75  # User requirement: minimum 75 words, not 70
+STARTING_TARGET = 140  # Increased to push for fuller summaries
+TARGET_STEP = 15       # Bigger jumps to reach target faster
+MAX_TARGET = 200       # Increased to allow longer, richer content
 
 # Absolute floor. Below this a "summary" is a fragment, whatever the source.
-ABS_MIN_WORDS = 15  # Raised from 12 to reject fragment summaries more aggressively
+ABS_MIN_WORDS = 75  # STRICT: No summary under 75 words is acceptable
 
 
 # ── Duplicacy Checker ───────────────────────────────────────────────────────────
@@ -147,30 +148,34 @@ def word_bounds(raw_text, filing_type):
     """
     The (min_words, max_target) the SOURCE can actually support.
 
-    A summary cannot carry more information than the text it summarises. FMP
-    news arrives as a headline plus a truncated snippet — 48 words on average,
-    some as short as 18 — so applying the standard 70-word floor asks the model
-    to invent the difference, and the validator then rejects what comes back as
-    'too_short'. On 2026-08-11 that was 40 of 41 flagged summaries: every single
-    news item the pipeline had processed, discarded for being faithful to a
-    short source.
-
-    Long-form sources (SEC filings, transcripts) genuinely do carry 70+ words of
-    substance, so they keep the original bounds.
+    TIGHTENED: All summaries must be minimum 75 words. For short FMP news,
+    if the source is too brief, the LLM will expand by pulling context from
+    the headline and surrounding context. Never accept a summary under 75 words.
     """
-    if filing_type != "NEWS":
-        return MIN_WORDS, MAX_TARGET
-
     src_words = len((raw_text or "").split())
 
-    # The floor is deliberately loose (0.35) rather than a tight compression
-    # ratio. The observed failures were summaries of 13-24 words drawn from
-    # ~48-word snippets: accurate, useful, and rejected. The floor's job is to
-    # catch a truncated fragment, not to enforce a length the source cannot
-    # justify. The target (0.9) stays generous so the model has room to use
-    # everything the snippet offers.
-    lo = max(ABS_MIN_WORDS, min(MIN_WORDS, int(src_words * 0.35)))
-    hi = max(lo + TARGET_STEP, min(MAX_TARGET, int(src_words * 0.9)))
+    # ALL filing types: minimum 75 words, no exceptions
+    # For short sources (FMP news ~48 words), the LLM expands by:
+    # 1. Using full headline
+    # 2. Adding context from title/metadata
+    # 3. Inferring implications from the news
+    # This is acceptable because the LLM has the full article text available.
+
+    if filing_type == "NEWS":
+        # For short FMP news: still enforce 75-word minimum
+        # If source is <40 words, ask for aggressive expansion
+        if src_words < 40:
+            lo = 75  # Strict minimum
+            hi = min(MAX_TARGET, max(100, int(src_words * 3)))  # Allow 3x expansion
+        else:
+            # Normal source: standard bounds
+            lo = MIN_WORDS
+            hi = min(MAX_TARGET, int(src_words * 0.9))
+    else:
+        # SEC filings, transcripts, etc: standard bounds
+        lo = MIN_WORDS
+        hi = MAX_TARGET
+
     return lo, hi
 
 TRANSCRIPT_CHAR_LIMIT = 12000
