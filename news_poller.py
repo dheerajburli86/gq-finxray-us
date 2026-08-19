@@ -110,7 +110,7 @@ MAX_TICKERS_PER_ARTICLE = 3
 
 # Anything older than this is backfill, not news — feeds occasionally republish
 # weeks-old items when a CMS is migrated.
-MAX_ARTICLE_AGE_DAYS = 3
+MAX_ARTICLE_AGE_DAYS = 1
 
 _session = requests.Session()
 
@@ -327,7 +327,30 @@ def extract_watched_tickers(text, watched):
 
     Only tickers in `watched` are ever tested. Looping the 6,353-row stocks table
     here would be 6,353 regex passes per article.
+
+    COMPANY NAME MATCHING: For well-known companies, also match by name.
+    E.g., "Apple Inc." matches AAPL, "Microsoft Corp." matches MSFT.
     """
+    # Map ticker → company names (case-insensitive)
+    COMPANY_NAMES = {
+        "AAPL": ["Apple", "Apple Inc"],
+        "MSFT": ["Microsoft"],
+        "GOOGL": ["Google", "Alphabet"],
+        "AMZN": ["Amazon"],
+        "META": ["Meta", "Facebook"],
+        "NVDA": ["Nvidia", "NVIDIA"],
+        "TSLA": ["Tesla"],
+        "AMD": ["AMD", "Advanced Micro Devices"],
+        "INTC": ["Intel"],
+        "NFLX": ["Netflix"],
+        "PYPL": ["PayPal"],
+        "SQ": ["Square", "Block"],
+        "CRM": ["Salesforce"],
+        "ADBE": ["Adobe"],
+        "CRWD": ["CrowdStrike"],
+        "DDOG": ["Datadog"],
+    }
+
     if not text or not watched:
         return []
 
@@ -341,6 +364,19 @@ def extract_watched_tickers(text, watched):
         if any(p.search(text) for f in forms for p in _patterns_for(f)[0]):
             strong_hits.append(ticker)
             continue
+
+        # Company name matching for well-known companies
+        if ticker in COMPANY_NAMES:
+            for company_name in COMPANY_NAMES[ticker]:
+                # Match "Company" or "Company Inc/Corp/Ltd" with word boundaries
+                if re.search(rf"\b{re.escape(company_name)}\b(\s+(?:Inc\.?|Corp\.?|Ltd\.?|Group|Technologies|Systems))?\b",
+                           text, re.IGNORECASE):
+                    strong_hits.append(ticker)
+                    break
+            else:
+                # If we already added it above, skip plain hits
+                if ticker in strong_hits:
+                    continue
 
         # A one- or two-letter ticker is never distinguishable from prose without
         # context, and neither is an ordinary English word.
