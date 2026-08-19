@@ -14,6 +14,7 @@ Key from FMP support:
 import os
 import logging
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -21,6 +22,9 @@ from supabase import create_client
 import fmp_client
 from feature_map import tag_extra
 from watchlist_util import get_watched_tickers, log_poller_error
+
+# Every date FMP hands back for an earnings event is a US market date.
+ET = ZoneInfo("America/New_York")
 
 load_dotenv()
 
@@ -67,8 +71,17 @@ def detect_eps_surprise(earnings_event):
     Returns:
         dict with 'is_miss', 'eps_actual', 'eps_estimate', 'beat_amount' or None
     """
-    actual = earnings_event.get('eps')  # actual EPS
-    estimate = earnings_event.get('epsEstimated')  # estimated EPS
+    # BUGFIX 2026-08-19: read `eps`, which does not exist on FMP's /stable/
+    # earnings-calendar response. The field is `epsActual` (the bare `eps` name
+    # is legacy v3). `actual` was therefore always None, this function always
+    # returned None, and every event was skipped — Feature 4 could not emit a
+    # single alert. Legacy names kept as fallbacks.
+    actual = (earnings_event.get('epsActual')
+              if earnings_event.get('epsActual') is not None
+              else earnings_event.get('eps'))
+    estimate = (earnings_event.get('epsEstimated')
+                if earnings_event.get('epsEstimated') is not None
+                else earnings_event.get('epsEstimate'))
 
     if actual is None or estimate is None:
         return None  # Not yet announced or missing data
@@ -134,19 +147,29 @@ def poll_earnings_for_tickers():
                 continue
 
             for event in earnings:
-                announcement_time = event.get('announcementTime')
-                announcement_date = event.get('announcementDate')
-                reporting_date = event.get('reportingDate')
-
-                # Skip future/unannounced
-                if not announcement_date:
+                # BUGFIX 2026-08-19: this read announcementTime / announcementDate
+                # / reportingDate. NONE of those fields exist on FMP's /stable/
+                # earnings-calendar payload, whose shape is:
+                #   {symbol, date, epsActual, epsEstimated,
+                #    revenueActual, revenueEstimated, lastUpdated}
+                # `announcement_date` was therefore None on every event and the
+                # `if not announcement_date: continue` below discarded the entire
+                # calendar on every run, forever. The date field is `date`.
+                event_date_str = (event.get('date')
+                                  or event.get('announcementDate')
+                                  or event.get('reportingDate'))
+                if not event_date_str:
                     continue
 
-                # Skip if already processed
-                event_date_str = announcement_date or reporting_date
                 try:
-                    event_date = datetime.fromisoformat(event_date_str.replace('Z', '+00:00'))
-                except:
+                    event_date = datetime.fromisoformat(
+                        str(event_date_str).replace('Z', '+00:00'))
+                    if event_date.tzinfo is None:
+                        # FMP returns a bare calendar date for this field. Treat
+                        # it as US market time, not UTC, or a same-day result is
+                        # up to five hours out and can fall outside the window.
+                        event_date = event_date.replace(tzinfo=ET).astimezone(timezone.utc)
+                except Exception:
                     continue
 
                 # Only process earnings from last 24 hours (to catch fresh results)

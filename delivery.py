@@ -31,7 +31,7 @@ issue thousands of round-trips per cycle at 6,300 tickers.
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -57,10 +57,25 @@ ADMIN_CHANNEL_ID = os.getenv("TELEGRAM_ADMIN_CHANNEL_ID") or None
 
 ET = ZoneInfo("America/New_York")
 
-# Market-wide broadcast switch.
-# DISABLED by default for watchlist-only routing. Set GQ_ENABLE_MARKET_WIDE=true
-# to allow market-wide alerts (sector heatmap, ETF Xray, macro digest, market reports).
-BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "false").strip().lower()
+# ── Market-wide routing ───────────────────────────────────────────────────────
+# There are two different things that were both being called "market-wide", and
+# collapsing them into one switch is what broke half the product.
+#
+#   1. COMPANY news about a company nobody follows. This must never be sent.
+#      That was the actual complaint ("every alert should only be from my
+#      watchlist"), and it stays absolutely closed — enforced by the watchlist
+#      gate in ai_pipeline Stage 0 and by ticker matching below.
+#
+#   2. WHOLE-MARKET products the user explicitly subscribed to as features:
+#      sector heatmaps, the ETF X-ray, the macro digest, the market reports,
+#      ETF flow, upcoming IPOs. These have no company ticker by construction —
+#      they are filed as ticker='MARKET' — so a watchlist match is impossible
+#      and blanket-blocking them silently disabled ten of the thirteen daily
+#      scheduled jobs. They ran, wrote their rows, matched nobody, and were
+#      marked delivered. That is why heatmaps stopped arriving.
+#
+# The allowlist below re-enables (2) without touching (1).
+BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "true").strip().lower()
                      in ("1", "true", "yes"))
 
 
@@ -69,31 +84,38 @@ def broadcast_enabled():
     return BROADCAST_ENABLED
 
 
-# Features that are market-wide BY NATURE.
-# DISABLED for watchlist-only routing. If you want market-wide features again,
-# set GQ_ENABLE_MARKET_WIDE=true and uncomment these sets.
-#
-# (Previously: IPO_UPCOMING, MACRO_BRIEFING, ETF_XRAY, MARKET_REPORT, SECTOR_HEATMAP)
-# TIGHTENED: Both sets are empty. Absolutely no market-wide broadcasts.
-MARKET_WIDE_FILING_TYPES = set()
-MARKET_WIDE_SOURCES = set()
+# Feature-level products that are market-scoped BY CONSTRUCTION. Every one of
+# these is a thing the user turned on as a feature, not incidental news about an
+# unwatched company.
+MARKET_WIDE_FILING_TYPES = {
+    "SECTOR_HEATMAP", "HEATMAP_DAILY_MIDDAY", "HEATMAP_DAILY_AFTERNOON",
+    "HEATMAP_WEEKLY", "HEATMAP_MONTHLY",
+    "MARKET_REPORT", "MACRO_BRIEFING", "ETF_XRAY",
+    "IPO_UPCOMING", "INFLOW", "OUTFLOW",
+}
+MARKET_WIDE_SOURCES = {
+    "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "ETF_FLOW", "FMP_IPO",
+}
 
 
 def _is_market_wide(alert):
-    """Determines if an alert is market-wide (ticker='MARKET' or in market-wide sets).
+    """
+    True when this alert is a whole-market product rather than company news.
 
-    TIGHTENED: Return True ONLY if it's explicitly MARKET, and only if BROADCAST_ENABLED.
-    This prevents any market-wide alert from being sent unless explicitly enabled.
+    Company news for an unwatched ticker is NOT market-wide and never becomes
+    market-wide by falling through this function — it simply finds no audience.
     """
     if not BROADCAST_ENABLED:
-        return False  # No market-wide alerts at all if broadcast disabled
+        return False
 
-    ticker = (alert.get("ticker") or "").upper()
-    if ticker in ("", "MARKET", "UNKNOWN"):
-        return True
     if (alert.get("filing_type") or "").upper() in MARKET_WIDE_FILING_TYPES:
         return True
     if (alert.get("source") or "").upper() in MARKET_WIDE_SOURCES:
+        return True
+
+    # A row with no company ticker cannot be watchlist-routed by definition.
+    ticker = (alert.get("ticker") or "").upper()
+    if ticker in ("", "MARKET", "UNKNOWN"):
         return True
     return False
 
@@ -102,7 +124,17 @@ IMPACT_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
 # Telegram permits ~30 messages/second across all chats. Stay comfortably under.
 SEND_GAP_SECONDS = 0.05
+# Telegram's per-chat ceiling is about one message per second. The 50ms global
+# gap above is a per-BOT courtesy; without a per-chat gap a user receiving
+# several alerts in one cycle gets them 50ms apart, which reliably triggers 429
+# RetryAfter and consumes the send-retry budget.
+PER_CHAT_GAP_SECONDS = float(os.getenv("GQ_PER_CHAT_GAP_SECONDS", "1.05"))
 BATCH_LIMIT = 100
+
+# How long a transiently-failing alert stays eligible for another delivery
+# attempt before it is settled and dropped. Matches the pipeline's freshness
+# window: past this point the content is stale anyway.
+MAX_RETRY_AGE_HOURS = float(os.getenv("MAX_CONTENT_AGE_HOURS", "24"))
 
 
 # ── Loading ───────────────────────────────────────────────────────────────────
@@ -206,20 +238,32 @@ def _fetch_watchers(tickers):
 
 
 def _fetch_existing_deliveries(alert_ids):
-    """{(alert_id, user_id)} already recorded — the idempotency guard."""
+    """
+    {(alert_id, user_id)} already SETTLED — the idempotency guard.
+
+    BUGFIX 2026-08-19: this returned every ledger row regardless of status, so a
+    row written with status='FAILED' counted as "already delivered" and the
+    retry path could never reach that user. Combined with the alert being marked
+    delivered=True on the same pass, one transient Telegram error meant the user
+    never received that alert — permanently, with no way to notice.
+
+    Only terminal outcomes suppress a resend. FAILED rows are deliberately
+    excluded so the next cycle tries again.
+    """
     seen = set()
     for i in range(0, len(alert_ids), 100):
         chunk = alert_ids[i:i + 100]
         try:
             rows = (supabase.table("alert_deliveries")
-                    .select("alert_id, user_id")
+                    .select("alert_id, user_id, status")
                     .in_("alert_id", chunk)
                     .execute()).data or []
         except Exception as e:
             logger.error(f"[DELIVERY] Delivery-ledger lookup failed: {e}")
             continue
         for r in rows:
-            seen.add((r["alert_id"], r["user_id"]))
+            if (r.get("status") or "").upper() in ("SENT", "SKIPPED", "UNDELIVERABLE"):
+                seen.add((r["alert_id"], r["user_id"]))
     return seen
 
 
@@ -297,7 +341,14 @@ def resolve_audience(alert, users, watchers):
 
 # ── Sending ───────────────────────────────────────────────────────────────────
 async def _send_one(bot, chat_id, text):
-    """Send with Telegram's own rate-limit signal honoured. Returns (ok, error)."""
+    """
+    Send with Telegram's own rate-limit signal honoured.
+
+    Returns (ok, error, permanent). `permanent` distinguishes "this message can
+    never send to this chat" (blocked bot, malformed HTML) from "this attempt
+    failed" (network, 5xx, timeout). Only the former may settle the alert; the
+    latter must leave it pending so a later cycle retries.
+    """
     for attempt in range(3):
         try:
             await bot.send_message(
@@ -306,22 +357,23 @@ async def _send_one(bot, chat_id, text):
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-            return True, None
+            return True, None, False
         except RetryAfter as e:
             # Telegram telling us exactly how long to wait. Obey it.
             await asyncio.sleep(float(e.retry_after) + 0.5)
         except Forbidden as e:
             # User blocked the bot or deleted the chat. Not retryable.
-            return False, f"forbidden: {e}"
+            return False, f"forbidden: {e}", True
         except BadRequest as e:
             # Malformed HTML or chat not found. Not retryable — retrying just
             # burns quota on a message that can never send.
-            return False, f"bad_request: {e}"
+            return False, f"bad_request: {e}", True
         except Exception as e:
             if attempt == 2:
-                return False, str(e)[:300]
+                # Transient (network, 5xx, timeout). Retryable on a later cycle.
+                return False, str(e)[:300], False
             await asyncio.sleep(2 ** attempt)
-    return False, "exhausted retries"
+    return False, "exhausted retries", False
 
 
 def _record(rows):
@@ -334,6 +386,28 @@ def _record(rows):
         ).execute()
     except Exception as e:
         logger.error(f"[DELIVERY] Failed to write alert_deliveries: {e}")
+
+
+def _past_retry_window(alert):
+    """
+    True once an alert is too old to be worth retrying.
+
+    Bounds the retry loop introduced alongside the FAILED-send fix: a chat that
+    is permanently unreachable for a non-permanent-looking reason would
+    otherwise hold its alert pending forever and, because the queue is read
+    oldest-first with a fixed limit, block every newer alert behind it.
+    """
+    stamp = alert.get("created_at")
+    if not stamp:
+        return True
+    try:
+        created = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+    except Exception:
+        return True
+    age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600.0
+    return age_hours >= MAX_RETRY_AGE_HOURS
 
 
 def _mark_fanned_out(alert_ids):
@@ -399,6 +473,10 @@ async def deliver_pending_alerts():
 
             text = build_message(alert, reason=delivery_reason(alert))
 
+            # True while at least one recipient failed for a reason that a later
+            # attempt could plausibly fix. Such an alert must NOT be settled.
+            retry_needed = False
+
             for user, reason in audience:
                 uid = user["user_id"]
                 if (aid, uid) in already:
@@ -410,24 +488,37 @@ async def deliver_pending_alerts():
                     stats["skipped"] += 1
                     continue
 
-                ok, err = await _send_one(bot, user["chat_id"], text)
+                ok, err, permanent = await _send_one(bot, user["chat_id"], text)
                 if ok:
                     ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
                                    "status": "SENT", "reason": reason})
                     sent_today[uid] = sent_today.get(uid, 0) + 1
                     stats["sent"] += 1
+                elif permanent:
+                    # Nothing will ever make this send succeed. Record it as
+                    # terminal so it is not retried forever.
+                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                                   "status": "UNDELIVERABLE", "reason": reason, "error": err})
+                    stats["failed"] += 1
                 else:
                     ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
                                    "status": "FAILED", "reason": reason, "error": err})
                     stats["failed"] += 1
+                    retry_needed = True
 
-                await asyncio.sleep(SEND_GAP_SECONDS)
+                # Telegram allows roughly one message per second per chat. The
+                # global 50ms gap alone triggers 429s when several alerts land
+                # for the same user in one cycle, and every 429 burns a retry.
+                await asyncio.sleep(max(SEND_GAP_SECONDS, PER_CHAT_GAP_SECONDS))
 
             # Optional admin mirror, off unless explicitly configured.
             if ADMIN_CHANNEL_ID:
                 await _send_one(bot, ADMIN_CHANNEL_ID, text)
 
-            fanned.append(aid)
+            if retry_needed and not _past_retry_window(alert):
+                stats["deferred"] += 1
+            else:
+                fanned.append(aid)
         except Exception as e:
             # Mark it fanned out anyway: it is structurally broken, and retrying
             # it forever would block the queue behind a row that can never send.

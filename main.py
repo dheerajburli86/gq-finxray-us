@@ -86,6 +86,7 @@ from delivery import delivery_loop
 from edgar_poller import (poll_sec_8k, poll_sec_form4, poll_sec_10q,
                           poll_sec_10k, poll_sec_s1, load_cik_map)
 from news_poller import poll_all_news
+from watchlist_util import audit_watchlist
 from fmp_poller import poll_fmp_news, poll_fmp_events
 from result_snapshot import process_pending_snapshots
 from technical_poller import run_technical_poller
@@ -246,9 +247,18 @@ def safe_job(fn, name=None, budget_seconds=120, lane_name=None, timeout_seconds=
 # that one job. Lanes only isolate a stall if the slow job is not sharing a lane
 # with everything it can starve.
 # ══════════════════════════════════════════════════════════════════════════════
-LANE_NAMES = ("sec", "news", "market", "events")
+# 2026-08-19: `events` was itself starving, for exactly the reason it was
+# created. It held poll_fmp_news (registered every 10 min, measured 5,794s
+# average — 96 minutes) alongside poll_fmp_events (3,580s) and earnings_alerts.
+# Between them the two slow jobs consumed ~155 minutes of wall clock per
+# notional 10-minute cycle, so poll_fmp_news completed 16 of ~170 scheduled runs
+# (a 91% loss) and earnings_alerts — Feature 5 — sat behind both. Putting a slow
+# job on a lane with another slow job is not isolation. Each watchlist-wide FMP
+# sweep now owns its own thread, so one running long cannot delay the others.
+LANE_NAMES = ("sec", "news", "market", "fmpnews", "fmpevents", "earnings")
 
-LANE_BUDGETS = {"sec": 60, "news": 90, "market": 300, "events": 900}
+LANE_BUDGETS = {"sec": 60, "news": 90, "market": 300,
+                "fmpnews": 600, "fmpevents": 900, "earnings": 600}
 
 _lane_schedulers = {}
 _lane_jobs = {}
@@ -313,10 +323,13 @@ def build_schedule():
     # ── Lane: events — watchlist-wide FMP sweeps (Features 4, 5) ─────────────
     # Isolated from `market`: poll_fmp_events runs long enough to starve every
     # other market-data job when they share a thread.
-    register("events", ("every", 10, "minutes"), poll_fmp_news, "poll_fmp_news")
-    register("events", ("every", 60, "minutes"), poll_fmp_events, "poll_fmp_events")
+    register("fmpnews", ("every", 10, "minutes"), poll_fmp_news, "poll_fmp_news")
+    register("fmpevents", ("every", 60, "minutes"), poll_fmp_events, "poll_fmp_events")
     # Feature 5 was imported but never registered — it could not run at all.
-    register("events", ("every", 4, "hours"), poll_earnings_for_tickers, "earnings_alerts")
+    # Also moved off a 4-hour interval: the process restarts roughly every 3.6
+    # hours (44 boots observed), and `schedule` re-arms the timer from zero on
+    # every boot, so a 4-hour timer on a 3.6-hour lifetime almost never fires.
+    register("earnings", ("every", 60, "minutes"), poll_earnings_for_tickers, "earnings_alerts")
 
     # ── Technical (Feature 6) — every 30 min, guarded to market hours inside ──
     register("market", ("every", 30, "minutes"), run_technical_poller, "technical_poller")
@@ -335,7 +348,12 @@ def build_schedule():
 
     # ── Heatmaps (Features 9, 14) — staggered so they never collide ──────────
     register("market", ("at", "13:00"), run_sector_heatmap_midday, "sector_heatmap_midday", catchup=True)
-    register("market", ("at", "15:00"), run_sector_heatmap_afternoon, "sector_heatmap_afternoon", catchup=True)
+    # 16:10, not 15:00. This is the day's closing sector picture, and at 15:00 it
+    # was published a full hour before the close — so the closing auction and the
+    # last hour of trade never appeared in any heatmap the user received, and the
+    # image labelled "DAILY" disagreed with the 16:05 market-close report sent
+    # five minutes later. 16:10 sits after the close and after that report.
+    register("market", ("at", "16:10"), run_sector_heatmap_afternoon, "sector_heatmap_afternoon", catchup=True)
     register("market", ("at", "17:10"), run_sector_heatmap_weekly, "sector_heatmap_weekly", catchup=True)
     register("market", ("at", "18:00"), run_sector_heatmap_monthly, "sector_heatmap_monthly", catchup=True)
     register("market", ("at", "13:05"), run_watchlist_heatmap_midday, "watchlist_heatmap_midday", catchup=True)
@@ -413,12 +431,17 @@ def _startup_pass(lane_name):
     # its intervals kicked silently lost its `.at()` catch-up. The market lane
     # owns every daily job in the system — both heatmaps, IPO, ETF Xray, the
     # macro digest and all five market reports — so it must run both passes.
-    if lane_name == "events":
-        logger.info("[STARTUP events] Skipping interval kick (watchlist-wide FMP sweeps "
-                    "run long) — will fire on schedule")
-    else:
-        logger.info("[STARTUP %s] Total entries for startup pass: %d", lane_name, len(entries))
+    # 2026-08-19: the FMP lanes used to be excluded from the interval kick, on
+    # the theory that their sweeps run long. The effect was the opposite of what
+    # was intended. `schedule` does not fire at registration, so a job excluded
+    # here waits out its whole interval after every deploy — and with a redeploy
+    # roughly every 3.6 hours, Feature 5's 4-hour timer was reset before it ever
+    # elapsed. Excluding a slow job from startup does not make it cheaper; it
+    # makes it never run. They each have their own lane now, so a long first
+    # sweep delays nothing but itself.
+    logger.info("[STARTUP %s] Total entries for startup pass: %d", lane_name, len(entries))
 
+    if True:
         # 1. Every interval job runs once, now — no waiting out a full interval.
         interval_kicked = 0
         for i, e in enumerate(entries):
@@ -476,6 +499,9 @@ def run_lane(lane_name):
     # of the whole process where it would delay delivery coming up.
     if lane_name == "sec":
         safe_job(load_cik_map, "load_cik_map", budget_seconds=90, lane_name="sec")()
+        # A watchlist symbol that no data provider recognises produces exactly
+        # the same silence as a company with no news. Say so once, out loud.
+        safe_job(audit_watchlist, "audit_watchlist", budget_seconds=30, lane_name="sec")()
 
     _startup_pass(lane_name)
     logger.info("[LANE %s] Startup pass complete; entering schedule loop.", lane_name)

@@ -39,9 +39,8 @@ THE REARCHITECTURE
 * Dedup is one batched query at the top of the run, and it fails CLOSED: if the
   ledger cannot be read the run emits nothing rather than risk re-sending.
 
-Alerts are written to `raw_filings` with status='PENDING' for processing by ai_pipeline.py.
-The pipeline applies watchlist gating, relevance checks, impact classification, and dedup.
-This module never talks to Telegram — delivery.py fans each final alert out to users.
+Alerts are written to `alerts` with delivered=False. This module never talks to
+Telegram — delivery.py fans each row out to the users watching that ticker.
 """
 
 import os
@@ -56,6 +55,9 @@ import fmp_client
 import massive_client
 from feature_map import tag_extra
 from watchlist_util import get_watched_tickers, log_poller_error
+# The exchange holiday calendar lives here. Importing it rather than
+# reimplementing it keeps one definition of "is the market actually open".
+from heatmap_generator import is_trading_day
 
 load_dotenv()
 
@@ -134,12 +136,27 @@ _VOLUME_PROFILE = [
 
 
 def is_market_open(now_et=None):
-    """True during US regular trading hours: 09:30–16:00 ET, Monday to Friday."""
+    """
+    True during US regular trading hours: 09:30–16:00 ET on a trading day.
+
+    BUGFIX 2026-08-19: this tested `weekday() >= 5` and nothing else. On every
+    US market holiday — Thanksgiving, Good Friday, Juneteenth, Christmas, MLK
+    Day, Memorial Day, Labor Day, July 4th, Presidents' Day — it reported the
+    market open, so this poller and etf_flow_poller (which imports this exact
+    function) spent the day computing "volume spikes" and "crossovers" against
+    the previous session's stale closing prices and alerting on them. A
+    holiday-aware calendar already existed in heatmap_generator; it is used now.
+
+    The close boundary is also exclusive now: 16:00:00 is the close, not a
+    moment of open trading, and the market lane's 30-minute cadence lands runs
+    on the hour often enough for that to matter.
+    """
     now_et = now_et or datetime.now(ET)
-    if now_et.weekday() >= 5:
+    if not is_trading_day(now_et.date()):
         return False
     minutes = now_et.hour * 60 + now_et.minute
-    return (MARKET_OPEN[0] * 60 + MARKET_OPEN[1]) <= minutes <= (MARKET_CLOSE[0] * 60 + MARKET_CLOSE[1])
+    return ((MARKET_OPEN[0] * 60 + MARKET_OPEN[1]) <= minutes
+            < (MARKET_CLOSE[0] * 60 + MARKET_CLOSE[1]))
 
 
 def session_volume_fraction(now_et=None):
@@ -227,35 +244,13 @@ def load_sent_today():
 
 
 def _write_alerts(rows):
-    """Queue alerts for the AI pipeline (raw_filings) instead of direct insertion."""
+    """Bulk insert in chunks so one oversized request cannot lose the whole run."""
     written = 0
-    import hashlib
-    import re
-
     for i in range(0, len(rows), 50):
         chunk = rows[i:i + 50]
         try:
-            # Convert alert format to raw_filings format for pipeline processing
-            filings = []
-            for row in chunk:
-                filing = {
-                    "ticker": row["ticker"],
-                    "company_name": row.get("ticker", "UNKNOWN"),  # Will be resolved in pipeline
-                    "source": SOURCE,
-                    "filing_type": row["filing_type"],
-                    "filing_url": row["filing_url"],
-                    "filed_at": datetime.now(ZoneInfo("UTC")).isoformat(),
-                    "raw_text": row["summary"],
-                    "status": "PENDING",
-                    "content_hash": hashlib.sha256(
-                        re.sub(r"\s+", " ", row["summary"].lower()).strip().encode("utf-8", "ignore")
-                    ).hexdigest(),
-                    "extra": row["extra"],
-                }
-                filings.append(filing)
-
-            supabase.table("raw_filings").insert(filings).execute()
-            written += len(filings)
+            supabase.table("alerts").insert(chunk).execute()
+            written += len(chunk)
         except Exception as e:
             log_poller_error(POLLER, "write_alerts", e,
                              {"tickers": [r["ticker"] for r in chunk]})
@@ -263,7 +258,6 @@ def _write_alerts(rows):
 
 
 def _build_alert(ticker, alert_type, summary, headline, extra):
-    """Build a raw_filings-compatible alert row for the pipeline."""
     payload = dict(extra or {})
     payload["headline"] = headline
 
@@ -273,8 +267,10 @@ def _build_alert(ticker, alert_type, summary, headline, extra):
     return {
         "ticker": ticker,
         "summary": summary,
+        "impact": ALERT_IMPACT.get(alert_type, "MEDIUM"),
         "source": SOURCE,
         "filing_type": alert_type,
+        "delivered": False,
         "extra": tag_extra(payload, SOURCE, alert_type),
         "filing_url": filing_url,
     }

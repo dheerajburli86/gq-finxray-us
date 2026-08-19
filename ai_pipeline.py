@@ -45,6 +45,11 @@ DEEPINFRA_MODEL = "google/gemini-2.5-flash"
 # Escape hatch for a fresh deployment with an empty watchlist, or for backfills.
 PROCESS_ALL_TICKERS = os.getenv("PROCESS_ALL_TICKERS", "false").lower() == "true"
 
+# Nothing older than this is ever summarised or delivered. The product is
+# "what happened in the last day"; a filing that has been sitting in the queue
+# longer than this is retired rather than sent.
+MAX_CONTENT_AGE_HOURS = int(os.getenv("MAX_CONTENT_AGE_HOURS", "24"))
+
 # Duplicacy checker config — TIGHTENED
 DUPLICATE_CHECK_HOURS = 24  # Check last 24 hours for duplicates
 SIMILARITY_THRESHOLD = 0.72  # Cross-source threshold (tightened from 0.75)
@@ -161,20 +166,37 @@ def word_bounds(raw_text, filing_type):
     # 3. Inferring implications from the news
     # This is acceptable because the LLM has the full article text available.
 
+    lo = MIN_WORDS
+
     if filing_type == "NEWS":
-        # For short FMP news: still enforce 75-word minimum
-        # If source is <40 words, ask for aggressive expansion
-        if src_words < 40:
-            lo = 75  # Strict minimum
-            hi = min(MAX_TARGET, max(100, int(src_words * 3)))  # Allow 3x expansion
-        else:
-            # Normal source: standard bounds
-            lo = MIN_WORDS
-            hi = min(MAX_TARGET, int(src_words * 0.9))
+        # BUGFIX 2026-08-19 — THE band was arithmetically impossible.
+        #
+        # The old rule for src_words >= 40 was hi = min(200, src_words * 0.9).
+        # classify_failure requires wc >= min_words AND wc <= max_words, plus a
+        # separate `fragment` floor. With lo = 75 that means:
+        #
+        #   src=45  -> band [75, 40]   impossible
+        #   src=60  -> band [75, 54]   impossible
+        #   src=86  -> band [75, 77]   impossible
+        #
+        # An RSS <description> is 40-86 words essentially always, so EVERY RSS
+        # and FMP news article fell in the dead zone: no summary of any length
+        # could pass, summarise()'s retry loop could not widen (target was
+        # already max_target), and the row was flagged FLAGGED_FOR_REVIEW and
+        # never delivered. This single line is why news alerts stopped.
+        #
+        # A news summary legitimately expands its source: the model is given the
+        # headline plus the body and writes the "what this means" framing the
+        # snippet omits. So the ceiling must always sit a workable distance
+        # above the floor, never below it.
+        hi = min(MAX_TARGET, max(lo + 45, int(src_words * 1.6)))
     else:
-        # SEC filings, transcripts, etc: standard bounds
-        lo = MIN_WORDS
-        hi = MAX_TARGET
+        # SEC filings, transcripts, snapshots: sources are long, cap at target.
+        hi = max(lo + 45, MAX_TARGET)
+
+    # Invariant: the acceptance band must be non-empty, whatever the source.
+    if hi <= lo:
+        hi = lo + 45
 
     return lo, hi
 
@@ -418,8 +440,10 @@ def classify_failure(summary, max_words, min_words=MIN_WORDS):
         return "bad_start"
     if last_sentence_incomplete(summary):
         return "incomplete"
-    # Extra check: reject summaries that are too short even if technically passing
-    if wc < ABS_MIN_WORDS + 3:
+    # BUGFIX 2026-08-19: this used to be `wc < ABS_MIN_WORDS + 3`, i.e. 78, which
+    # silently overrode the declared 75-word floor and made any band whose
+    # ceiling sat at 75-77 unsatisfiable. One floor, one value.
+    if wc < ABS_MIN_WORDS:
         return "fragment"
     return None
 
@@ -739,9 +763,16 @@ def process_filing(filing, watched=None):
 
     # ── Stage 5: Store ──────────────────────────────────────────────────────
     usage = get_token_usage()
+    # BUGFIX 2026-08-19: this unconditionally wrote `filing_url` over the clean
+    # article URL the poller had already put in extra. news_poller stores a
+    # per-ticker row URL ("…/article#t=AAPL") in filing_url purely to satisfy a
+    # uniqueness constraint, and that fragment was what users saw and clicked.
+    # Prefer the poller's own clean URL; fall back to filing_url with the
+    # synthetic fragment stripped.
+    clean_url = extra.get("url") or (filing_url or "").split("#t=")[0] or None
     extra.update({
         "company_name": company_name,
-        "url": filing_url,
+        "url": clean_url,
         "summarization_attempts": attempts,
         "input_tokens": usage["input"],
         "output_tokens": usage["output"],
@@ -841,6 +872,36 @@ def sweep_unwatched(watched):
         return swept
 
 
+def retire_stale(cutoff_iso, page=500):
+    """
+    Move PENDING rows older than the freshness window to STALE.
+
+    Without this the freshness filter in run_pipeline would simply hide old rows
+    rather than clear them: they would stay PENDING forever, and every indexed
+    read would keep scanning past a permanently growing tail.
+    """
+    try:
+        rows = (supabase.table("raw_filings")
+                .select("id")
+                .eq("status", "PENDING")
+                .lt("created_at", cutoff_iso)
+                .limit(page)
+                .execute()).data or []
+        if not rows:
+            return 0
+        ids = [r["id"] for r in rows]
+        (supabase.table("raw_filings")
+         .update({"status": "STALE"})
+         .in_("id", ids)
+         .execute())
+        print(f"[GATE] Retired {len(ids)} PENDING row(s) older than "
+              f"{MAX_CONTENT_AGE_HOURS}h.")
+        return len(ids)
+    except Exception as e:
+        print(f"[GATE] Stale retirement failed: {e}")
+        return 0
+
+
 def run_pipeline(batch=25):
     """
     Drain the PENDING queue.
@@ -867,13 +928,32 @@ def run_pipeline(batch=25):
                   "Add tickers via the Telegram bot, or set PROCESS_ALL_TICKERS=true.")
             return
 
-        q = supabase.table("raw_filings").select("*").eq("status", "PENDING")
+        # ── Freshness window ────────────────────────────────────────────────
+        # The product promise is news less than 24 hours old. Anything older is
+        # not just low value, it is actively harmful: it occupies the queue that
+        # fresh content needs and it reaches the user labelled as current.
+        #
+        # This also repairs a starvation bug. The queue was ordered newest-first
+        # with limit(25) and NO floor, against a backlog that reached 16k rows.
+        # Newest-first plus an unbounded tail means old PENDING rows are never
+        # reached — not delayed, never — so the backlog grew without limit and
+        # every query had to scan past it. Bounding the window makes the queue
+        # self-draining: fresh rows are processed, stale ones are retired below.
+        fresh_cutoff = (datetime.now(timezone.utc)
+                        - timedelta(hours=MAX_CONTENT_AGE_HOURS)).isoformat()
+
+        q = (supabase.table("raw_filings").select("*")
+             .eq("status", "PENDING")
+             .gte("created_at", fresh_cutoff))
         if watched is not None:
             # Only ever pull rows that can produce a deliverable alert.
             q = q.in_("ticker", sorted(watched))
 
         res = q.order("created_at", desc=True).limit(batch).execute()
         filings = res.data or []
+
+        # Retire anything that aged out of the window while queued.
+        retire_stale(fresh_cutoff)
 
         # Sweep unwatched rows EVERY cycle, not only when the watched queue is
         # empty. The old placement meant that as long as a single watched filing

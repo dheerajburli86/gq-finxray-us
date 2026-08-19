@@ -52,7 +52,19 @@ def get_watched_tickers(force=False):
         return _cache["watched"]
 
     try:
-        rows = _sb.table("watchlists").select("ticker").execute().data or []
+        # Paginated for the same reason get_all_stocks() is: PostgREST caps an
+        # unbounded select at 1000 rows by default. An unpaginated read here
+        # silently returns 1000 of N watchlist rows once the user base grows,
+        # and every ticker past that point stops receiving alerts with no error
+        # anywhere. Cheap to do correctly now, invisible to debug later.
+        rows, page, size = [], 0, 1000
+        while True:
+            chunk = (_sb.table("watchlists").select("ticker")
+                     .range(page * size, page * size + size - 1).execute()).data or []
+            rows.extend(chunk)
+            if len(chunk) < size:
+                break
+            page += 1
         watched = {(r.get("ticker") or "").upper() for r in rows if r.get("ticker")}
         _cache.update({"watched": watched, "watched_at": now})
         return watched
@@ -119,6 +131,53 @@ def stock_exists(ticker):
         return bool(rows)
     except Exception:
         return False
+
+
+# ── Watchlist health ─────────────────────────────────────────────────────────
+# Symbols that cannot produce an alert no matter how healthy the pollers are,
+# because the symbol itself is wrong. A ticker in here is a silent 100% loss:
+# FMP returns nothing, Massive has no snapshot row, SEC has no filer, and every
+# poller reports "no data" — indistinguishable from a quiet market.
+KNOWN_DEAD_TICKERS = {
+    # Tuttle Capital's SPAC & New Issue ETF, liquidated and delisted. Often
+    # entered as a proxy for SpaceX, which is private and has no public ticker.
+    "SPCX": "delisted ETF — no SEC filer, no FMP quote, no Massive snapshot",
+}
+
+# Symbols that still exist but trade under a different ticker now. Data vendors
+# serve the CURRENT symbol, so the old one silently returns nothing.
+RENAMED_TICKERS = {
+    "SQ": "XYZ",    # Block, Inc. renamed its NYSE ticker in January 2025
+    "FB": "META",
+    "TWTR": None,   # taken private, no longer listed
+}
+
+
+def audit_watchlist(log=None):
+    """
+    Report watchlist symbols that can never produce an alert.
+
+    Called once at startup. This exists because a bad ticker is invisible: it
+    produces exactly the same logs as a company that simply had no news, so a
+    watchlist can quietly be 10% dead weight for months. Returns the list of
+    problem symbols; it never modifies anything.
+    """
+    emit = log or logger.warning
+    problems = []
+    for t in sorted(get_watched_tickers()):
+        if t in KNOWN_DEAD_TICKERS:
+            problems.append(t)
+            emit("[WATCHLIST] %s cannot produce alerts: %s", t, KNOWN_DEAD_TICKERS[t])
+        elif t in RENAMED_TICKERS:
+            problems.append(t)
+            new = RENAMED_TICKERS[t]
+            emit("[WATCHLIST] %s no longer trades under that symbol%s — data "
+                 "providers serve the current ticker, so this one returns nothing.",
+                 t, f"; it is now {new}" if new else "")
+    if problems:
+        emit("[WATCHLIST] %d of %d watched symbol(s) are dead weight: %s",
+             len(problems), len(get_watched_tickers()), ", ".join(problems))
+    return problems
 
 
 def log_poller_error(poller_name, job_name, error, context=None):

@@ -29,7 +29,7 @@ Quality decisions made here, and why:
 
 import html
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import fmp_client
@@ -148,12 +148,64 @@ def esc_attr(text):
     return html.escape(str(text or ""), quote=True)
 
 
-def _source_link(extra):
-    """Find whatever URL the poller stored, under any of the keys used across pollers."""
-    for key in ("url", "filing_url", "source_url", "link", "article_url"):
-        val = (extra or {}).get(key)
-        if val and isinstance(val, str) and val.startswith("http"):
-            return val
+def _clean_url(val):
+    """A usable https link, with news_poller's synthetic #t=TICKER row-key stripped."""
+    if not val or not isinstance(val, str):
+        return None
+    val = val.strip()
+    if not val.startswith("http"):
+        return None
+    # news_poller appends "#t=<TICKER>" so one article can occupy one row per
+    # ticker. It is a storage key, not part of the article's address, and it
+    # must never appear in a link handed to a user.
+    return val.split("#t=")[0] or None
+
+
+def _event_time_et(alert):
+    """
+    When the event actually happened, rendered in US Eastern (market) time.
+
+    Order of preference: the poller's recorded filing/publication timestamp,
+    then the alert row's created_at, then now. Always ET, because every time in
+    this product is a market time — never the server's or the reader's zone.
+    """
+    extra = alert.get("extra") if isinstance(alert.get("extra"), dict) else {}
+    for candidate in (extra.get("filed_at"), extra.get("published_at"),
+                      extra.get("publishedDate"), extra.get("date"),
+                      alert.get("filed_at"), alert.get("created_at")):
+        if not candidate:
+            continue
+        try:
+            raw = str(candidate).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(ET).strftime("%b %d, %I:%M %p ET").replace(" 0", " ")
+        except Exception:
+            continue
+    return datetime.now(ET).strftime("%b %d, %I:%M %p ET").replace(" 0", " ")
+
+
+def _source_link(alert_or_extra):
+    """
+    Find the source URL for an alert.
+
+    BUGFIX 2026-08-19: this used to accept ONLY `extra` and search inside it.
+    Every poller that writes straight to `alerts` — technical, ETF flow, IPO,
+    analyst ratings, earnings calendar, bulk deals, market reports — stores its
+    link in the `filing_url` COLUMN and puts nothing in extra. So all of those
+    features shipped with no "View source" line at all, despite the URL being
+    present on the row the whole time. The column is now checked as a
+    first-class source alongside extra.
+    """
+    src = alert_or_extra or {}
+    extra = src.get("extra") if isinstance(src.get("extra"), dict) else {}
+
+    for container in (extra, src):
+        for key in ("url", "filing_url", "source_url", "link", "article_url"):
+            cleaned = _clean_url((container or {}).get(key))
+            if cleaned:
+                return cleaned
     return None
 
 
@@ -178,7 +230,12 @@ def build_message(alert, reason=None):
     emoji        = IMPACT_EMOJI.get(impact, "🟢")
     source_name  = SOURCE_LABELS.get(source, source.replace("_", " ").title())
     type_label   = FILING_TYPE_LABELS.get(filing_type, filing_type.replace("_", " ").title())
-    time_str     = datetime.now(ET).strftime("%I:%M %p ET").lstrip("0")
+    # BUGFIX 2026-08-19: this was datetime.now(ET) — the moment the message was
+    # rendered, not the moment the news broke. A backlogged alert therefore
+    # stamped itself as current. Use the event's own timestamp (the filing /
+    # publication time the poller recorded), falling back to the alert row's
+    # creation time, and only then to now.
+    time_str     = _event_time_et(alert)
 
     lines = []
 
@@ -210,7 +267,7 @@ def build_message(alert, reason=None):
     lines.append("")
     lines.append(f"📋 {esc(source_name)} · {esc(type_label)} · {time_str}")
 
-    url = _source_link(extra)
+    url = _source_link(alert)
     if url:
         lines.append(f'🔗 <a href="{esc_attr(url)}">View source</a>')
 
@@ -262,6 +319,14 @@ def build_message(alert, reason=None):
 
 
 def delivery_reason(alert):
-    """The 'why am I getting this' line — always watchlist-based."""
+    """
+    The 'why am I getting this' line.
+
+    BUGFIX 2026-08-19: this assumed every alert was watchlist-routed and printed
+    "because MARKET is on your watchlist" on every heatmap, market report, macro
+    digest, ETF flow and IPO alert — nobody has MARKET on a watchlist.
+    """
     ticker = (alert.get("ticker") or "").upper()
+    if ticker in ("", "MARKET", "UNKNOWN"):
+        return "You're receiving this because it covers the whole market."
     return f"You're receiving this because {ticker} is on your watchlist."

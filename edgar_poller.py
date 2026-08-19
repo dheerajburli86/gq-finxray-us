@@ -52,6 +52,7 @@ import logging
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -88,6 +89,70 @@ EDGAR_CIK_URL   = "https://www.sec.gov/files/company_tickers.json"
 
 MAX_FILING_CHARS = 6000
 CIK_MAP = {}
+
+# ── Per-company filing index ──────────────────────────────────────────────────
+# WHY THIS EXISTS (2026-08-19)
+#
+# The five URLs above are EDGAR's `action=getcurrent` FIREHOSE: the N most
+# recent filings of a type across every reporting company, with count=40. That
+# is the wrong data structure for a watchlist, and the arithmetic is brutal:
+#
+#   * ~600 8-Ks are filed market-wide on a normal day.
+#   * The 21 watched megacaps file ~0.85 8-Ks per day between them.
+#   * Watchlist share of the stream is therefore ~0.14%.
+#   * Expected watched entries inside a 40-entry window: 40 x 0.0014 = 0.06.
+#
+# So "40 total entries, 34 skipped (not watched), 0 candidates" every single
+# cycle is not a bug in the gate — it is exactly what the base rate predicts.
+# The poller was working perfectly and could still never see a watched filing.
+#
+# It is worse for the others. Form 4 emits 2+ Atom entries per accession and
+# ~1,100 accessions land between 16:00 and 18:00 ET, so a 40-entry window is
+# under two minutes of peak tape. 10-Q polls every 5 minutes against deadline
+# days that produce thousands of filings in an afternoon. Anything filed by a
+# watched company in the gap between two polls is lost permanently — which is
+# why raw_filings has never held a single 10-Q or 10-K row.
+#
+# data.sec.gov/submissions/CIK##########.json is the correct endpoint: it is
+# that ONE company's filing history, so nothing can fall out of a window at any
+# filing rate. One request per watched ticker covers every form type at once —
+# 21 requests replaces 5 firehose requests and actually finds things.
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+TICKER_TO_CIK = {}
+
+# Only surface filings this fresh. The product promise is "less than 24 hours
+# old"; a slightly wider window absorbs weekend and holiday gaps without ever
+# delivering something the user would call old news.
+EDGAR_MAX_AGE_HOURS = float(os.getenv("EDGAR_MAX_AGE_HOURS", "36"))
+
+# Per-ticker high-water mark, so a company that files twice in a day produces
+# two alerts and a company that files nothing costs one cheap JSON read.
+_last_seen_accession = {}
+
+
+def _rebuild_ticker_index(raw_cik_json):
+    """
+    ticker -> zero-padded CIK, from SEC's own company_tickers.json.
+
+    Built alongside CIK_MAP rather than inverted from it: CIK_MAP keeps only the
+    FIRST ticker per CIK, so inverting it loses every secondary share class.
+    Alphabet files one 8-K under CIK 0001652044 and that CIK maps to whichever
+    of GOOGL/GOOG the file happened to list first — if it listed GOOG, a
+    GOOGL watcher silently never receives an Alphabet filing. Indexing every
+    ticker separately removes that entire failure mode.
+    """
+    global TICKER_TO_CIK
+    index = {}
+    for val in (raw_cik_json or {}).values():
+        try:
+            cik = str(val["cik_str"]).zfill(10)
+            ticker = str(val["ticker"]).upper().strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ticker:
+            index[ticker] = cik
+    if index:
+        TICKER_TO_CIK = index
 
 ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
@@ -247,10 +312,6 @@ def sec_get(url, timeout=None, retries=2, budget=None):
 def load_cik_map():
     """Load SEC's full CIK↔ticker file. Called once at startup by main.py."""
     global CIK_MAP
-    # Reset SEC backoff at startup so a previous rate-limit block doesn't prevent
-    # the CIK map from loading, which would break all subsequent SEC polls.
-    with _sec_lock:
-        _sec_state["blocked_until"] = 0.0
     try:
         r = sec_get(EDGAR_CIK_URL, timeout=30, budget=60)
         if r is None:
@@ -271,10 +332,9 @@ def load_cik_map():
                 mapping[cik] = ticker
         if mapping:
             CIK_MAP = mapping
-            logger.info("[EDGAR] Loaded %d CIK→ticker mappings", len(CIK_MAP))
-            # Debug: log sample tickers
-            sample_tickers = sorted([CIK_MAP[k] for k in list(CIK_MAP.keys())[:50]])
-            logger.info("[EDGAR] Sample tickers: %s", ", ".join(sample_tickers[:20]))
+            _rebuild_ticker_index(data)
+            logger.info("[EDGAR] Loaded %d CIK→ticker mappings (%d tickers indexed)",
+                        len(CIK_MAP), len(TICKER_TO_CIK))
     except Exception as e:
         logger.error("[EDGAR] load_cik_map failed: %s", e)
         log_poller_error(POLLER_NAME, "load_cik_map", e)
@@ -618,8 +678,6 @@ def poll_edgar_generic(url, form_type, label):
                 logger.error("[EDGAR] %s: cannot resolve tickers without a CIK map; skipping.", label)
                 return
 
-        logger.debug("[EDGAR] %s poll: CIK_MAP has %d entries, watching %d tickers", label, len(CIK_MAP), len(watched))
-
         r = sec_get(url)
         if r is None:
             return
@@ -632,8 +690,6 @@ def poll_edgar_generic(url, form_type, label):
 
         entries = root.findall("atom:entry", ATOM_NS)
         candidates = []
-        skipped_no_ticker = 0
-        skipped_not_watched = 0
         for entry in entries:
             title = _entry_text(entry, "title")
             filing_url = _entry_link(entry)
@@ -642,12 +698,8 @@ def poll_edgar_generic(url, form_type, label):
 
             company_name, cik = _parse_title(title, form_type)
             ticker = get_ticker_from_cik(cik)
-            if not ticker:
-                skipped_no_ticker += 1
-                continue
-            if ticker not in watched:
-                skipped_not_watched += 1
-                continue
+            if not ticker or ticker not in watched:
+                continue  # gate BEFORE spending SEC bandwidth on the document
 
             filed = parse_atom_date(_entry_text(entry, "updated"))
             candidates.append({
@@ -661,8 +713,7 @@ def poll_edgar_generic(url, form_type, label):
             })
 
         if not candidates:
-            logger.warning("[EDGAR] %s: %d total entries, %d skipped (no ticker), %d skipped (not watched), 0 candidates.",
-                          label, len(entries), skipped_no_ticker, skipped_not_watched)
+            logger.info("[EDGAR] %s: %d entries, none watchlisted.", label, len(entries))
             return
 
         try:
@@ -699,133 +750,224 @@ def poll_edgar_generic(url, form_type, label):
         log_poller_error(POLLER_NAME, f"poll_edgar_generic:{label}", e, {"url": url})
 
 
-def poll_sec_8k():
-    poll_edgar_generic(EDGAR_8K_URL, "8-K", "8-K")
-
-
-def poll_sec_10q():
-    poll_edgar_generic(EDGAR_10Q_URL, "10-Q", "10-Q (Quarterly Report)")
-
-
-def poll_sec_10k():
-    poll_edgar_generic(EDGAR_10K_URL, "10-K", "10-K (Annual Report)")
-
-
-def poll_sec_s1():
-    poll_edgar_generic(EDGAR_S1_URL, "S-1", "S-1 (Registration)")
-
-
-# ── Form 4 ────────────────────────────────────────────────────────────────────
-def poll_sec_form4():
+def _recent_filings_for_cik(cik):
     """
-    Form 4 needs its own pass because EDGAR emits one entry per party — an
-    (Issuer) entry and a (Reporting) entry sharing an accession number. The
-    issuer entry carries the company CIK we gate on; the reporting entry carries
-    the insider's name. Never raises.
+    That company's recent filings, newest first, from data.sec.gov.
+
+    Returns a list of dicts: form, accession, filed (date), primary_doc, url.
+    Returns None when the request failed, so the caller can tell "no filings"
+    apart from "could not ask" — the firehose path could not make that
+    distinction and reported both as silence.
     """
+    r = sec_get(SEC_SUBMISSIONS_URL.format(cik=cik))
+    if r is None:
+        return None
+    try:
+        recent = (r.json().get("filings") or {}).get("recent") or {}
+    except Exception:
+        return None
+
+    forms = recent.get("form") or []
+    accessions = recent.get("accessionNumber") or []
+    dates = recent.get("filingDate") or []
+    accepted = recent.get("acceptanceDateTime") or []
+    primary = recent.get("primaryDocument") or []
+    if not forms or not accessions:
+        return []
+
+    bare_cik = str(int(cik))  # archive paths use the unpadded CIK
+    out = []
+    for i, form in enumerate(forms):
+        try:
+            acc = accessions[i]
+        except IndexError:
+            continue
+        acc_nodash = acc.replace("-", "")
+        doc = primary[i] if i < len(primary) else ""
+        out.append({
+            "form": (form or "").upper().strip(),
+            "accession": acc,
+            "filed": dates[i] if i < len(dates) else "",
+            "accepted": accepted[i] if i < len(accepted) else "",
+            "primary_doc": doc,
+            "url": (f"https://www.sec.gov/Archives/edgar/data/{bare_cik}/"
+                    f"{acc_nodash}/{doc}" if doc else
+                    f"https://www.sec.gov/Archives/edgar/data/{bare_cik}/"
+                    f"{acc_nodash}/{acc}-index.htm"),
+        })
+    return out
+
+
+def _filing_age_hours(item):
+    """Hours since SEC accepted the filing. Large number when unparseable."""
+    stamp = item.get("accepted") or item.get("filed")
+    if not stamp:
+        return 1e9
+    try:
+        raw = str(stamp).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            # acceptanceDateTime and filingDate are both US Eastern.
+            dt = dt.replace(tzinfo=ZoneInfo("America/New_York"))
+        return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        return 1e9
+
+
+def poll_edgar_watchlist(form_types, label):
+    """
+    Poll EDGAR per watched company instead of scraping the market-wide firehose.
+
+    One `data.sec.gov/submissions` read per watched ticker returns that
+    company's complete recent filing history, so a watched filing can never be
+    missed no matter how busy the tape is. See the SEC_SUBMISSIONS_URL comment
+    for why the previous getcurrent?count=40 approach structurally could not
+    work for a 21-name watchlist.
+    """
+    wanted_forms = {f.upper() for f in form_types}
     try:
         watched = get_watched_tickers()
         if not watched:
-            logger.info("[EDGAR] Form 4: no watchlisted tickers; skipping.")
+            logger.info("[EDGAR] %s: no watchlisted tickers; skipping.", label)
             return
 
-        if not CIK_MAP:
+        if not TICKER_TO_CIK:
+            logger.warning("[EDGAR] Ticker index empty — reloading before %s poll", label)
             load_cik_map()
-            if not CIK_MAP:
-                logger.error("[EDGAR] Form 4: cannot resolve tickers without a CIK map; skipping.")
+            if not TICKER_TO_CIK:
+                logger.error("[EDGAR] %s: cannot resolve CIKs; skipping.", label)
                 return
 
-        r = sec_get(EDGAR_FORM4_URL)
-        if r is None:
-            return
-
-        try:
-            root = ET.fromstring(r.content)
-        except ET.ParseError as e:
-            log_poller_error(POLLER_NAME, "parse:form4", e, {"url": EDGAR_FORM4_URL})
-            return
-
-        by_accession = {}
-        for entry in root.findall("atom:entry", ATOM_NS):
-            title = _entry_text(entry, "title")
-            filing_url = _entry_link(entry)
-            if not title or not filing_url:
-                continue
-            acc = re.search(r"(\d{10}-\d{2}-\d{6})", filing_url)
-            if not acc:
-                continue
-            by_accession.setdefault(acc.group(1), []).append({
-                "title": title,
-                "url": filing_url,
-                "updated": _entry_text(entry, "updated"),
-            })
-
         candidates = []
-        for acc_num, group in by_accession.items():
-            issuer = next((e for e in group if "(Issuer)" in e["title"]), None)
-            reporting = next((e for e in group if "(Reporting)" in e["title"]), None)
-            if not issuer:
+        unresolved = []
+        for ticker in sorted(watched):
+            cik = TICKER_TO_CIK.get(ticker.upper())
+            if not cik:
+                unresolved.append(ticker)
                 continue
 
-            m = re.match(r"4\s*-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)", issuer["title"])
-            company_name = m.group(1).strip() if m else issuer["title"]
-            cik = m.group(2) if m else ""
-            ticker = get_ticker_from_cik(cik)
-            if not ticker or ticker not in watched:
+            filings = _recent_filings_for_cik(cik)
+            if filings is None:
+                continue  # request failed; sec_get already logged/backed off
+            if not filings:
                 continue
 
-            insider_name = "Unknown Insider"
-            if reporting:
-                rm = re.match(r"4\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)", reporting["title"])
-                if rm:
-                    insider_name = rm.group(1).strip()
+            for item in filings:
+                if item["form"] not in wanted_forms:
+                    continue
+                # The list is newest-first, so the first form match that is too
+                # old means every later one is older still.
+                if _filing_age_hours(item) > EDGAR_MAX_AGE_HOURS:
+                    break
+                if _last_seen_accession.get(ticker) == item["accession"]:
+                    break
+                candidates.append({
+                    "title": f"{ticker} {item['form']} filed {item['filed']}",
+                    "url": item["url"],
+                    "summary": "",
+                    "company_name": ticker,
+                    "cik": cik,
+                    "ticker": ticker,
+                    "form": item["form"],
+                    "accession": item["accession"],
+                    "filed_at": _edgar_iso(item),
+                })
 
-            filed = parse_atom_date(issuer["updated"])
-            candidates.append({
-                "url": issuer["url"],
-                "company_name": company_name,
-                "cik": cik,
-                "ticker": ticker,
-                "insider_name": insider_name,
-                "accession": acc_num,
-                "filed_at": (filed or datetime.now(timezone.utc)).isoformat(),
-            })
+        if unresolved:
+            logger.warning("[EDGAR] %s: %d watchlist ticker(s) have no SEC CIK and can "
+                           "never produce a filing alert: %s",
+                           label, len(unresolved), ", ".join(sorted(unresolved)))
 
         if not candidates:
-            logger.info("[EDGAR] Form 4: %d accessions, none watchlisted.", len(by_accession))
+            logger.info("[EDGAR] %s: no new filings for %d watched ticker(s).",
+                        label, len(watched))
             return
 
         try:
             seen = existing_filing_urls({c["url"] for c in candidates})
         except Exception as e:
-            logger.error("[EDGAR] Form 4 dedup query failed, skipping cycle: %s", e)
-            log_poller_error(POLLER_NAME, "dedup:form4", e)
+            logger.error("[EDGAR] %s: dedup query failed, skipping cycle: %s", label, e)
+            log_poller_error(POLLER_NAME, f"dedup:{label}", e, {"label": label})
             return
 
         stored = 0
         for c in candidates:
             if (c["url"], c["ticker"]) in seen:
+                _last_seen_accession[c["ticker"]] = c["accession"]
                 continue
 
-            text = fetch_form4_text(c["url"], c["company_name"], c["insider_name"])
-            if not text or len(text) < 50:
-                text = (f"{c['company_name']} insider {c['insider_name']} filed a Form 4 "
-                        f"disclosing a change in beneficial ownership.")
+            filing_text = fetch_filing_text(c["url"], c["form"])
+            if not filing_text or len(filing_text) < 100:
+                filing_text = f"{c['company_name']}\n\n{c['title']}".strip()
 
-            if store_filing("4", c["company_name"], c["ticker"], text, c["url"],
-                            c["filed_at"], cik=c["cik"],
-                            extra={"insider_name": c["insider_name"],
-                                   "accession": c["accession"],
-                                   "title": f"{c['company_name']} Form 4 — {c['insider_name']}"}):
+            extra = {"cik": c["cik"], "form_type": c["form"], "title": c["title"],
+                     "accession": c["accession"], "url": c["url"]}
+            if c["form"] in ("10-Q", "10-K"):
+                # Consumed by result_snapshot.py, which clears the flag when done.
+                extra["needs_result_snapshot"] = True
+
+            if store_filing(c["form"], c["company_name"], c["ticker"], filing_text,
+                            c["url"], c["filed_at"], cik=c["cik"], extra=extra):
                 stored += 1
                 seen.add((c["url"], c["ticker"]))
+                _last_seen_accession[c["ticker"]] = c["accession"]
 
-        logger.info("[EDGAR] Form 4: %d accessions, %d watchlisted, %d stored.",
-                    len(by_accession), len(candidates), stored)
+        logger.info("[EDGAR] %s: %d watched ticker(s), %d new filing(s), %d stored.",
+                    label, len(watched), len(candidates), stored)
 
     except Exception as e:
-        logger.exception("[EDGAR] Form 4 poll failed: %s", e)
-        log_poller_error(POLLER_NAME, "poll_sec_form4", e, {"url": EDGAR_FORM4_URL})
+        logger.exception("[EDGAR] %s poll failed: %s", label, e)
+        log_poller_error(POLLER_NAME, f"poll_edgar_watchlist:{label}", e, {"label": label})
+
+
+def _edgar_iso(item):
+    """Best available timestamp for a submissions-API filing, as ISO-8601 UTC."""
+    stamp = item.get("accepted") or item.get("filed")
+    try:
+        raw = str(stamp).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("America/New_York"))
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).isoformat()
+
+
+def poll_sec_8k():
+    # 8-K/A amendments carry the same market-moving content as the original.
+    poll_edgar_watchlist(["8-K", "8-K/A"], "8-K")
+
+
+def poll_sec_10q():
+    poll_edgar_watchlist(["10-Q", "10-Q/A"], "10-Q (Quarterly Report)")
+
+
+def poll_sec_10k():
+    poll_edgar_watchlist(["10-K", "10-K/A"], "10-K (Annual Report)")
+
+
+def poll_sec_s1():
+    poll_edgar_watchlist(["S-1", "S-1/A"], "S-1 (Registration)")
+
+
+# ── Form 4 ────────────────────────────────────────────────────────────────────
+def poll_sec_form4():
+    """
+    Insider transactions for watched companies.
+
+    Rewritten 2026-08-19 to use the per-company submissions API like every other
+    EDGAR form. The old implementation read the market-wide `getcurrent&type=4`
+    firehose with count=40 and then de-interleaved EDGAR's paired (Issuer) and
+    (Reporting) Atom entries. That pairing logic was correct; the feed it read
+    was not. Form 4 emits two or more entries per accession and roughly 1,100
+    accessions land between 16:00 and 18:00 ET, so a 40-entry window covers
+    under two minutes of peak tape — a watched insider filing at 16:30 was gone
+    before the next 30-second poll. EDGAR indexes every Form 4 under the ISSUER's
+    CIK as well as the reporting person's, so the issuer submissions feed sees
+    all of them, in order, with nothing to de-interleave.
+    """
+    poll_edgar_watchlist(["4", "4/A"], "Form 4 (Insider)")
+
 
 
 if __name__ == "__main__":

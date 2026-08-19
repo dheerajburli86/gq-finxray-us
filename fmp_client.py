@@ -58,6 +58,11 @@ class FMPError(Exception):
     pass
 
 
+# Paths already reported as unavailable, so a dead endpoint logs once rather
+# than once per ticker per cycle.
+_reported_bad_paths = set()
+
+
 def _get(path, params=None, timeout=20, retries=2):
     """Generic GET against the FMP stable API. Returns parsed JSON or None.
 
@@ -93,8 +98,20 @@ def _get(path, params=None, timeout=20, retries=2):
                 wait = min(wait * 2, 16)  # Cap backoff at 16s
                 continue
             last_was_429 = False
-            # Tightened: Don't retry on non-429 errors, just log and return None
-            if r.status_code not in (404, 400, 403):
+            # Don't retry on non-429 errors — but DO make them visible.
+            #
+            # BUGFIX 2026-08-19: 404/400/403 returned None with no output at all.
+            # Every caller coerces None to []/None and reports "no data", so a
+            # path that FMP had renamed or that the plan does not cover was
+            # indistinguishable from a genuinely quiet market — for weeks. Each
+            # failing path is now reported once so a broken endpoint is obvious
+            # without drowning the log in per-ticker repeats.
+            if r.status_code in (404, 400, 403):
+                if path not in _reported_bad_paths:
+                    _reported_bad_paths.add(path)
+                    print(f"[FMP] {path} returned {r.status_code} — endpoint unavailable "
+                          f"on this plan or renamed. Suppressing repeats. {r.text[:120]}")
+            else:
                 print(f"[FMP] {path} returned {r.status_code}: {r.text[:100]}")
             return None
         except Exception as e:
@@ -142,12 +159,24 @@ def get_stock_news(ticker, limit=10):
 
     TIGHTENED: Validate ticker format before request.
     """
-    # Reject obviously malformed tickers
+    # Reject obviously malformed tickers.
+    #
+    # BUGFIX 2026-08-19: this guard was `len(ticker) > 50` and silently returned
+    # [] for every batched call. `symbols` is a COMMA-JOINED list — 21 watchlist
+    # tickers join to 100 characters, so every FMP news request was discarded
+    # before an HTTP call was ever made. No exception, no log: Feature 2's FMP
+    # half produced exactly zero articles for as long as the guard existed.
+    # The cap now bounds the joined batch (FMP accepts well over 1000 chars),
+    # and each individual symbol is validated on its own.
     if not ticker or not isinstance(ticker, str):
         return []
     ticker = ticker.upper().strip()
-    if not ticker or len(ticker) > 50:  # Sanity check on length
+    if not ticker or len(ticker) > 1200:
         return []
+    symbols = [s.strip() for s in ticker.split(",") if s.strip()]
+    if not symbols or any(len(s) > 12 for s in symbols):
+        return []
+    ticker = ",".join(symbols)
     data = _get("news/stock", {"symbols": ticker, "limit": limit})
     return data if isinstance(data, list) else []
 
