@@ -703,16 +703,24 @@ def poll_news_source(source, watched, cutoff):
 
     # Pass 1: parse everything, decide tickers, compute hashes. No I/O.
     candidates = []
+    entry_count = 0
+    no_title_url = 0
+    too_old = 0
+    no_tickers = 0
+
     for entry in entries:
+        entry_count += 1
         title = strip_html(_child_text(entry, "title"))
         url = _entry_link(entry)
         if not title or not url:
+            no_title_url += 1
             continue
 
         body = strip_html(_child_text(entry, "description", "summary", "content", "encoded"))
 
         published = parse_feed_date(_child_text(entry, "pubDate", "published", "updated", "date"))
         if published and published < cutoff:
+            too_old += 1
             continue
         if published and published > datetime.now(timezone.utc) + timedelta(hours=6):
             # A clock-skewed feed item; trust the poll time instead of a future date.
@@ -721,11 +729,13 @@ def poll_news_source(source, watched, cutoff):
 
         tickers = extract_watched_tickers(f"{title}. {body}", watched)
         if not tickers:
+            no_tickers += 1
             continue
 
         # STRICT: only keep tickers that are in the watched set
         tickers = [t for t in tickers if t in watched]
         if not tickers:
+            no_tickers += 1
             continue
 
         sector = feed_sector if feed_sector != "MARKET" else detect_sector_from_text(f"{title} {body}")
@@ -736,6 +746,9 @@ def poll_news_source(source, watched, cutoff):
         })
 
     if not candidates:
+        if entry_count > 0:
+            logger.info("[NEWS] %s — parsed %d entries: no_title_url=%d, too_old=%d, no_tickers=%d",
+                       name, entry_count, no_title_url, too_old, no_tickers)
         return 0
 
     # Pass 2: one batched dedup read for the whole feed.
