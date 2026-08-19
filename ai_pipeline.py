@@ -56,7 +56,7 @@ SIMILARITY_THRESHOLD = 0.72  # Cross-source threshold (tightened from 0.75)
 SAME_SOURCE_THRESHOLD = 0.82  # Same type/source threshold (tightened from 0.85)
 
 from Prompt_P2_GibberishChecker import get_prompt as gibberish_prompt
-from Prompt_V3_RelevanceCheck import get_prompt as relevance_prompt
+from Prompt_V3_RelevanceCheck import get_prompt as relevance_prompt, is_listicle
 from Prompt_V1_SummaryValidation import get_prompt as validation_prompt
 from Prompt_V2_SimilarityCheck import get_prompt as similarity_prompt
 from Prompt_C1_ImpactClassification import get_prompt as impact_prompt
@@ -75,6 +75,11 @@ MAX_TARGET = 200       # Increased to allow longer, richer content
 
 # Absolute floor. Below this a "summary" is a fragment, whatever the source.
 ABS_MIN_WORDS = 75  # STRICT: No summary under 75 words is acceptable
+
+# How many times to ask before giving up and flagging. The ladder used to be
+# driven purely by "is there room to raise the target", which for short news
+# sources evaluated false on the first pass and gave the model exactly one shot.
+MAX_SUMMARY_ATTEMPTS = int(os.getenv("GQ_MAX_SUMMARY_ATTEMPTS", "4"))
 
 
 # ── Duplicacy Checker ───────────────────────────────────────────────────────────
@@ -256,15 +261,35 @@ _reasoning_param_supported = [True]
 
 
 def _looks_truncated(text):
-    """A visible answer that stops without terminal punctuation was cut off."""
-    return bool(text) and not text.rstrip().endswith((".", "!", "?", '"', ")"))
+    """A visible answer that stops without a terminal character was cut off.
+
+    BUGFIX 2026-08-19 — this fired on EVERY well-formed JSON reply. A complete
+    `{"impact": "HIGH"}` ends in `}`, which was not in the accepted set, so the
+    caller declared it truncated and re-asked at 2000 then 4000 tokens. Every
+    JSON stage in the pipeline (skip check, company match, relevance, impact,
+    gibberish, similarity) therefore cost THREE model calls instead of one:
+    ~3x the tokens, ~3x the latency, and a pipeline slow enough that the PENDING
+    queue could not drain between polls. That is the `[DEEPINFRA] Output
+    truncated — retrying` line repeating forever in the logs against summaries
+    that were never actually cut.
+
+    Closing braces/brackets and code fences are legitimate endings. A genuine
+    cut is caught by finish_reason=="length", which is authoritative; this
+    heuristic only has to catch prose that stops mid-sentence.
+    """
+    if not text:
+        return False
+    tail = text.rstrip().rstrip("`").rstrip()
+    return not tail.endswith((".", "!", "?", '"', ")", "}", "]", "%", ":"))
 
 
-def call_deepinfra(prompt, retries=3, max_tokens=1500):
+def call_deepinfra(prompt, retries=3, max_tokens=1500, expect_json=False):
     """A 429 gets its own longer, capped wait; other failures get short backoff.
 
     Truncated generations are retried with a larger budget instead of being
-    passed downstream as content failures.
+    passed downstream as content failures. `expect_json=True` disables the prose
+    heuristic entirely — a JSON reply's shape is verified by the parser, so the
+    only truncation signal worth acting on is the provider's own finish_reason.
     """
     headers = {"Authorization": f"Bearer {DEEPINFRA_API_KEY}", "Content-Type": "application/json"}
 
@@ -306,7 +331,8 @@ def call_deepinfra(prompt, retries=3, max_tokens=1500):
                 text = ""
             _record_token_usage(resp.get("usage"))
 
-            cut = choice.get("finish_reason") == "length" or _looks_truncated(text)
+            hard_cut = choice.get("finish_reason") == "length"
+            cut = hard_cut or (not expect_json and _looks_truncated(text))
             if cut and truncation_retries < 2 and budget < TOKEN_CEILING:
                 truncation_retries += 1
                 budget = min(budget * 2, TOKEN_CEILING)
@@ -368,7 +394,8 @@ def ask_json(prompt, max_tokens=1000, attempts=2):
     pass — meaning a malformed response silently disabled the check.
     """
     for _ in range(attempts):
-        parsed = parse_json_response(call_deepinfra(prompt, max_tokens=max_tokens))
+        parsed = parse_json_response(call_deepinfra(prompt, max_tokens=max_tokens,
+                                                    expect_json=True))
         if parsed is not None:
             return parsed
     return None
@@ -523,16 +550,37 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="",
     raw = generate_s1(company_name, raw_text, filing_type, sub_summary,
                       min_word_count=min_words, target_word_count=target)
     summary = standardize_numbers(clean_summary(raw)) if raw else None
-    failure = classify_failure(summary, target, min_words)
+    # Judge against the BAND ceiling, not the ceiling we happened to ask for.
+    # Asking for 120 and getting a good 135-word summary is a pass when the band
+    # allows 200; rejecting it as 'too_long' throws away usable content.
+    failure = classify_failure(summary, max_target, min_words)
     attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
 
-    while failure and target < max_target:
-        target = min(target + TARGET_STEP, max_target)
-        print(f"[SUMMARY] Retry — {failure}, new target {target} words")
-        raw = generate_s3(company_name, raw_text, target, filing_type, min_words)
+    # BUGFIX 2026-08-19 — the loop was `while failure and target < max_target`,
+    # which for NEWS is `while failure and False`. word_bounds() returns a
+    # ceiling of min(200, max(120, src*1.6)); for a typical 60-90 word article
+    # that is 120, and the opening target is min(STARTING_TARGET=140, 120) = 120.
+    # target == max_target on entry, so the ladder had ZERO retries: one short
+    # first draft and the item went straight to flagged_summaries. That is the
+    # "Ladder exhausted (too_short) — flagging, not sending" after a single
+    # attempt seen for AVGO and AAPL.
+    #
+    # A too_short draft is an EXECUTION failure, not a budget failure — raising
+    # the ceiling does not help, re-asking does. Drive the loop on attempts and
+    # only widen the target when there is actually room to widen it.
+    while failure and len(attempts_log) < MAX_SUMMARY_ATTEMPTS:
+        if target < max_target:
+            target = min(target + TARGET_STEP, max_target)
+        # At the ceiling: re-ask at the same target. Explicitly aim above the
+        # floor so a model that undershot has somewhere to land.
+        ask_for = max(target, min_words + 20) if failure == "too_short" else target
+        ask_for = min(ask_for, max_target)
+        print(f"[SUMMARY] Retry {len(attempts_log) + 1}/{MAX_SUMMARY_ATTEMPTS} — "
+              f"{failure}, asking for {ask_for} words (band {min_words}-{max_target})")
+        raw = generate_s3(company_name, raw_text, ask_for, filing_type, min_words)
         summary = standardize_numbers(clean_summary(raw)) if raw else None
-        failure = classify_failure(summary, target, min_words)
-        attempts_log.append({"attempt": len(attempts_log) + 1, "target": target,
+        failure = classify_failure(summary, max_target, min_words)
+        attempts_log.append({"attempt": len(attempts_log) + 1, "target": ask_for,
                              "words": count_words(summary), "failure": failure})
 
     if not failure:
@@ -661,6 +709,42 @@ def process_filing(filing, watched=None):
     print(f"\n[PROCESSING] {filing_type} -- {company_name} ({ticker}) [source={source}]")
     _reset_token_usage()
 
+    # ── Stage 0b: cheap noise gates, BEFORE we pay to summarise ─────────────
+    # Gibberish and relevance used to run at Stages 2 and 3, i.e. AFTER the full
+    # summarisation ladder. Every listicle and opinion piece therefore consumed
+    # a summary plus up to four retries plus a validation call before being
+    # discarded on a check that only ever needed the raw text. Both checks read
+    # `raw_text` and nothing else, so they belong here: a rejected item now costs
+    # one cheap call instead of six expensive ones, and the queue drains faster.
+    #
+    # Headline shape is free to test, so test it first and skip the model call
+    # entirely for the forms that cannot be a company event.
+    if filing_type == "NEWS" and is_listicle(sub_summary):
+        print(f"[DISCARDED] Not an event — headline is a roundup/opinion form: {sub_summary[:70]!r}")
+        update_filing_status(filing_id, "DISCARDED")
+        return
+
+    gib = ask_json(gibberish_prompt(raw_text[:3000]))
+    if gib is None:
+        print(f"[HELD] Gibberish check could not be completed -- {ticker}")
+        update_filing_status(filing_id, "CHECK_FAILED")
+        return
+    if gib.get("is_gibberish") in (True, "True", "true"):
+        print(f"[DISCARDED] Gibberish -- {ticker}")
+        update_filing_status(filing_id, "DISCARDED")
+        return
+
+    rel = ask_json(relevance_prompt(company_name, raw_text[:3000], sub_summary))
+    if rel is None:
+        print(f"[HELD] Relevance check could not be completed -- {ticker}")
+        update_filing_status(filing_id, "CHECK_FAILED")
+        return
+    if rel.get("is_relevant") in (False, "False", "false"):
+        print(f"[DISCARDED] Not alert-worthy for {company_name}: "
+              f"{(rel.get('reason') or 'failed subject/event test')[:80]}")
+        update_filing_status(filing_id, "DISCARDED")
+        return
+
     # ── Stage 1: Summarise + Validate ────────────────────────────────────────
     summary, attempts = summarise(company_name, raw_text, filing_type, sub_summary,
                                   filing_id=filing_id, ticker=ticker, source=source)
@@ -693,29 +777,8 @@ def process_filing(filing, watched=None):
         summary = corrected
         print(f"[CORRECTED] V.1 fixed the summary ({count_words(summary)} words)")
 
-    # ── Stage 2: Gibberish Checker ──────────────────────────────────────────
-    gib = ask_json(gibberish_prompt(raw_text[:3000]))
-    if gib is None:
-        print(f"[HELD] Gibberish check could not be completed -- {ticker}")
-        update_filing_status(filing_id, "CHECK_FAILED")
-        return
-    if gib.get("is_gibberish") in (True, "True", "true"):
-        print(f"[DISCARDED] Gibberish -- {ticker}")
-        update_filing_status(filing_id, "DISCARDED")
-        return
-
-    # ── Stage 3: Relevance Checker ──────────────────────────────────────────
-    rel = ask_json(relevance_prompt(company_name, raw_text[:3000]))
-    if rel is None:
-        print(f"[HELD] Relevance check could not be completed -- {ticker}")
-        update_filing_status(filing_id, "CHECK_FAILED")
-        return
-    if rel.get("is_relevant") in (False, "False", "false"):
-        print(f"[DISCARDED] Not relevant to {company_name}")
-        update_filing_status(filing_id, "DISCARDED")
-        return
-
     # ── Stage 4: Impact Classifier ──────────────────────────────────────────
+    # (Gibberish and relevance now run at Stage 0b, before summarisation.)
     cur_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     imp = ask_json(impact_prompt(company_name, summary, cur_date))
     impact = (imp or {}).get("impact", "LOW")
@@ -902,6 +965,57 @@ def retire_stale(cutoff_iso, page=500):
         return 0
 
 
+def _fair_share(rows, batch):
+    """
+    Interleave the queue by filing_type so no one feature can starve the rest.
+
+    BUGFIX 2026-08-19 — THE reason only Feature 2 (Company & Sector News) was
+    arriving. The queue was strictly newest-first with limit(25), and the news
+    poller inserts rows every 60 SECONDS while SEC filings, insider trades,
+    result snapshots, transcripts, analyst actions and ETF flows arrive every
+    few minutes to hours. Newest-first against a continuously-refreshed source
+    means the news rows permanently occupy all 25 slots: every other feature's
+    rows sit one page down the ordering and are never reached — not delayed,
+    never — until they age out of the 24h window and get retired unprocessed.
+    Thirteen features were writing rows correctly and exactly one was being read.
+
+    Round-robin one row per filing_type, newest-first within each type, until
+    the batch is full. A quiet feature still gets its row processed the cycle it
+    appears; a noisy one still gets the majority of the batch once the quiet
+    ones are served. Freshness is preserved because each type is drained newest
+    -first, which was the point of the original ordering.
+    """
+    if not rows:
+        return []
+
+    buckets = {}
+    for r in rows:
+        # Group by feature, not by ticker — one busy company must not crowd out
+        # a different feature either.
+        key = (r.get("filing_type") or "UNKNOWN").upper()
+        buckets.setdefault(key, []).append(r)
+
+    picked, exhausted = [], False
+    while len(picked) < batch and not exhausted:
+        exhausted = True
+        for key in sorted(buckets):
+            if not buckets[key]:
+                continue
+            picked.append(buckets[key].pop(0))
+            exhausted = False
+            if len(picked) >= batch:
+                break
+
+    if len(buckets) > 1:
+        spread = {}
+        for r in picked:
+            k = (r.get("filing_type") or "UNKNOWN").upper()
+            spread[k] = spread.get(k, 0) + 1
+        print(f"[QUEUE] Fair-share across {len(buckets)} feature type(s): "
+              + ", ".join(f"{k}={v}" for k, v in sorted(spread.items())))
+    return picked
+
+
 def run_pipeline(batch=25):
     """
     Drain the PENDING queue.
@@ -949,8 +1063,10 @@ def run_pipeline(batch=25):
             # Only ever pull rows that can produce a deliverable alert.
             q = q.in_("ticker", sorted(watched))
 
-        res = q.order("created_at", desc=True).limit(batch).execute()
-        filings = res.data or []
+        # Pull a wider candidate pool than we will process, so the fair-share
+        # interleave below has something from every feature to choose from.
+        res = q.order("created_at", desc=True).limit(max(batch * 6, 120)).execute()
+        filings = _fair_share(res.data or [], batch)
 
         # Retire anything that aged out of the window while queued.
         retire_stale(fresh_cutoff)
