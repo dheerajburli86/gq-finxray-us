@@ -90,6 +90,13 @@ EDGAR_CIK_URL   = "https://www.sec.gov/files/company_tickers.json"
 MAX_FILING_CHARS = 6000
 CIK_MAP = {}
 
+# Manual overrides for tickers that may not yet be in SEC's company_tickers.json
+# Used when SEC's official CIK file hasn't caught up to a recent ticker rename.
+# Example: Block Inc. (formerly Square) renamed from SQ to XYZ in Jan 2025.
+MANUAL_TICKER_CIK_OVERRIDES = {
+    "XYZ": "0001616707",  # Block Inc. (formerly Square) — renamed Jan 2025
+}
+
 # ── Per-company filing index ──────────────────────────────────────────────────
 # WHY THIS EXISTS (2026-08-19)
 #
@@ -151,6 +158,13 @@ def _rebuild_ticker_index(raw_cik_json):
             continue
         if ticker:
             index[ticker] = cik
+
+    # Apply manual overrides for recently-renamed tickers
+    for ticker, cik_raw in MANUAL_TICKER_CIK_OVERRIDES.items():
+        ticker_upper = ticker.upper().strip()
+        if ticker_upper not in index:  # Only override if not already in SEC's file
+            index[ticker_upper] = str(cik_raw).zfill(10)
+
     if index:
         TICKER_TO_CIK = index
 
@@ -859,8 +873,9 @@ def poll_edgar_watchlist(form_types, label):
                 # old means every later one is older still.
                 if _filing_age_hours(item) > EDGAR_MAX_AGE_HOURS:
                     break
-                if _last_seen_accession.get(ticker) == item["accession"]:
-                    break
+                # Don't use _last_seen_accession as a break; it can get permanently stuck
+                # if a filing fails downstream. Instead, add to candidates and let the
+                # dedup query (line 901) decide what's been seen before.
                 candidates.append({
                     "title": f"{ticker} {item['form']} filed {item['filed']}",
                     "url": item["url"],
