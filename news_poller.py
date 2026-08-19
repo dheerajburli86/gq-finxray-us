@@ -110,8 +110,7 @@ MAX_TICKERS_PER_ARTICLE = 3
 
 # Anything older than this is backfill, not news — feeds occasionally republish
 # weeks-old items when a CMS is migrated.
-MAX_ARTICLE_AGE_DAYS = 3
-
+MAX_ARTICLE_AGE_DAYS = 1
 _session = requests.Session()
 
 
