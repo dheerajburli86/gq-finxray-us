@@ -139,15 +139,11 @@ def stock_exists(ticker):
 # FMP returns nothing, Massive has no snapshot row, SEC has no filer, and every
 # poller reports "no data" — indistinguishable from a quiet market.
 KNOWN_DEAD_TICKERS = {
-    # Tuttle Capital's SPAC & New Issue ETF, liquidated and delisted. Often
-    # entered as a proxy for SpaceX, which is private and has no public ticker.
-    "SPCX": "delisted ETF — no SEC filer, no FMP quote, no Massive snapshot",
 }
 
 # Symbols that still exist but trade under a different ticker now. Data vendors
 # serve the CURRENT symbol, so the old one silently returns nothing.
 RENAMED_TICKERS = {
-    "SQ": "XYZ",    # Block, Inc. renamed its NYSE ticker in January 2025
     "FB": "META",
     "TWTR": None,   # taken private, no longer listed
 }
