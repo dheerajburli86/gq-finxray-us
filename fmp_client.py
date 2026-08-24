@@ -7,7 +7,7 @@ Replaces EODHD across the codebase. All endpoints below are the current
 against FMP's own developer docs on 2026-07-27:
 
   quote                      -> /stable/quote
-  stock news                 -> /stable/stock-news
+  stock news                 -> /stable/news/stock
   general news                -> /stable/general-news
   company screener            -> /stable/company-screener
   ipo calendar                -> /stable/ipos-calendar
@@ -123,7 +123,12 @@ def get_commodity_quote(commodity_symbol):
 
 # ── News ──────────────────────────────────────────────────────────────────────
 def get_stock_news(ticker, limit=10):
-    data = _get("stock-news", {"symbols": ticker, "limit": limit})
+    """Fetch news for a specific ticker.
+    
+    FMP API confirmed: endpoint is /stable/news/stock (not stock-news).
+    Parameter is 'symbols' (plural) and accepts comma-separated list.
+    """
+    data = _get("news/stock", {"symbols": ticker, "limit": limit})
     return data if isinstance(data, list) else []
 
 
