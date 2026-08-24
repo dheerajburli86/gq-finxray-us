@@ -39,6 +39,15 @@ BULK_DEAL_MIN_MARKET_CAP = 200_000_000   # $200M — company size gate, NOT trad
 _market_cap_cache = {}
 
 
+
+def form4_fallback_url(ticker):
+    """SEC EDGAR browse URL for Form 4 filings when exact filing not found."""
+    return (
+        "https://www.sec.gov/cgi-bin/browse-edgar"
+        f"?action=getcompany&CIK={ticker}&type=4"
+        "&dateb=&owner=include&count=10"
+    )
+
 def get_market_cap(ticker):
     """Market cap for the Feature 5 bulk-deal gate.
 
@@ -390,7 +399,7 @@ def poll_insider_transactions(tickers):
                     # the alert then goes out with no link rather than a guess.
                     form4_url = edgar_link.find_filing_url(
                         ticker, form_type="4", target_date=txn_date
-                    )
+                    ) or form4_fallback_url(ticker)
                     store_alert(ticker, bulk_summary, "HIGH", "BULK_DEAL", {
                         "insider_name": insider_name, "action": action, "shares": shares_str,
                         "price": price_str, "value": value_str, "role": role,
