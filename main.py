@@ -26,7 +26,7 @@ from ipo_poller import run_ipo_poller
 from earnings_transcript_poller import run_earnings_transcript_poller
 from news_roundup import run_etf_xray
 from etf_flow_poller import run_etf_flow_poller
-from heatmap_generator import run_sector_heatmap_daily, run_sector_heatmap_weekly, run_sector_heatmap_monthly
+from heatmap_generator import run_sector_heatmap_midday, run_sector_heatmap_afternoon, run_sector_heatmap_weekly, run_sector_heatmap_monthly
 
 
 # ── FMP price fetch (replaces TwelveData) ─────────────────────────────────────
