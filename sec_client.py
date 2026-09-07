@@ -29,53 +29,52 @@ MAX_RETRIES = int(os.getenv("SEC_MAX_RETRIES", "3"))
 _current_session: aiohttp.ClientSession | None = None
 
 
-async def _get_or_create_session() -> aiohttp.ClientSession:
-    """Get or create a session for this poll run."""
-    global _current_session
-    if _current_session is None or _current_session.closed:
-        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-        _current_session = aiohttp.ClientSession(
-            timeout=timeout,
-            headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"},
-            connector=aiohttp.TCPConnector(limit=MAX_CONCURRENCY, force_close=False),
-        )
-    return _current_session
-
-
 async def _fetch(url: str, as_json: bool):
-    """Single GET with retry/backoff."""
-    session = await _get_or_create_session()
+    """Single GET with retry/backoff — create fresh session per request."""
+    global _current_session
+    
+    # Create a fresh session for this request
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    session = aiohttp.ClientSession(
+        timeout=timeout,
+        headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"},
+        connector=aiohttp.TCPConnector(limit=MAX_CONCURRENCY, force_close=False),
+    )
+    _current_session = session
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with session.get(url) as resp:
-                if resp.status in (429, 503):
-                    delay = (2 ** attempt) + random.random()
-                    logger.warning("[SEC] %s on %s — backing off %.1fs", resp.status, url, delay)
-                    await asyncio.sleep(delay)
-                    continue
+    try:
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with session.get(url) as resp:
+                    if resp.status in (429, 503):
+                        delay = (2 ** attempt) + random.random()
+                        logger.warning("[SEC] %s on %s — backing off %.1fs", resp.status, url, delay)
+                        await asyncio.sleep(delay)
+                        continue
 
-                if resp.status != 200:
-                    logger.warning("[SEC] HTTP %s for %s", resp.status, url)
-                    return None
+                    if resp.status != 200:
+                        logger.warning("[SEC] HTTP %s for %s", resp.status, url)
+                        return None
 
-                if as_json:
-                    return await resp.json(content_type=None)
-                return await resp.text()
+                    if as_json:
+                        return await resp.json(content_type=None)
+                    return await resp.text()
 
-        except asyncio.TimeoutError:
-            logger.warning("[SEC] timeout on %s (attempt %d/%d)", url, attempt + 1, MAX_RETRIES)
-        except aiohttp.ClientError as e:
-            logger.warning("[SEC] client error on %s: %s", url, e)
-        except Exception as e:
-            logger.warning("[SEC] error on %s: %s", url, e)
-            return None
+            except asyncio.TimeoutError:
+                logger.warning("[SEC] timeout on %s (attempt %d/%d)", url, attempt + 1, MAX_RETRIES)
+            except aiohttp.ClientError as e:
+                logger.warning("[SEC] client error on %s: %s", url, e)
+            except Exception as e:
+                logger.warning("[SEC] error on %s: %s", url, e)
+                return None
 
-        if attempt < MAX_RETRIES - 1:
-            await asyncio.sleep((2 ** attempt) + random.random())
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep((2 ** attempt) + random.random())
 
-    logger.error("[SEC] giving up on %s after %d attempts", url, MAX_RETRIES)
-    return None
+        logger.error("[SEC] giving up on %s after %d attempts", url, MAX_RETRIES)
+        return None
+    finally:
+        await session.close()
 
 
 async def get_json(url: str):
