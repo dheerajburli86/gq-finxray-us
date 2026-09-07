@@ -41,7 +41,6 @@ MAX_RETRIES = int(os.getenv("SEC_MAX_RETRIES", "3"))
 
 _session: aiohttp.ClientSession | None = None
 _session_lock = asyncio.Lock()
-_rate_semaphore: asyncio.Semaphore | None = None
 _last_request_at = 0.0
 _pace_lock: asyncio.Lock | None = None
 
@@ -56,7 +55,7 @@ def _headers() -> dict:
 
 async def _get_session() -> aiohttp.ClientSession:
     """One session per process, created lazily inside the running loop."""
-    global _session, _rate_semaphore, _pace_lock
+    global _session
     async with _session_lock:
         if _session is None or _session.closed:
             timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
@@ -65,22 +64,7 @@ async def _get_session() -> aiohttp.ClientSession:
                 headers={"User-Agent": USER_AGENT,
                          "Accept-Encoding": "gzip, deflate"},
             )
-        if _rate_semaphore is None:
-            _rate_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-        if _pace_lock is None:
-            _pace_lock = asyncio.Lock()
     return _session
-
-
-async def _pace():
-    """Enforce a minimum gap between request starts, process-wide."""
-    global _last_request_at
-    async with _pace_lock:
-        now = asyncio.get_event_loop().time()
-        wait = MIN_INTERVAL - (now - _last_request_at)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_request_at = asyncio.get_event_loop().time()
 
 
 async def _fetch(url: str, as_json: bool):
@@ -96,28 +80,26 @@ async def _fetch(url: str, as_json: bool):
 
     for attempt in range(MAX_RETRIES):
         try:
-            await _pace()
-            async with _rate_semaphore:
-                async with session.get(url) as resp:
-                    # 429/503 are SEC throttling — back off and retry.
-                    if resp.status in (429, 503):
-                        delay = (2 ** attempt) + random.random()
-                        logger.warning(
-                            "[SEC] %s on %s — backing off %.1fs (attempt %d/%d)",
-                            resp.status, url, delay, attempt + 1, MAX_RETRIES,
-                        )
-                        await asyncio.sleep(delay)
-                        continue
+            async with session.get(url) as resp:
+                # 429/503 are SEC throttling — back off and retry.
+                if resp.status in (429, 503):
+                    delay = (2 ** attempt) + random.random()
+                    logger.warning(
+                        "[SEC] %s on %s — backing off %.1fs (attempt %d/%d)",
+                        resp.status, url, delay, attempt + 1, MAX_RETRIES,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
 
-                    if resp.status != 200:
-                        logger.warning("[SEC] HTTP %s for %s", resp.status, url)
-                        return None
+                if resp.status != 200:
+                    logger.warning("[SEC] HTTP %s for %s", resp.status, url)
+                    return None
 
-                    if as_json:
-                        # SEC serves JSON as text/html on some endpoints,
-                        # so don't let aiohttp's content-type check reject it.
-                        return await resp.json(content_type=None)
-                    return await resp.text()
+                if as_json:
+                    # SEC serves JSON as text/html on some endpoints,
+                    # so don't let aiohttp's content-type check reject it.
+                    return await resp.json(content_type=None)
+                return await resp.text()
 
         except asyncio.TimeoutError:
             logger.warning("[SEC] timeout on %s (attempt %d/%d)",
@@ -157,8 +139,10 @@ async def gather_limited(coros, limit: int | None = None):
     `isinstance(text, Exception)`, so a single bad filing must not abort the
     whole batch.
     """
-    await _get_session()  # ensure semaphore exists
-    sem = asyncio.Semaphore(limit) if limit else _rate_semaphore
+    if limit is None:
+        limit = MAX_CONCURRENCY
+    
+    sem = asyncio.Semaphore(limit)
 
     async def _bounded(coro):
         async with sem:
@@ -171,10 +155,20 @@ async def gather_limited(coros, limit: int | None = None):
 
 
 async def close_session():
-    """Close the shared session. Safe to call when nothing was opened."""
+    """
+    Close the shared session. Safe to call when nothing was opened.
+    
+    In practice, this should only run at process shutdown. Calling it mid-poll
+    (e.g. at the end of a schedule job) closes the loop too early and causes
+    "Event loop is closed" on the next poll in a new job. Let the process exit
+    handle cleanup instead, or wrap the job in a try/finally that doesn't call this.
+    """
     global _session
     if _session is not None and not _session.closed:
-        await _session.close()
-        # aiohttp needs a tick to release the underlying connector.
-        await asyncio.sleep(0.1)
+        try:
+            await _session.close()
+            # aiohttp needs a tick to release the underlying connector.
+            await asyncio.sleep(0.1)
+        except Exception:
+            pass  # Already closed or loop gone; ignore
     _session = None
