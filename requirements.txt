@@ -1,7 +1,6 @@
 aiohttp==3.9.1
 aiofiles==23.2.1
 anthropic==0.25.0
-asyncio==3.4.3
 beautifulsoup4==4.12.2
 certifi==2023.11.17
 charset-normalizer==3.3.2
@@ -9,10 +8,8 @@ click==8.1.7
 colorama==0.4.6
 cryptography==41.0.7
 cssselect==1.2.0
-db-dtypes==1.1.1
 feedparser==6.0.10
 faker==20.1.0
-fmp-python==1.1.5
 google-cloud-bigquery==3.13.0
 google-cloud-storage==2.10.0
 greenlet==3.0.3
@@ -24,16 +21,13 @@ pillow==10.1.0
 psycopg2-binary==2.9.9
 python-dateutil==2.8.2
 python-dotenv==1.0.0
+python-telegram-bot==20.3
 pytz==2023.3.post1
 requests==2.31.0
 SQLAlchemy==2.0.23
 supabase==2.1.1
-telegram==0.0.1
 urllib3==2.1.0
 yfinance==0.2.32
-sec-api==4.4.0
-sec-edgar==0.3.46
-sec-cik-lookup==1.0.2
 html5lib==1.1
 regex==2023.11.8
 unidecode==1.3.0
