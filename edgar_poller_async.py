@@ -721,4 +721,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(_main())
     finally:
-        # asyncio.run(sec_client.close_session())
+                pass
