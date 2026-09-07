@@ -416,7 +416,7 @@ def poll_insider_transactions(tickers):
 
 
 # ── Master poll functions (same entry points main.py already imports) ────────
-def poll_eodhd_news():
+def poll_fmp_news():
     """Kept name for drop-in compatibility with main.py's scheduler wiring."""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] FMP — Polling news...")
     tickers = get_watched_tickers()
@@ -425,7 +425,7 @@ def poll_eodhd_news():
     print(f"[FMP NEWS] Ticker articles: {ticker_count} | Market sweep: {market_count}")
 
 
-def poll_eodhd_events():
+def poll_fmp_events():
     """Kept name for drop-in compatibility with main.py's scheduler wiring."""
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] FMP — Polling events...")
     tickers = get_watched_tickers()
