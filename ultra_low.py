@@ -1,0 +1,6 @@
+﻿import sys; sys.path.insert(0, '.')
+content = open('etf_flow_poller.py').read()
+content = content.replace('VOLUME_SPIKE_THRESHOLD = 0.5', 'VOLUME_SPIKE_THRESHOLD = 0.3')
+content = content.replace('PRICE_MOVE_THRESHOLD = 0.1', 'PRICE_MOVE_THRESHOLD = 0.05')
+open('etf_flow_poller.py', 'w').write(content)
+print('Thresholds: 0.3x volume, 0.05% price')

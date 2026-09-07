@@ -1,0 +1,332 @@
+"""
+alert_formatter.py
+GQ FinXray US — turns an `alerts` row into the message a user actually reads.
+
+Quality decisions made here, and why:
+
+1. HTML parse mode, not Markdown. Telegram's legacy Markdown breaks on a single
+   unmatched `*` or `_` — and company names ("AT&T Inc.", "Jones_Lang") and
+   LLM-written summaries produce those constantly. A broken parse means the API
+   rejects the whole message and the alert is silently lost. HTML needs only
+   `& < >` escaped, which is deterministic.
+
+2. Every alert leads with a headline. The India system's alerts read as
+   "News Flash: Bank Addresses Lawsuits, Governance, and Post-Merger Outlook"
+   — a scannable title above the paragraph. The US alerts had no equivalent;
+   they opened straight into a wall of summary. ai_pipeline.py now generates a
+   headline (Prompt_H1) and stores it in extra.headline; this renders it.
+
+3. Company name, not just the ticker. "$HDFCBANK — HDFC Bank Limited" reads as
+   a real alert; "$HDFCBANK" alone reads as a database row. company_name is
+   already carried on raw_filings and is now propagated into alerts.extra.
+
+4. Live price with direction. Fetched once per ticker per minute via a TTL cache
+   — without the cache, a burst of 50 alerts for the same ticker would fire 50
+   identical FMP quote calls.
+
+5. A source link when one exists. An alert the reader cannot verify is a rumour.
+"""
+
+import html
+import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import fmp_client
+from feature_map import feature_footer, resolve_feature
+
+ET = ZoneInfo("America/New_York")
+
+DISCLAIMER_URL = "https://gquants.com/disclaimer"
+MANAGE_URL = "https://gquants.com/build"
+
+IMPACT_EMOJI = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
+
+SOURCE_LABELS = {
+    "SEC_EDGAR": "SEC EDGAR",
+    "FMP_NEWS": "FMP News",
+    "CNBC": "CNBC",
+    "REUTERS": "Reuters",
+    "MARKETWATCH": "MarketWatch",
+    "BLOOMBERG": "Bloomberg",
+    "NASDAQ": "Nasdaq",
+    "IBD": "Investor's Business Daily",
+    "FORTUNE": "Fortune",
+    "CNN": "CNN Business",
+    "FMP": "FMP Fundamentals",
+    "FMP_FUNDAMENTALS": "FMP Fundamentals",
+    "TECHNICAL": "Technical (Massive/FMP)",
+    "FMP_IPO": "FMP IPO Calendar",
+    "FMP_TRANSCRIPT": "Earnings Call Transcript",
+    "FMP_ANALYST": "Analyst Consensus (FMP)",
+    "ETF_FLOW": "ETF Flow (Massive)",
+    "ETF_XRAY": "ETF Xray",
+    "SECTOR_HEATMAP": "Sector Heatmap",
+    "MACRO_ROUNDUP": "Macro & Policy",
+    "LARGE_TRADE": "Large Trade",
+}
+
+FILING_TYPE_LABELS = {
+    "8-K":  "8-K Current Report",
+    "10-Q": "10-Q Quarterly Report",
+    "10-K": "10-K Annual Report",
+    "S-1":  "S-1 Registration",
+    "4":    "Form 4 Insider Transaction",
+    "NEWS": "News",
+    "RESULT_SNAPSHOT": "Quarterly Results",
+    "EARNINGS_CALENDAR": "Earnings Calendar",
+    "EARNINGS_TRANSCRIPT": "Earnings Call",
+    "INSIDER_FMP": "Insider Transaction",
+    "BULK_DEAL": "Large Block Trade",
+    "LARGE_TRADE": "Large Trade",
+    "ANALYST_RATING": "Analyst Rating",
+    "IPO_UPCOMING": "Upcoming IPO",
+    "MACRO_BRIEFING": "Macro Digest",
+    "RSI_OVERBOUGHT": "RSI Overbought",
+    "RSI_OVERSOLD": "RSI Oversold",
+    "52W_HIGH": "52-Week High",
+    "52W_LOW": "52-Week Low",
+    "VOLUME_SPIKE": "Volume Spike",
+    "SMA200_CROSSOVER_UP": "200-SMA Crossover Up",
+    "SMA200_CROSSOVER_DOWN": "200-SMA Crossover Down",
+    "INFLOW": "ETF Inflow",
+    "OUTFLOW": "ETF Outflow",
+}
+
+
+# ── Quote cache ───────────────────────────────────────────────────────────────
+# A burst of alerts for one ticker (an 8-K, a Form 4 and a news item landing in
+# the same delivery cycle) would otherwise fire one FMP quote call each. 60s TTL
+# is well inside the useful lifetime of a price shown on an alert.
+_QUOTE_TTL_SECONDS = 60
+_quote_cache = {}
+
+
+def _cached_quote(ticker):
+    now = time.monotonic()
+    hit = _quote_cache.get(ticker)
+    if hit and (now - hit[0]) < _QUOTE_TTL_SECONDS:
+        return hit[1]
+    try:
+        q = fmp_client.get_quote(ticker)
+    except Exception:
+        q = None
+    _quote_cache[ticker] = (now, q)
+    return q
+
+
+def _price_line(ticker):
+    """'📈 $214.29  🟢 +1.24%' or '' when the price is unavailable."""
+    if not ticker or ticker.upper() in ("MARKET", "UNKNOWN", ""):
+        return ""
+    q = _cached_quote(ticker)
+    if not q or q.get("price") in (None, ""):
+        return ""
+    try:
+        price = float(q["price"])
+        chg = float(q.get("changePercentage") or 0)
+    except (TypeError, ValueError):
+        return ""
+    arrow = "🟢" if chg >= 0 else "🔴"
+    sign = "+" if chg >= 0 else ""
+    return f"📈 <b>${price:,.2f}</b>  {arrow} {sign}{chg:.2f}%"
+
+
+def esc(text):
+    """Escape for Telegram HTML parse mode. Only & < > are special."""
+    return html.escape(str(text or ""), quote=False)
+
+
+def esc_attr(text):
+    """Escape for use INSIDE an HTML attribute value, e.g. href="...".
+
+    esc() passes quote=False, so a double quote survives untouched. Filing URLs
+    come from scraped/third-party data; one stray `"` closes the href early,
+    corrupts the anchor, and Telegram rejects the entire message with "can't
+    parse entities" — losing the alert rather than degrading it.
+    """
+    return html.escape(str(text or ""), quote=True)
+
+
+def _clean_url(val):
+    """A usable https link, with news_poller's synthetic #t=TICKER row-key stripped."""
+    if not val or not isinstance(val, str):
+        return None
+    val = val.strip()
+    if not val.startswith("http"):
+        return None
+    # news_poller appends "#t=<TICKER>" so one article can occupy one row per
+    # ticker. It is a storage key, not part of the article's address, and it
+    # must never appear in a link handed to a user.
+    return val.split("#t=")[0] or None
+
+
+def _event_time_et(alert):
+    """
+    When the event actually happened, rendered in US Eastern (market) time.
+
+    Order of preference: the poller's recorded filing/publication timestamp,
+    then the alert row's created_at, then now. Always ET, because every time in
+    this product is a market time — never the server's or the reader's zone.
+    """
+    extra = alert.get("extra") if isinstance(alert.get("extra"), dict) else {}
+    for candidate in (extra.get("filed_at"), extra.get("published_at"),
+                      extra.get("publishedDate"), extra.get("date"),
+                      alert.get("filed_at"), alert.get("created_at")):
+        if not candidate:
+            continue
+        try:
+            raw = str(candidate).replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(ET).strftime("%b %d, %I:%M %p ET").replace(" 0", " ")
+        except Exception:
+            continue
+    return datetime.now(ET).strftime("%b %d, %I:%M %p ET").replace(" 0", " ")
+
+
+def _source_link(alert_or_extra):
+    """
+    Find the source URL for an alert.
+
+    BUGFIX 2026-08-19: this used to accept ONLY `extra` and search inside it.
+    Every poller that writes straight to `alerts` — technical, ETF flow, IPO,
+    analyst ratings, earnings calendar, bulk deals, market reports — stores its
+    link in the `filing_url` COLUMN and puts nothing in extra. So all of those
+    features shipped with no "View source" line at all, despite the URL being
+    present on the row the whole time. The column is now checked as a
+    first-class source alongside extra.
+    """
+    src = alert_or_extra or {}
+    extra = src.get("extra") if isinstance(src.get("extra"), dict) else {}
+
+    for container in (extra, src):
+        for key in ("url", "filing_url", "source_url", "link", "article_url"):
+            cleaned = _clean_url((container or {}).get(key))
+            if cleaned:
+                return cleaned
+    return None
+
+
+def build_message(alert, reason=None):
+    """
+    Render one alert row into Telegram HTML.
+
+    `reason` is the one-line explanation of why THIS user is receiving it —
+    "AAPL is on your watchlist" vs "market-wide alert". Telling the reader why
+    they got something is the difference between an alert and spam.
+    """
+    ticker      = (alert.get("ticker") or "UNKNOWN").upper()
+    impact      = (alert.get("impact") or "LOW").upper()
+    summary     = alert.get("summary") or ""
+    source      = alert.get("source") or ""
+    filing_type = alert.get("filing_type") or ""
+    extra       = alert.get("extra") or {}
+
+    company  = extra.get("company_name") or extra.get("company") or ""
+    headline = extra.get("headline") or extra.get("title") or ""
+
+    emoji        = IMPACT_EMOJI.get(impact, "🟢")
+    source_name  = SOURCE_LABELS.get(source, source.replace("_", " ").title())
+    type_label   = FILING_TYPE_LABELS.get(filing_type, filing_type.replace("_", " ").title())
+    # BUGFIX 2026-08-19: this was datetime.now(ET) — the moment the message was
+    # rendered, not the moment the news broke. A backlogged alert therefore
+    # stamped itself as current. Use the event's own timestamp (the filing /
+    # publication time the poller recorded), falling back to the alert row's
+    # creation time, and only then to now.
+    time_str     = _event_time_et(alert)
+
+    lines = []
+
+    # ── Header: impact · ticker — company ────────────────────────────────────
+    if ticker in ("MARKET", "UNKNOWN"):
+        lines.append(f"{emoji} <b>{esc(type_label)}</b>")
+    else:
+        head = f"{emoji} <b>{impact}</b> · <b>${esc(ticker)}</b>"
+        if company and company.upper() != ticker:
+            head += f" — {esc(company)}"
+        lines.append(head)
+        price = _price_line(ticker)
+        if price:
+            lines.append(price)
+
+    # ── Headline ─────────────────────────────────────────────────────────────
+    if headline:
+        lines.append("")
+        lines.append(f"<b>{esc(headline)}</b>")
+
+    # ── Body ─────────────────────────────────────────────────────────────────
+    summary_idx = None
+    if summary:
+        lines.append("")
+        summary_idx = len(lines)          # remembered so it can absorb any trim
+        lines.append(esc(summary))
+
+    # ── Provenance ───────────────────────────────────────────────────────────
+    lines.append("")
+    lines.append(f"📋 {esc(source_name)} · {esc(type_label)} · {time_str}")
+
+    url = _source_link(alert)
+    if url:
+        lines.append(f'🔗 <a href="{esc_attr(url)}">View source</a>')
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    lines.append("")
+    if reason:
+        lines.append(f"<i>{esc(reason)}</i>")
+    lines.append(f'<i>Disclaimer: <a href="{DISCLAIMER_URL}">gquants.com/disclaimer</a></i>')
+    lines.append(f'📊 <a href="{MANAGE_URL}">Manage your watchlist</a>')
+    lines.append(f"🏷 {esc(feature_footer(source, filing_type))}")
+
+    msg = "\n".join(lines)
+
+    # Telegram hard-caps a message at 4096 characters.
+    #
+    # Slicing the assembled HTML at a fixed offset (the old msg[:3990]) cuts
+    # wherever it lands — including inside `<a href="...">` or an `<i>` pair.
+    # Telegram then rejects the whole message with "can't parse entities" and the
+    # alert is lost outright, which is the opposite of what truncating is for.
+    #
+    # The summary is the only unbounded line and, unlike every other line, it is
+    # plain escaped text with no tags of its own — so it is the one place a cut
+    # is safe. Trim it and keep the provenance, disclaimer and footer intact.
+    if len(msg) > 4000 and summary_idx is not None:
+        overhead = len(msg) - len(lines[summary_idx])
+        room = 3900 - overhead
+        if room > 0:
+            # Trim the RAW text and re-escape. Cutting the already-escaped string
+            # could land inside an entity ("&amp;" -> "&am"), which is exactly the
+            # kind of malformed markup that makes Telegram reject the message.
+            cut = summary[:room]
+            while cut and len(esc(cut)) > room:
+                cut = cut[:-1]
+            lines[summary_idx] = esc(cut.rstrip()) + "…"
+            msg = "\n".join(lines)
+
+    # Belt and braces: if something unforeseen is still oversized, drop whole
+    # trailing lines (each carries balanced tags) rather than slice mid-tag.
+    if len(msg) > 4000:
+        kept, used = [], 0
+        for line in lines:
+            if used + len(line) + 1 > 3900:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        kept.append("…")
+        msg = "\n".join(kept)
+    return msg
+
+
+def delivery_reason(alert):
+    """
+    The 'why am I getting this' line.
+
+    BUGFIX 2026-08-19: this assumed every alert was watchlist-routed and printed
+    "because MARKET is on your watchlist" on every heatmap, market report, macro
+    digest, ETF flow and IPO alert — nobody has MARKET on a watchlist.
+    """
+    ticker = (alert.get("ticker") or "").upper()
+    if ticker in ("", "MARKET", "UNKNOWN"):
+        return "You're receiving this because it covers the whole market."
+    return f"You're receiving this because {ticker} is on your watchlist."
