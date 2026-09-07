@@ -35,35 +35,23 @@ USER_AGENT = os.getenv(
 )
 
 MAX_CONCURRENCY = int(os.getenv("SEC_MAX_CONCURRENCY", "5"))
-MIN_INTERVAL = float(os.getenv("SEC_MIN_INTERVAL", "0.12"))  # ~8 req/s
 REQUEST_TIMEOUT = int(os.getenv("SEC_TIMEOUT", "30"))
 MAX_RETRIES = int(os.getenv("SEC_MAX_RETRIES", "3"))
 
 _session: aiohttp.ClientSession | None = None
-_session_lock = asyncio.Lock()
-_last_request_at = 0.0
-_pace_lock: asyncio.Lock | None = None
-
-
-def _headers() -> dict:
-    return {
-        "User-Agent": USER_AGENT,
-        "Accept-Encoding": "gzip, deflate",
-        "Host": "www.sec.gov",
-    }
 
 
 async def _get_session() -> aiohttp.ClientSession:
     """One session per process, created lazily inside the running loop."""
     global _session
-    async with _session_lock:
-        if _session is None or _session.closed:
-            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            _session = aiohttp.ClientSession(
-                timeout=timeout,
-                headers={"User-Agent": USER_AGENT,
-                         "Accept-Encoding": "gzip, deflate"},
-            )
+    
+    if _session is None or _session.closed:
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        _session = aiohttp.ClientSession(
+            timeout=timeout,
+            headers={"User-Agent": USER_AGENT,
+                     "Accept-Encoding": "gzip, deflate"},
+        )
     return _session
 
 
