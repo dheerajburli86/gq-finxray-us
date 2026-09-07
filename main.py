@@ -29,7 +29,8 @@ from ipo_poller import run_ipo_poller
 from earnings_transcript_poller import run_earnings_transcript_poller
 from news_roundup import run_etf_xray
 from etf_flow_poller import run_etf_flow_poller
-from heatmap_generator import run_sector_heatmap_daily, run_sector_heatmap_weekly, run_sector_heatmap_monthly
+from heatmap_generator import (run_sector_heatmap_midday, run_sector_heatmap_afternoon,
+                               run_sector_heatmap_weekly, run_sector_heatmap_monthly)
 
 
 # ── FMP price fetch ───────────────────────────────────────────────────────────
@@ -580,8 +581,8 @@ def run_scheduler():
     # Market reports + Sector Heatmap (Feature 9)
     schedule.every().day.at("09:25").do(job(send_premarket_report))
     schedule.every().day.at("09:30").do(job(send_market_open_report))
-    schedule.every().day.at("09:30").do(job(run_sector_heatmap_daily))
-    schedule.every().day.at("13:00").do(job(run_sector_heatmap_daily))
+    schedule.every().day.at("09:30").do(job(run_sector_heatmap_midday))
+    schedule.every().day.at("13:00").do(job(run_sector_heatmap_afternoon))
     schedule.every().day.at("16:00").do(job(run_sector_heatmap_weekly))
     schedule.every().day.at("16:30").do(job(run_sector_heatmap_monthly))
     schedule.every().day.at("13:00").do(job(send_midday_report))
