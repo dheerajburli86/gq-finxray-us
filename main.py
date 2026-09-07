@@ -355,35 +355,11 @@ async def deliver_pending_alerts():
 
         bot = get_bot()
 
-        for alert in alerts:
-            ticker = alert.get("ticker", "UNKNOWN")
-            impact = alert.get("impact", "LOW")
-
-            # Send ALL alerts to Telegram channel — no watchlist/user filtering
-            if TELEGRAM_CHANNEL_ID:
-                try:
-                    msg = format_alert(alert)
-                    await bot.send_message(
-                        chat_id=TELEGRAM_CHANNEL_ID,
-                        text=msg,
-                        parse_mode="Markdown"
-                    )
-                    print(f"[CHANNEL] {impact} — ${ticker} sent to channel")
-                    log_alert_run(alert, telegram_success=True)
-                except Exception as e:
-                    print(f"[ERROR] Channel post failed for {ticker}: {e}")
-                    log_alert_run(alert, telegram_success=False, telegram_error=e)
-            else:
-                # No channel configured -- nothing was actually sent, but
-                # still log it so the run record isn't silently incomplete.
-                log_alert_run(alert, telegram_success=False, telegram_error="TELEGRAM_CHANNEL_ID not configured")
-
-            # Mark delivered
-            supabase.table("alerts") \
-                .update({"delivered": True}) \
-                .eq("id", alert["id"]) \
-                .execute()
-            print(f"[DELIVERED] {impact} — ${ticker}")
+        # Alerts are now routed per-user via delivery.py:deliver_pending_alerts()
+        # which respects watchlists and min_impact thresholds for each user.
+        # Do NOT mark delivered here — delivery.py handles the full fan-out
+        # and marks delivered=True only after all users have been contacted.
+        pass
 
     except Exception as e:
         print(f"[ERROR] Delivery failed: {e}")
