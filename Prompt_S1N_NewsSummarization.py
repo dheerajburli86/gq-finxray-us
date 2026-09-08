@@ -10,9 +10,11 @@ Maximum: {target_word_count} words
 CRITICAL RULES:
 - Include the most important facts: what happened, why it matters, financial impact if relevant
 - Include specific numbers, percentages, dates if present in the article
-- Must end with complete sentence (period, exclamation, or question mark)
+- Must end with a complete factual sentence, ending in a period. Never end with a question mark or exclamation point
+- Never end with a rhetorical question, speculation, or any sentence asking what will happen next
+- State only what is reported. Do not speculate, editorialize, or suggest an interpretation
 - Never start with filler: "This article", "The following", "Summary:", "Note:", "According to"
-- Plain English, neutral and factual, no personal opinion
+- Plain English, neutral and factual, no personal opinion, no stance-taking
 - Every word must carry real information — no padding or repetition
 - If word count cannot be exact, come as close as possible while staying accurate
 

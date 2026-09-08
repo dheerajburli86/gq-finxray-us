@@ -23,9 +23,11 @@ STRUCTURE:
 
 MUST FOLLOW:
 - Exactly {target_word_count} words if possible; never below {min_word_count}
-- End with complete sentence (period, exclamation, or question mark)
+- Must end with a complete factual sentence, ending in a period. Never end with a question mark or exclamation point
+- Never end with a rhetorical question, speculation, or any sentence asking what will happen next
+- State only what is reported. Do not speculate, editorialize, or suggest an interpretation
 - Never start with: "This transcript", "The following", "Summary:", "Management noted"
-- Plain English, neutral factual tone, no personal commentary
+- Plain English, neutral factual tone, no personal commentary, no stance-taking
 - Every word conveys real information; no filler or repetition
 - If exact word count impossible, come as close as possible while staying accurate
 

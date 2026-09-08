@@ -16,9 +16,11 @@ KEY PRIORITIES:
 
 MUST FOLLOW:
 - Exactly {target_word_count} words if possible; never below {min_word_count}
-- End with complete sentence (period, exclamation, or question mark)
+- Must end with a complete factual sentence, ending in a period. Never end with a question mark or exclamation point
+- Never end with a rhetorical question, speculation, or any sentence asking what will happen next
+- State only what is reported. Do not speculate, editorialize, or suggest an interpretation
 - Never start with: "This filing", "The following", "Summary:", "Note:", "This document"
-- Plain English, neutral factual tone, no personal opinion
+- Plain English, neutral factual tone, no personal opinion, no stance-taking
 - Every word must convey real information; no filler or padding
 - If exact word count impossible, come as close as possible while staying accurate
 

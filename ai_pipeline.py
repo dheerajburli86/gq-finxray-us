@@ -230,6 +230,19 @@ def last_sentence_incomplete(text):
     ]
     return any(text.lower().endswith(e) for e in incomplete_endings) or text[-1] not in ".!?"
 
+def ends_with_question_or_exclamation(text):
+    """
+    A summary must state facts, not pose a rhetorical question or exclaim.
+    last_sentence_incomplete() treats "?" and "!" as valid complete endings
+    (they are grammatically complete), which let alerts like "...Is this the
+    future of ride-sharing?" through untouched. This is the deterministic
+    gate that actually blocks that ending, independent of whether the LLM
+    followed the prompt's "neutral, no rhetorical question" instruction.
+    """
+    if not text:
+        return False
+    return text.strip().endswith(("?", "!"))
+
 def classify_failure(summary, max_words):
     """Returns the failure reason for this attempt, or None if it passes."""
     if not summary:
@@ -241,6 +254,8 @@ def classify_failure(summary, max_words):
         return "too_short"
     if starts_with_bad_keyword(summary):
         return "bad_start"
+    if ends_with_question_or_exclamation(summary):
+        return "rhetorical_or_exclamatory_ending"
     if last_sentence_incomplete(summary):
         return "incomplete"
     return None
@@ -486,7 +501,7 @@ def process_filing(filing):
     # the same word-count/quality checks; if it doesn't, flag it too rather
     # than blindly trusting the correction.
     validation_result = parse_json_response(call_deepinfra(validation_prompt(summary)))
-    if validation_result.get("issues_detected") == "True":
+    if validation_result.get("issues_detected") in (True, "True"):
         corrected = validation_result.get("corrected_summary", "").strip()
         if not corrected:
             # V.1 flagged real problems with a summary that had already passed
