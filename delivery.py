@@ -75,7 +75,7 @@ ET = ZoneInfo("America/New_York")
 #      marked delivered. That is why heatmaps stopped arriving.
 #
 # The allowlist below re-enables (2) without touching (1).
-BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "true").strip().lower()
+BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "false").strip().lower()
                      in ("1", "true", "yes"))
 
 
