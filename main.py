@@ -114,7 +114,7 @@ def _format_alert_body(alert):
     emoji = impact_emoji.get(impact, "🟢")
     source_name = source_labels.get(source, source)
     time_str = datetime.now().strftime("%I:%M %p EST")
-    footer = f"\n\n{feature_footer(source, filing_type)}"
+    footer = f"\n\n🏷 {feature_footer(source, filing_type)}"
 
     # Fetch live price from FMP (skip MARKET ticker)
     price_line = ""
