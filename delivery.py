@@ -42,6 +42,7 @@ from telegram.error import RetryAfter, Forbidden, BadRequest
 
 from alert_formatter import build_message, delivery_reason
 from feature_map import resolve_feature
+from gquants_format_converter import make_frontend_link
 
 load_dotenv()
 
@@ -410,6 +411,40 @@ def _past_retry_window(alert):
     return age_hours >= MAX_RETRY_AGE_HOURS
 
 
+def _log_payload(alert):
+    """
+    Write the alert's structured XBRL/JSON payload to payload_log the moment it
+    is about to reach Telegram — independent of whether GQUANTS_ALERT_BASE_URL
+    is set, since the frontend link is no longer a prerequisite for logging.
+
+    Upserts on alert_id so a retried delivery cycle (deferred alert, restarted
+    process) never writes a duplicate row. Missing table or any DB error is
+    swallowed to a warning: this is an audit trail, not part of the send path,
+    and must never be the reason an alert fails to reach a user.
+    """
+    extra = alert.get("extra") if isinstance(alert.get("extra"), dict) else {}
+    payload = extra.get("structured_payload")
+    if not payload:
+        return
+    try:
+        link = make_frontend_link(payload, str(alert.get("id") or "")) or None
+    except Exception:
+        link = None
+    try:
+        supabase.table("payload_log").upsert({
+            "alert_id": alert.get("id"),
+            "ticker": (alert.get("ticker") or "").upper(),
+            "payload_type": payload.get("type"),
+            "filing_type": alert.get("filing_type"),
+            "source": alert.get("source"),
+            "payload": payload,
+            "frontend_link": link,
+        }, on_conflict="alert_id", ignore_duplicates=True).execute()
+    except Exception as e:
+        logger.warning("[DELIVERY] payload_log insert failed (run migrations/"
+                       "2026-09-08_payload_log.sql?): %s", e)
+
+
 def _mark_fanned_out(alert_ids):
     if not alert_ids:
         return
@@ -421,7 +456,21 @@ def _mark_fanned_out(alert_ids):
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 async def deliver_pending_alerts():
-    """One fan-out cycle. Safe to call on a loop; safe to interrupt."""
+    """
+    One fan-out cycle. Safe to call on a loop; safe to interrupt.
+
+    Sends are parallel ACROSS users. The previous version had one single loop
+    that sent every recipient of every alert strictly one after another, so a
+    cycle with 50 alerts x 10 recipients each did 500 sequential sends at
+    ~1.05s apart (PER_CHAT_GAP_SECONDS) — over 8 minutes for a batch that
+    should land within a couple of seconds. The 1-second-per-chat pacing is a
+    real Telegram constraint, but it only applies to repeat sends to the SAME
+    chat_id — it does not require serializing different chats behind each
+    other. Every user's own queue is still sent to in order (so a user with
+    three alerts this cycle gets them spaced out safely); different users'
+    queues run concurrently via asyncio.gather, so N users drop their alerts
+    at roughly the same moment instead of one after another.
+    """
     alerts = _fetch_undelivered()
     if not alerts:
         return
@@ -445,9 +494,17 @@ async def deliver_pending_alerts():
 
     bot = Bot(token=TELEGRAM_TOKEN)
     ledger = []
-    fanned = []
     stats = {"sent": 0, "failed": 0, "skipped": 0, "no_audience": 0, "deferred": 0, "errored": 0}
 
+    # aid -> {"alert": row, "retry_needed": bool, "fanned": bool}
+    alert_state = {}
+    # user_id -> [(aid, user, text, reason), ...], sent in order, one task/user
+    per_user_queue = {}
+
+    # ── Phase 1: resolve audience + build message text for every alert ────────
+    # Cheap, synchronous, no network — safe to do inline before fanning out the
+    # actual sends. Also the single choke point where every structured XBRL/JSON
+    # payload gets logged, once per alert, regardless of which poller built it.
     for alert in alerts:
         aid = alert["id"]
 
@@ -468,14 +525,13 @@ async def deliver_pending_alerts():
 
             if not audience:
                 stats["no_audience"] += 1
-                fanned.append(aid)
+                alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": True}
                 continue
 
             text = build_message(alert, reason=delivery_reason(alert))
+            _log_payload(alert)
 
-            # True while at least one recipient failed for a reason that a later
-            # attempt could plausibly fix. Such an alert must NOT be settled.
-            retry_needed = False
+            alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": False}
 
             for user, reason in audience:
                 uid = user["user_id"]
@@ -488,48 +544,60 @@ async def deliver_pending_alerts():
                     stats["skipped"] += 1
                     continue
 
-                ok, err, permanent = await _send_one(bot, user["chat_id"], text)
-                if ok:
-                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                                   "status": "SENT", "reason": reason})
-                    sent_today[uid] = sent_today.get(uid, 0) + 1
-                    stats["sent"] += 1
-                elif permanent:
-                    # Nothing will ever make this send succeed. Record it as
-                    # terminal so it is not retried forever.
-                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                                   "status": "UNDELIVERABLE", "reason": reason, "error": err})
-                    stats["failed"] += 1
-                else:
-                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                                   "status": "FAILED", "reason": reason, "error": err})
-                    stats["failed"] += 1
-                    retry_needed = True
+                per_user_queue.setdefault(uid, []).append((aid, user, text, reason))
+                # Reserve the slot now so two alerts to the same user in this
+                # cycle both see the incremented count before either sends.
+                sent_today[uid] = sent_today.get(uid, 0) + 1
 
-                # Telegram allows roughly one message per second per chat. The
-                # global 50ms gap alone triggers 429s when several alerts land
-                # for the same user in one cycle, and every 429 burns a retry.
-                await asyncio.sleep(max(SEND_GAP_SECONDS, PER_CHAT_GAP_SECONDS))
-
-            # Optional admin mirror, off unless explicitly configured.
+            # Optional admin mirror, off unless explicitly configured. Fired
+            # once per alert here rather than per recipient.
             if ADMIN_CHANNEL_ID:
                 await _send_one(bot, ADMIN_CHANNEL_ID, text)
-
-            if retry_needed and not _past_retry_window(alert):
-                stats["deferred"] += 1
-            else:
-                fanned.append(aid)
         except Exception as e:
             # Mark it fanned out anyway: it is structurally broken, and retrying
             # it forever would block the queue behind a row that can never send.
             logger.exception("[DELIVERY] Alert %s failed to process, skipping: %s", aid, e)
             stats["errored"] += 1
-            fanned.append(aid)
+            alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": True}
 
-        # Flush periodically so a crash loses at most a few ledger rows.
-        if len(ledger) >= 50:
-            _record(ledger)
-            ledger = []
+    # ── Phase 2: fan out concurrently, one task per user ───────────────────────
+    async def _drain_user_queue(uid, items):
+        for aid, user, text, reason in items:
+            ok, err, permanent = await _send_one(bot, user["chat_id"], text)
+            if ok:
+                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                               "status": "SENT", "reason": reason})
+                stats["sent"] += 1
+            elif permanent:
+                # Nothing will ever make this send succeed. Record it as
+                # terminal so it is not retried forever.
+                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                               "status": "UNDELIVERABLE", "reason": reason, "error": err})
+                stats["failed"] += 1
+            else:
+                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                               "status": "FAILED", "reason": reason, "error": err})
+                stats["failed"] += 1
+                alert_state[aid]["retry_needed"] = True
+
+            # Telegram allows roughly one message per second per chat. This gap
+            # only serializes repeat sends to THIS chat_id — it no longer holds
+            # up any other user's queue, which is what made fan-out slow.
+            await asyncio.sleep(max(SEND_GAP_SECONDS, PER_CHAT_GAP_SECONDS))
+
+    if per_user_queue:
+        await asyncio.gather(*(
+            _drain_user_queue(uid, items) for uid, items in per_user_queue.items()
+        ))
+
+    fanned = []
+    for aid, state in alert_state.items():
+        if state["fanned"]:
+            fanned.append(aid)
+        elif state["retry_needed"] and not _past_retry_window(state["alert"]):
+            stats["deferred"] += 1
+        else:
+            fanned.append(aid)
 
     _record(ledger)
     _mark_fanned_out(fanned)

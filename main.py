@@ -23,8 +23,8 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 # instantly reached a phone up to ~2 minutes later, ~60s on average, before any
 # AI time. Each drain is a single indexed Supabase query when its queue is
 # empty, so tightening the idle gaps costs queries, not tokens or API quota.
-PIPELINE_IDLE_SECONDS = int(os.getenv("GQ_PIPELINE_IDLE_SECONDS", "5"))
-DELIVERY_IDLE_SECONDS = int(os.getenv("GQ_DELIVERY_IDLE_SECONDS", "5"))
+PIPELINE_IDLE_SECONDS = int(os.getenv("GQ_PIPELINE_IDLE_SECONDS", "3"))
+DELIVERY_IDLE_SECONDS = int(os.getenv("GQ_DELIVERY_IDLE_SECONDS", "3"))
 # 8-K and Form 4 are the time-critical ones (material events, insider trades).
 SEC_FAST_POLL_SECONDS = int(os.getenv("GQ_SEC_POLL_SECONDS", "15"))
 
@@ -558,24 +558,34 @@ def run_scheduler():
     # policy allows at 10 req/s with the required User-Agent.
     schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_8k))
     schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_form4))
-    schedule.every(5).minutes.do(sec_job(poll_sec_10q))
-    schedule.every(5).minutes.do(sec_job(poll_sec_10k))
-    schedule.every(10).minutes.do(sec_job(poll_sec_s1))
-    # 5 min, not 30: the 10-Q/10-K pollers run every 5 min, so a 30-min drain
-    # here added up to 30 min of latency on top of a filing SEC published in
-    # seconds -- the single largest delay in the financial-alert path. The job
-    # is a no-op when no rows are PENDING, so the extra ticks cost one indexed
-    # Supabase query each.
-    schedule.every(5).minutes.do(sec_job(process_pending_snapshots))
+    # SEC is the creator of these filings, not FMP/Massive re-publishing them
+    # later — 5min/10min meant a 10-Q could sit unnoticed for most of that
+    # window even though SEC published it instantly. Tightened to 2min/3min,
+    # still comfortably inside SEC's fair-access rate limit since these share
+    # the dedicated _SEC_POOL lane and never queue behind FMP/Massive jobs.
+    schedule.every(2).minutes.do(sec_job(poll_sec_10q))
+    schedule.every(2).minutes.do(sec_job(poll_sec_10k))
+    schedule.every(3).minutes.do(sec_job(poll_sec_s1))
+    # Matches the tightened 10-Q/10-K interval above — no point polling SEC
+    # every 2 minutes if the snapshot builder that turns those filings into
+    # alerts only wakes up every 5. The job is a no-op when nothing is
+    # PENDING, so the extra ticks cost one indexed Supabase query each.
+    schedule.every(2).minutes.do(sec_job(process_pending_snapshots))
     schedule.every(30).minutes.do(job(run_earnings_transcript_poller))
     schedule.every(60).seconds.do(job(poll_all_news))
 
-    # FMP news + events pollers (Features 2, 4, 5)
-    schedule.every(10).minutes.do(job(poll_fmp_news))
-    schedule.every(60).minutes.do(job(poll_fmp_events))
+    # FMP news + events pollers (Features 2, 4, 5) — deliberately de-prioritized.
+    # FMP/Massive re-surface the same material events SEC EDGAR already caught
+    # (and caught faster, being the primary source), so these exist only to
+    # cover what SEC EDGAR structurally cannot: general market news, earnings
+    # calendars, analyst ratings. Widened from 10min/60min so their API budget
+    # and scheduler slots don't compete with the SEC lane's priority.
+    schedule.every(15).minutes.do(job(poll_fmp_news))
+    schedule.every(90).minutes.do(job(poll_fmp_events))
 
-    # Technical + IPO pollers (Features 6, 8)
-    schedule.every(60).minutes.do(job(run_technical_poller))
+    # Technical + IPO pollers (Features 6, 8) — FMP/Massive-sourced, same
+    # de-prioritization as above.
+    schedule.every(90).minutes.do(job(run_technical_poller))
     # NOTE: Times below are in UTC (EST: UTC-5, EDT: UTC-4)
     # If container timezone is not UTC, set TZ=America/New_York in environment
     # 08:00 ET = 13:00 UTC (EST)
@@ -584,7 +594,7 @@ def run_scheduler():
     # ETF Xray + ETF Flow (Features 7, 10)
     # 09:00 ET = 14:00 UTC (EST)
     schedule.every().day.at("14:00").do(job(run_etf_xray))
-    schedule.every(60).minutes.do(job(run_etf_flow_poller))
+    schedule.every(90).minutes.do(job(run_etf_flow_poller))
 
     # Market reports + Sector Heatmap (Feature 9)
     # Market hours: 09:30-16:00 ET
