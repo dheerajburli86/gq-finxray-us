@@ -577,15 +577,21 @@ def run_pipeline():
         filings = result.data
         if not filings:
             print("No PENDING filings found.")
-            return
+            return 0
 
         print(f"Found {len(filings)} PENDING filings -- processing...")
         for filing in filings:
             process_filing(filing)
             time.sleep(1)
 
+        # Returned so the caller can drain a backlog back-to-back instead of
+        # sleeping between batches. A full page means there is very likely more
+        # waiting behind it; the caller only idles when this comes back 0.
+        return len(filings)
+
     except Exception as e:
         print(f"[ERROR] Pipeline failed: {e}")
+        return 0
 
 
 if __name__ == "__main__":

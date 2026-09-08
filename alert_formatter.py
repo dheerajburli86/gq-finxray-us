@@ -34,6 +34,7 @@ from zoneinfo import ZoneInfo
 
 import fmp_client
 from feature_map import feature_footer, resolve_feature
+from gquants_format_converter import make_frontend_link
 
 ET = ZoneInfo("America/New_York")
 
@@ -270,6 +271,23 @@ def build_message(alert, reason=None):
     url = _source_link(alert)
     if url:
         lines.append(f'🔗 <a href="{esc_attr(url)}">View source</a>')
+
+    # ── GQuants deep link ────────────────────────────────────────────────────
+    # The structured payload (fr / it / ipo / earning_calls / tradingview) rides
+    # alerts.extra from the poller through ai_pipeline. THIS is the only render
+    # path delivery.py uses, so the link must be spliced here — main.format_alert
+    # carried an identical block but nothing calls it, which is why the payload
+    # feature shipped nothing to users despite its tests passing.
+    # make_frontend_link() returns "" while GQUANTS_ALERT_BASE_URL is unset, so
+    # this is a no-op until the frontend route is known.
+    payload = extra.get("structured_payload")
+    if payload:
+        try:
+            deep = make_frontend_link(payload, str(alert.get("id") or ""))
+        except Exception:
+            deep = ""
+        if deep:
+            lines.append(f'📈 <a href="{esc_attr(deep)}">View full report on GQuants</a>')
 
     # ── Footer ───────────────────────────────────────────────────────────────
     lines.append("")

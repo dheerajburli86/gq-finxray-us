@@ -17,6 +17,17 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
+# ── Latency budget ────────────────────────────────────────────────────────────
+# End-to-end delay is the sum of three queue drains: SEC poll -> AI pipeline ->
+# delivery fan-out. It used to be 30s + 60s + 30s, so a filing SEC published
+# instantly reached a phone up to ~2 minutes later, ~60s on average, before any
+# AI time. Each drain is a single indexed Supabase query when its queue is
+# empty, so tightening the idle gaps costs queries, not tokens or API quota.
+PIPELINE_IDLE_SECONDS = int(os.getenv("GQ_PIPELINE_IDLE_SECONDS", "5"))
+DELIVERY_IDLE_SECONDS = int(os.getenv("GQ_DELIVERY_IDLE_SECONDS", "5"))
+# 8-K and Form 4 are the time-critical ones (material events, insider trades).
+SEC_FAST_POLL_SECONDS = int(os.getenv("GQ_SEC_POLL_SECONDS", "15"))
+
 import fmp_client
 from feature_map import feature_footer
 from delivery import deliver_pending_alerts as delivery_deliver
@@ -411,16 +422,32 @@ def fetch_top_movers():
 
 
 async def send_market_report(title: str, body: str):
-    if not TELEGRAM_CHANNEL_ID:
-        return
+    """
+    Queue a market report as an alert row so delivery.py fans it out per user.
+
+    It used to bot.send_message() straight to TELEGRAM_CHANNEL_ID, which put
+    every scheduled report into the shared GQ FinXray US channel and never into
+    a subscriber's own chat. That bypassed the whole routing layer: no
+    min_impact floor, no muted_features, no daily cap, no alert_deliveries
+    ledger, and no way for a user to stop receiving them.
+
+    Filed as ticker='MARKET' / MARKET_REPORT, which delivery.py already treats
+    as a whole-market product: it reaches exactly the users who have
+    receive_market_wide on, in their own Telegram chat.
+    """
     try:
-        bot = get_bot()
-        time_str = datetime.now().strftime("%I:%M %p EST")
-        msg = f"📊 *{title}*\n_{time_str}_\n\n{body}\n\n_GQ FinXray US · gquants.com_"
-        await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=msg, parse_mode="Markdown")
-        print(f"[REPORT] Sent: {title}")
+        supabase.table("alerts").insert({
+            "ticker": "MARKET",
+            "summary": body,
+            "impact": "LOW",
+            "source": "MARKET_REPORT",
+            "filing_type": "MARKET_REPORT",
+            "extra": {"headline": title, "report_title": title},
+            "delivered": False,
+        }).execute()
+        print(f"[REPORT] Queued for fan-out: {title}")
     except Exception as e:
-        print(f"[ERROR] Failed to send market report: {e}")
+        print(f"[ERROR] Failed to queue market report: {e}")
 
 
 def send_premarket_report():
@@ -460,11 +487,18 @@ def send_afterhours_report():
 
 # ── Scheduler thread ──────────────────────────────────────────────────────────
 _JOB_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="job")
+# SEC EDGAR gets its own lane. Sharing one pool meant the latency-critical 8-K
+# and Form 4 polls queued behind whatever slow FMP/Massive/news/technical job
+# happened to hold the workers — the heatmap, ETF Xray and transcript jobs are
+# all minutes long, and six of them at once stalled SEC polling completely.
+# A separate executor means an SEC tick never waits on a non-SEC job, which is
+# what "prioritise SEC EDGAR over FMP/Massive" actually requires.
+_SEC_POOL = ThreadPoolExecutor(max_workers=5, thread_name_prefix="sec")
 _JOB_RUNNING = {}
 _JOB_LOCK = threading.Lock()
 
 
-def job(fn):
+def job(fn, pool=None):
     """
     Hand a scheduled job to the pool instead of running it inline.
 
@@ -498,10 +532,15 @@ def job(fn):
                 with _JOB_LOCK:
                     _JOB_RUNNING[name] = False
 
-        _JOB_POOL.submit(_run)
+        (pool or _JOB_POOL).submit(_run)
 
     _submit.__name__ = f"job_{name}"
     return _submit
+
+
+def sec_job(fn):
+    """Schedule on the dedicated SEC lane so filings never queue behind FMP."""
+    return job(fn, pool=_SEC_POOL)
 
 
 def run_scheduler():
@@ -510,20 +549,24 @@ def run_scheduler():
     # Warm start in parallel — the old serial block delayed the first
     # scheduled tick by however long the slowest poller took.
     for warm in (poll_sec_8k, poll_sec_form4, poll_sec_10q, poll_sec_10k,
-                 poll_sec_s1, poll_all_news, poll_fmp_news, poll_fmp_events,
+                 poll_sec_s1):
+        sec_job(warm)()
+    for warm in (poll_all_news, poll_fmp_news, poll_fmp_events,
                  run_technical_poller, run_ipo_poller, run_etf_flow_poller):
         job(warm)()
-    schedule.every(30).seconds.do(job(poll_sec_8k))
-    schedule.every(30).seconds.do(job(poll_sec_form4))
-    schedule.every(5).minutes.do(job(poll_sec_10q))
-    schedule.every(5).minutes.do(job(poll_sec_10k))
-    schedule.every(10).minutes.do(job(poll_sec_s1))
+    # SEC lane — 8-K and Form 4 at 15s, the tightest interval SEC's fair-access
+    # policy allows at 10 req/s with the required User-Agent.
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_8k))
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_form4))
+    schedule.every(5).minutes.do(sec_job(poll_sec_10q))
+    schedule.every(5).minutes.do(sec_job(poll_sec_10k))
+    schedule.every(10).minutes.do(sec_job(poll_sec_s1))
     # 5 min, not 30: the 10-Q/10-K pollers run every 5 min, so a 30-min drain
     # here added up to 30 min of latency on top of a filing SEC published in
     # seconds -- the single largest delay in the financial-alert path. The job
     # is a no-op when no rows are PENDING, so the extra ticks cost one indexed
     # Supabase query each.
-    schedule.every(5).minutes.do(job(process_pending_snapshots))
+    schedule.every(5).minutes.do(sec_job(process_pending_snapshots))
     schedule.every(30).minutes.do(job(run_earnings_transcript_poller))
     schedule.every(60).seconds.do(job(poll_all_news))
 
@@ -564,22 +607,44 @@ def run_scheduler():
 
 # ── AI pipeline thread ────────────────────────────────────────────────────────
 def run_pipeline():
+    """
+    Drain PENDING raw_filings continuously.
+
+    The idle gap was 60s. A filing that the SEC poller captured seconds after
+    publication then sat untouched for up to a further minute before the AI
+    even looked at it — on its own the largest delay between "SEC published"
+    and "user's phone buzzes". process_with_ai() is a single indexed Supabase
+    query when the queue is empty, so a short gap costs one cheap query per
+    tick and nothing else; when the queue is NOT empty there is no sleep at
+    all, so a burst drains back-to-back instead of one batch per minute.
+    """
     print("[PIPELINE] Starting...")
     while True:
+        worked = False
         try:
-            process_with_ai()
+            worked = bool(process_with_ai())
         except Exception as e:
             print(f"[PIPELINE ERROR] {e}")
             asyncio.run(send_error_alert(f"Pipeline error: {str(e)}"))
-        time.sleep(60)
+        if not worked:
+            time.sleep(PIPELINE_IDLE_SECONDS)
 
 
 # ── Delivery loop ─────────────────────────────────────────────────────────────
 async def delivery_loop():
+    """
+    Fan out ready alerts. 30s -> 5s: this is the last hop before the user's
+    phone, and a fixed 30s gap added up to half a minute to every alert
+    regardless of how fast the poller and the AI had been. An empty cycle is
+    one indexed query that returns nothing.
+    """
     print("[DELIVERY] Starting...")
     while True:
-        await deliver_pending_alerts()
-        await asyncio.sleep(30)
+        try:
+            await deliver_pending_alerts()
+        except Exception as e:
+            print(f"[DELIVERY ERROR] {e}")
+        await asyncio.sleep(DELIVERY_IDLE_SECONDS)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

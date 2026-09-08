@@ -38,7 +38,12 @@ FEATURES = {
     3: {
         "name": "Result Snapshot",
         "detail": "Structured quarterly/annual financials triggered off 10-Q/10-K filings.",
-        "sources": {"FMP", "FMP_FUNDAMENTALS"},
+        # SEC_XBRL is the PREFERRED source: result_snapshot.py tries SEC XBRL
+        # companyfacts first and only falls back to FMP. It was missing here, so
+        # every snapshot built from the primary path resolved to feature 0 --
+        # footer read "Unmapped" and, because muting is keyed on feature id, the
+        # feature could not be muted by a user at all.
+        "sources": {"FMP", "FMP_FUNDAMENTALS", "SEC_XBRL"},
         "filing_types": {"RESULT_SNAPSHOT"},
         "market_wide": False,
     },
@@ -117,9 +122,13 @@ FEATURES = {
     13: {
         "name": "Macro & Policy Digest",
         "detail": "Fed decisions, Treasury yields, jobs/inflation prints, commodities, USD.",
-        "sources": {"MACRO_ROUNDUP"},
-        "filing_types": {"MACRO_BRIEFING"},
-        "market_wide": False,
+        # MARKET_REPORT covers the five scheduled index/mover digests (pre-market,
+        # open, midday, close, after-hours). They now queue as alert rows and fan
+        # out per user like everything else, so they need a feature id to carry a
+        # footer and to be mutable via muted_features.
+        "sources": {"MACRO_ROUNDUP", "MARKET_REPORT"},
+        "filing_types": {"MACRO_BRIEFING", "MARKET_REPORT"},
+        "market_wide": True,
     },
 }
 
