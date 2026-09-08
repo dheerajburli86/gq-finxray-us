@@ -19,6 +19,7 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
 import fmp_client
 from feature_map import feature_footer
+from delivery import deliver_pending_alerts as delivery_deliver
 
 from edgar_poller_async import poll_sec_8k, poll_sec_form4, poll_sec_10q, poll_sec_10k, poll_sec_s1, load_cik_map
 from news_poller import poll_all_news
@@ -31,6 +32,7 @@ from news_roundup import run_etf_xray
 from etf_flow_poller import run_etf_flow_poller
 from heatmap_generator import (run_sector_heatmap_midday, run_sector_heatmap_afternoon,
                                run_sector_heatmap_weekly, run_sector_heatmap_monthly)
+from ai_pipeline import run_pipeline as process_with_ai
 
 
 # ── FMP price fetch ───────────────────────────────────────────────────────────
@@ -341,26 +343,9 @@ def get_bot():
 
 
 async def deliver_pending_alerts():
+    """Dispatch to delivery.py which handles per-user routing and watchlist filtering."""
     try:
-        result = supabase.table("alerts") \
-            .select("*") \
-            .eq("delivered", False) \
-            .order("created_at") \
-            .limit(20) \
-            .execute()
-
-        alerts = result.data
-        if not alerts:
-            return
-
-        bot = get_bot()
-
-        # Alerts are now routed per-user via delivery.py:deliver_pending_alerts()
-        # which respects watchlists and min_impact thresholds for each user.
-        # Do NOT mark delivered here — delivery.py handles the full fan-out
-        # and marks delivered=True only after all users have been contacted.
-        pass
-
+        await delivery_deliver()
     except Exception as e:
         print(f"[ERROR] Delivery failed: {e}")
 
@@ -548,22 +533,28 @@ def run_scheduler():
 
     # Technical + IPO pollers (Features 6, 8)
     schedule.every(60).minutes.do(job(run_technical_poller))
-    schedule.every().day.at("08:00").do(job(run_ipo_poller))
+    # NOTE: Times below are in UTC (EST: UTC-5, EDT: UTC-4)
+    # If container timezone is not UTC, set TZ=America/New_York in environment
+    # 08:00 ET = 13:00 UTC (EST)
+    schedule.every().day.at("13:00").do(job(run_ipo_poller))
 
     # ETF Xray + ETF Flow (Features 7, 10)
-    schedule.every().day.at("09:00").do(job(run_etf_xray))
+    # 09:00 ET = 14:00 UTC (EST)
+    schedule.every().day.at("14:00").do(job(run_etf_xray))
     schedule.every(60).minutes.do(job(run_etf_flow_poller))
 
     # Market reports + Sector Heatmap (Feature 9)
-    schedule.every().day.at("09:25").do(job(send_premarket_report))
-    schedule.every().day.at("09:30").do(job(send_market_open_report))
-    schedule.every().day.at("09:30").do(job(run_sector_heatmap_midday))
-    schedule.every().day.at("13:00").do(job(run_sector_heatmap_afternoon))
-    schedule.every().day.at("16:00").do(job(run_sector_heatmap_weekly))
-    schedule.every().day.at("16:30").do(job(run_sector_heatmap_monthly))
-    schedule.every().day.at("13:00").do(job(send_midday_report))
-    schedule.every().day.at("16:00").do(job(send_market_close_report))
-    schedule.every().day.at("16:30").do(job(send_afterhours_report))
+    # Market hours: 09:30-16:00 ET
+    # 09:25 ET = 14:25 UTC, 09:30 ET = 14:30 UTC, 13:00 ET = 18:00 UTC, 16:00 ET = 21:00 UTC, 16:30 ET = 21:30 UTC (EST)
+    schedule.every().day.at("14:25").do(job(send_premarket_report))
+    schedule.every().day.at("14:30").do(job(send_market_open_report))
+    schedule.every().day.at("14:30").do(job(run_sector_heatmap_midday))
+    schedule.every().day.at("18:00").do(job(run_sector_heatmap_afternoon))
+    schedule.every().day.at("21:00").do(job(run_sector_heatmap_weekly))
+    schedule.every().day.at("21:30").do(job(run_sector_heatmap_monthly))
+    schedule.every().day.at("18:00").do(job(send_midday_report))
+    schedule.every().day.at("21:00").do(job(send_market_close_report))
+    schedule.every().day.at("21:30").do(job(send_afterhours_report))
 
     print("[SCHEDULER] All pollers and market reports scheduled.")
     while True:
@@ -576,8 +567,7 @@ def run_pipeline():
     print("[PIPELINE] Starting...")
     while True:
         try:
-            from ai_pipeline import run_pipeline as process
-            process()
+            process_with_ai()
         except Exception as e:
             print(f"[PIPELINE ERROR] {e}")
             asyncio.run(send_error_alert(f"Pipeline error: {str(e)}"))
