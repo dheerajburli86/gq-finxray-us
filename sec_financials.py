@@ -164,7 +164,7 @@ def get_income_statement_sync(cik, limit: int = 8) -> list:
 
     rows = []
     for end_date in sorted(all_dates, reverse=True)[:limit]:
-        row = {"date": end_date, "_source": "SEC XBRL"}
+        row = {"date": end_date, "_source": "SEC_XBRL"}
 
         for field in ("revenue", "grossProfit", "operatingIncome",
                       "netIncome", "epsDiluted"):
@@ -210,3 +210,19 @@ def get_income_statement_sync(cik, limit: int = 8) -> list:
 
 # Convenience alias — some call sites use the async-free name directly.
 get_income_statement = get_income_statement_sync
+
+
+def get_company_name(cik) -> str | None:
+    """
+    Company name straight off the same companyfacts payload the quarters came
+    from (SEC's "entityName" field) -- reuses _fetch_companyfacts's cache, so
+    this costs nothing extra once get_income_statement_sync() has already run
+    for this CIK. Lets callers skip an FMP profile call purely to get a name
+    when SEC XBRL already supplied everything else.
+    """
+    if not cik:
+        return None
+    facts = _fetch_companyfacts(cik)
+    if not facts:
+        return None
+    return facts.get("entityName") or None

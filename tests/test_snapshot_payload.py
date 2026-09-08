@@ -18,6 +18,12 @@ Q = [
 
 import sec_financials, fmp_client
 sec_financials.get_income_statement_sync = lambda cik, limit=8: Q
+# sec_financials is fully mocked above, so any attribute we don't stub
+# resolves to an auto-generated MagicMock -- including this new one, which
+# result_snapshot now calls when data_source == "SEC_XBRL" -- and a MagicMock
+# fails json.dumps() downstream in the payload assertions. Return a real
+# string so the SEC-path branch behaves like it does in production.
+sec_financials.get_company_name = lambda cik: "Apple Inc."
 fmp_client.get_profile = lambda t: {"companyName":"Apple Inc."}
 
 import result_snapshot as rs

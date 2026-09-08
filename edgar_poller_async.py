@@ -456,12 +456,21 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
             return 0
 
         watchlist = get_watchlist() if watchlist_only else None
-        pattern = re.compile(rf'{re.escape(form_type)}\s*-\s*(.+?)\s*\((\d+)\)')
+        # (?:/A)? handles amended filings (8-K/A, 10-Q/A, 10-K/A, S-1/A), which
+        # SEC EDGAR files constantly and which otherwise never match this
+        # pattern -- title is "8-K/A - Company (0001234567)", not "8-K - ...",
+        # so the plain form_type pattern stops right after "8-K" and fails.
+        # A fallback pattern (same shape as edgar_poller.py's) catches any
+        # other title layout SEC uses. Without either, m is None, cik is "",
+        # ticker_from_cik("") returns "UNKNOWN", and the filing is silently
+        # dropped -- even when it is for a watchlisted company.
+        pattern = re.compile(rf'{re.escape(form_type)}(?:/A)?\s*-\s*(.+?)\s*\((\d+)\)')
+        fallback_pattern = re.compile(r'[^-]+-\s*(.+?)\s*\((\d+)\)')
 
         # ---- FILTER BEFORE FETCH ----
         candidates = []
         for e in entries:
-            m = pattern.match(e["title"])
+            m = pattern.match(e["title"]) or fallback_pattern.match(e["title"])
             company = m.group(1).strip() if m else e["title"]
             cik = m.group(2) if m else ""
             ticker = ticker_from_cik(cik)
@@ -526,8 +535,13 @@ async def poll_sec_form4_async():
                 grouped.setdefault(m.group(1), []).append(e)
 
         watchlist = get_watchlist()
-        issuer_re = re.compile(r'4\s*-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)')
-        reporter_re = re.compile(r'4\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)')
+        # (?:/A)? for amended Form 4/A filings -- same gap as the generic
+        # poller above: "4/A - Issuer (0001234567) (Issuer)" doesn't match
+        # a pattern anchored on a bare "4", so cik stays "" and the filing
+        # is dropped as UNKNOWN regardless of whether it's watchlisted.
+        issuer_re = re.compile(r'4(?:/A)?\s*-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)')
+        reporter_re = re.compile(r'4(?:/A)?\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)')
+        fallback_issuer_re = re.compile(r'[^-]+-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)')
 
         candidates = []
         for entries in grouped.values():
@@ -536,7 +550,7 @@ async def poll_sec_form4_async():
             if not issuer:
                 continue
 
-            m = issuer_re.match(issuer["title"])
+            m = issuer_re.match(issuer["title"]) or fallback_issuer_re.match(issuer["title"])
             company = m.group(1).strip() if m else issuer["title"]
             cik = m.group(2) if m else ""
             ticker = ticker_from_cik(cik)

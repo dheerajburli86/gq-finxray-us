@@ -115,8 +115,18 @@ def build_result_snapshot(ticker, form_type, cik=None):
     prev = quarters[1]
     yoy = quarters[4] if len(quarters) >= 5 else None
 
-    profile = fmp_client.get_profile(ticker)
-    company_name = (profile or {}).get("companyName", ticker)
+    # SEC-over-FMP means SEC over FMP everywhere in this function, not just
+    # for the quarters -- calling fmp_client.get_profile() unconditionally
+    # here spent one FMP call per snapshot purely for a company name, even
+    # when companyfacts (already fetched and cached above) carries the same
+    # name under "entityName". Only fall back to FMP when SEC XBRL wasn't
+    # the source or didn't have a usable name.
+    company_name = None
+    if data_source == "SEC_XBRL" and cik:
+        company_name = sec_financials.get_company_name(cik)
+    if not company_name:
+        profile = fmp_client.get_profile(ticker)
+        company_name = (profile or {}).get("companyName", ticker)
 
     # g() tries several key spellings since FMP has renamed fields across API
     # versions (older v3-style responses used all-lowercase keys; current
