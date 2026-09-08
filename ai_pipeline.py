@@ -153,7 +153,27 @@ def call_deepinfra(prompt, retries=3, max_tokens=1000):
             _record_token_usage(resp.get("usage"))
             return text
 
-        if r.status_code == 429:
+        # DeepInfra proxies google/gemini-2.5-flash straight through to Google.
+        # When Google's own quota is exhausted, DeepInfra does NOT surface it as
+        # an HTTP 429 -- it wraps Google's "code": 429 / "Resource exhausted"
+        # error inside its OWN HTTP 500 response body. The `r.status_code == 429`
+        # branch below therefore never fired for the single most common failure
+        # mode in production: every one of these was falling into the generic
+        # "normal_attempt" path, which gives up after 3 tries with a 2-4 second
+        # backoff -- nowhere near long enough for a quota window to clear -- and
+        # returns None. summarise() then read that as a content failure ("empty"/
+        # "too_short"), burned its entire word-target retry ladder re-calling
+        # this same rate-limited API, and flagged the alert as undeliverable
+        # instead of just waiting out the quota and sending it. Detecting the
+        # wrapped error here routes it through the real rate-limit backoff.
+        is_wrapped_429 = (
+            r.status_code in (429, 500, 503)
+            and ('"code": 429' in r.text or '"code":429' in r.text
+                 or "resource exhausted" in r.text.lower()
+                 or "rate limit" in r.text.lower())
+        )
+
+        if is_wrapped_429:
             rate_limit_attempt += 1
             if rate_limit_attempt > MAX_RATE_LIMIT_RETRIES:
                 print(f"[DEEPINFRA] Rate limited (429) persisted after {MAX_RATE_LIMIT_RETRIES} extended waits -- giving up")
@@ -333,15 +353,23 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
 
     raw = generate_s1(company_name, raw_text, filing_type, sub_summary)
     summary = standardize_numbers(clean_summary(raw)) if raw else None
-    failure = classify_failure(summary, target)
+    failure = "api_unavailable" if raw is None else classify_failure(summary, target)
     attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
 
-    while failure and target < MAX_TARGET:
+    # "api_unavailable" (call_deepinfra returned None — DeepInfra/Gemini gave up
+    # after its own rate-limit backoff) is an infra failure, not a content
+    # failure. Escalating the word-target ladder and calling generate_s3 again
+    # immediately just re-hits the same exhausted quota one more time per rung,
+    # each paying that same backoff again, for a summary the content is not at
+    # fault for. Stop the ladder on the first "api_unavailable" and flag it —
+    # classify_failure's real length/quality checks still get their full ladder
+    # for actual content problems.
+    while failure and failure != "api_unavailable" and target < MAX_TARGET:
         target += TARGET_STEP
         print(f"[SUMMARY] Retry — previous failure: {failure}, new target: {target} words")
         raw = generate_s3(company_name, raw_text, target, filing_type)
         summary = standardize_numbers(clean_summary(raw)) if raw else None
-        failure = classify_failure(summary, target)
+        failure = "api_unavailable" if raw is None else classify_failure(summary, target)
         attempts_log.append({"attempt": len(attempts_log) + 1, "target": target, "words": count_words(summary), "failure": failure})
 
     if not failure:
