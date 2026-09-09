@@ -230,10 +230,11 @@ def save_alert(ticker, block):
         f"Price: ${block['price']:.2f}\n"
         f"Notional: {_fmt_notional(block['notional'])}\n"
         f"Time: {et}{fills_note}\n\n"
-        f"_A block of this size crossing the tape often signals institutional "
-        f"repositioning. US markets do not disclose counterparties — for the "
-        f"'who', watch for a 13F or SC 13D/G filing._\n"
-        f"_Source: Massive tick tape_"
+        f"A block of this size typically indicates institutional repositioning. "
+        f"US equity markets don't disclose trade counterparties in real time. "
+        f"For ownership details, monitor Form 13F (quarterly, 45-day lag) and "
+        f"Schedule 13D/G filings (5%+ stakes, filed within 4 business days).\n\n"
+        f"_Data: Massive tick tape_"
     )
 
     impact = "HIGH" if block["notional"] >= 10_000_000 else "MEDIUM"
