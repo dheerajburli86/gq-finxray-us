@@ -32,6 +32,7 @@ from Prompt_C1_ImpactClassification import get_prompt as impact_prompt
 from Prompt_S1N_NewsSummarization import get_prompt as s1n_prompt
 from Prompt_S1A_AnnouncementSummarization import get_prompt as s1a_prompt
 from Prompt_S1T_TranscriptSummarization import get_prompt as s1t_prompt
+from Prompt_S1F_Form4Insider import get_prompt as s1f_prompt
 from feature_map import resolve_feature
 
 
@@ -434,7 +435,7 @@ def classify_failure(summary, max_words, min_words=None):
     return None
 
 
-# ── S.1 — Primary summarisation (real S.1.N / S.1.A / S.1.T prompts) ─────────
+# ── S.1 — Primary summarisation (real S.1.N / S.1.A / S.1.T / S.1.F prompts) ───
 def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_words=None):
     min_words = MIN_WORDS if min_words is None else min_words
     if filing_type == "NEWS":
@@ -453,6 +454,12 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_word
     elif filing_type == "EARNINGS_TRANSCRIPT":
         prompt = s1t_prompt(company_name, sub_summary, raw_text[:TRANSCRIPT_CHAR_LIMIT],
                              target_word_count=STARTING_TARGET, min_word_count=min_words)
+    elif filing_type == "4":
+        # Form 4 (insider trading) is inherently brief: insider name, trade type,
+        # share count, price, date. Asking for 150 words is impossible and results
+        # in "empty" API failures. S.1.F asks for 20-30 words instead.
+        prompt = s1f_prompt(company_name, raw_text[:FILING_CHAR_LIMIT],
+                            target_word_count=30, min_word_count=min(15, min_words))
     else:
         prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
                              target_word_count=STARTING_TARGET, min_word_count=min_words)
@@ -496,16 +503,18 @@ Return only the summary. Nothing else."""
 
 # ── Flagged-for-review sink (replaces "best available" fallback) ─────────────
 def store_flagged_summary(filing_id, ticker, company_name, final_summary, failure_reason, attempts,
-                           source="SEC_EDGAR", filing_type=""):
+                           source="SEC_EDGAR", filing_type="", max_target_reached=None):
     try:
         fid, fname = resolve_feature(source, filing_type)
+        if max_target_reached is None:
+            max_target_reached = 60 if filing_type == "4" else MAX_TARGET
         supabase.table("flagged_summaries").insert({
             "filing_id": filing_id,
             "ticker": ticker,
             "company_name": company_name,
             "final_summary": final_summary,
             "final_word_count": count_words(final_summary) if final_summary else 0,
-            "max_target_reached": MAX_TARGET,
+            "max_target_reached": max_target_reached,
             "failure_reason": failure_reason,
             "attempts": attempts,
             "feature_id": fid,
@@ -521,14 +530,27 @@ def store_flagged_summary(filing_id, ticker, company_name, final_summary, failur
 # ── Master summarise — retry-until-valid, escalating word budget ─────────────
 def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=None, ticker=None, source="SEC_EDGAR"):
     """
-    Attempt 1: S.1.N / S.1.A / S.1.T prompt, target 75 words.
-    Each failure retries via S.3 with the ceiling raised by 5 words
-    (80, 85, 90, 95, 100), floor fixed at MIN_WORDS the whole time.
+    Attempt 1: S.1.N / S.1.A / S.1.T / S.1.F prompt, target varies by type.
+    For most filings: target 150 words, escalate by 10 up to 250.
+    For Form 4 (insider trading): target 30 words, escalate by 5 up to 60.
+
+    Each failure retries via S.3 with the ceiling raised, floor fixed at min_words.
     If still failing at MAX_TARGET, stop and flag for manual review —
     never discard silently, never send a summary that failed validation.
     """
     attempts_log = []
-    target = STARTING_TARGET
+
+    # Form 4 has different word targets (it's inherently brief)
+    if filing_type == "4":
+        starting_target = 30
+        target_step = 5
+        max_target = 60
+    else:
+        starting_target = STARTING_TARGET
+        target_step = TARGET_STEP
+        max_target = MAX_TARGET
+
+    target = starting_target
     min_words = effective_min_words(raw_text)
 
     def _evaluate(raw_response):
@@ -571,8 +593,8 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
     # fault for. Stop the ladder on the first "api_unavailable" and flag it —
     # classify_failure's real length/quality checks still get their full ladder
     # for actual content problems.
-    while failure and failure != "api_unavailable" and target < MAX_TARGET:
-        target += TARGET_STEP
+    while failure and failure != "api_unavailable" and target < max_target:
+        target += target_step
         print(f"[SUMMARY] Retry — previous failure: {failure}, new target: {target} words")
         raw = generate_s3(company_name, raw_text, target, filing_type,
                           min_words=min_words)
@@ -592,7 +614,8 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
         failure_reason=failure,
         attempts=attempts_log,
         source=source,
-        filing_type=filing_type
+        filing_type=filing_type,
+        max_target_reached=max_target
     )
     return None, len(attempts_log)
 
