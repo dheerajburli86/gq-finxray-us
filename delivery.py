@@ -458,8 +458,15 @@ def _past_retry_window(alert):
             created = created.replace(tzinfo=timezone.utc)
     except Exception:
         return True
-    age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600.0
-    return age_hours >= MAX_RETRY_AGE_HOURS
+    age_minutes = (datetime.now(timezone.utc) - created).total_seconds() / 60.0
+    # Bounded by the staleness sweep, not just by MAX_RETRY_AGE_HOURS. Once
+    # _expire_stale_alerts() retires undelivered alerts at MAX_ALERT_AGE_MINUTES
+    # (90m), nothing can survive in the queue to reach the 24h retry ceiling --
+    # so reading MAX_RETRY_AGE_HOURS alone would tell you transient failures get
+    # a day of retries when they actually get 90 minutes. Take whichever is
+    # tighter so the two windows agree by construction.
+    limit_minutes = min(MAX_RETRY_AGE_HOURS * 60.0, MAX_ALERT_AGE_MINUTES)
+    return age_minutes >= limit_minutes
 
 
 def _log_payload(alert):

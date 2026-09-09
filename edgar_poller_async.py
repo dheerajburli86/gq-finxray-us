@@ -96,8 +96,15 @@ async def load_cik_map_async():
 
 
 def load_cik_map():
-    """Sync entry point, kept for main.py."""
-    asyncio.run(load_cik_map_async())
+    """
+    Sync entry point, kept for main.py.
+
+    Goes through the same session cleanup as every other poll. Calling
+    asyncio.run() directly here left the HTTP session this download opened
+    bound to a loop that was then closed, so it was never closed itself --
+    aiohttp reports that as an unclosed-connector warning at startup.
+    """
+    asyncio.run(_with_session_cleanup(load_cik_map_async()))
 
 
 def ticker_from_cik(cik: str) -> str:

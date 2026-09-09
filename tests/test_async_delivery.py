@@ -118,7 +118,11 @@ async def run():
     # would take >= 0.10s beyond the per-send latency. Concurrent fan-out
     # across the 3 distinct chats should land well under that.
     assert len(SEND_LOG) == 3, f"expected 3 sends, got {len(SEND_LOG)}"
-    assert elapsed < 0.08, f"fan-out took {elapsed:.3f}s — sends are not concurrent"
+    # Serial would be >= 3 * PER_CHAT_GAP_SECONDS (0.15s) plus per-send
+    # latency; concurrent measures ~0.06s. 0.10 sits clearly between the two,
+    # far enough from the observed value to not flake on a loaded machine while
+    # still failing outright if the sends ever go back to being serialized.
+    assert elapsed < 0.10, f"fan-out took {elapsed:.3f}s — sends are not concurrent"
 
     upserts = fake_supabase.db.get("payload_log_upserts", [])
     print(f"payload_log upserts: {len(upserts)} (expected 1 — only a2 carries a structured_payload)")
