@@ -1,8 +1,11 @@
 import os
 import json
 import re
+import threading
 import time
 import requests
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime, timezone
@@ -56,57 +59,112 @@ NEWS_CHAR_LIMIT = 6000
 
 
 # ── Token usage tracking (per filing currently being processed) ──────────────
-# process_filing() runs one filing at a time on a single thread (run_pipeline's
-# for-loop), so a simple module-level accumulator is safe -- reset it at the
-# start of each filing, read it back once at the end to get the TOTAL tokens
-# spent across every DeepInfra call that filing needed (gibberish check,
-# relevance check, every S.1/S.3 summarization attempt, V.1 validation,
-# impact classification, similarity checks) -- not just the final successful
+# Reset at the start of each filing, read back once at the end to get the TOTAL
+# tokens spent across every DeepInfra call that filing needed (gibberish check,
+# relevance check, every S.1/S.3 summarization attempt, V.1 validation, impact
+# classification, similarity checks) -- not just the final successful
 # summarization call, since that's the true per-alert cost.
-_token_usage = {"input": 0, "output": 0, "calls": 0}
+#
+# THREAD-LOCAL, not a plain module global: run_pipeline() now processes several
+# filings concurrently, so a shared accumulator would interleave their counts
+# and attribute one filing's tokens to whichever filing happened to finish
+# next. Each worker thread keeps its own bucket, so per-alert cost stays exact.
+_token_usage_local = threading.local()
+
+
+def _usage_bucket():
+    bucket = getattr(_token_usage_local, "bucket", None)
+    if bucket is None:
+        bucket = {"input": 0, "output": 0, "calls": 0}
+        _token_usage_local.bucket = bucket
+    return bucket
 
 
 def _reset_token_usage():
-    _token_usage["input"] = 0
-    _token_usage["output"] = 0
-    _token_usage["calls"] = 0
+    _token_usage_local.bucket = {"input": 0, "output": 0, "calls": 0}
 
 
 def _record_token_usage(usage):
     if not usage:
         return
-    _token_usage["input"] += usage.get("prompt_tokens", 0) or 0
-    _token_usage["output"] += usage.get("completion_tokens", 0) or 0
-    _token_usage["calls"] += 1
+    bucket = _usage_bucket()
+    bucket["input"] += usage.get("prompt_tokens", 0) or 0
+    bucket["output"] += usage.get("completion_tokens", 0) or 0
+    bucket["calls"] += 1
 
 
 def get_token_usage():
     """Snapshot of accumulated tokens since the last _reset_token_usage()."""
-    return dict(_token_usage)
+    return dict(_usage_bucket())
 
 
-# ── DeepInfra caller ─────────────────────────────────────────────────────────
-# Rate-limit pacing: this pipeline calls DeepInfra one at a time on a single
-# thread (see process_filing() below) -- there's no concurrency to cap, so a
-# semaphore wouldn't change anything here. What actually trips DeepInfra's
-# 429 "Resource exhausted" on bursty days (several earnings calls / big news
-# landing close together) is requests arriving too close together in time,
-# which is a pacing problem, not a concurrency problem. MIN_CALL_GAP_SECONDS
-# forces a minimum gap between consecutive DeepInfra calls so normal
-# operation doesn't creep up on the ceiling in the first place.
-MIN_CALL_GAP_SECONDS = 2.0
+# ── DeepInfra concurrency + rate limiting ────────────────────────────────────
+# Two different limits, enforced by two different mechanisms. Conflating them
+# is what left the old fixed 2-second gap unable to prevent 429s:
+#
+#   1. CONCURRENCY (the semaphore). Filings are now summarized in parallel, and
+#      the scheduler's own worker pool can start an AI-backed job at any time,
+#      so N threads can reach this function at once. The semaphore caps how
+#      many DeepInfra requests are ever in flight together — the ceiling the
+#      old single-threaded design got for free and then lost.
+#
+#   2. THROUGHPUT (the sliding window). Gemini's quota is requests-per-minute,
+#      not requests-in-flight. Four concurrent workers each pacing themselves
+#      2 seconds apart still issue 120 requests/minute between them. The window
+#      below counts the calls actually issued in the last 60 seconds across all
+#      threads and blocks the next one until issuing it stays under LLM_RPM,
+#      which is the limit the API actually enforces.
+#
+# Plus a shared cooldown: when any thread does get rate limited, every other
+# thread waits out that same window instead of piling straight back into the
+# exhausted quota and turning one 429 into N.
+LLM_CONCURRENCY = int(os.getenv("GQ_LLM_CONCURRENCY", "4"))
+LLM_RPM = int(os.getenv("GQ_LLM_RPM", "55"))
 MAX_RATE_LIMIT_RETRIES = 5
-_last_call_at = [0.0]
+
+_llm_semaphore = threading.BoundedSemaphore(LLM_CONCURRENCY)
+_rate_lock = threading.Lock()
+_call_window = deque()      # monotonic timestamps of recently issued calls
+_cooldown_until = [0.0]     # global "everybody wait" deadline, set on a 429
 
 
-def _pace_before_call():
-    elapsed = time.monotonic() - _last_call_at[0]
-    if elapsed < MIN_CALL_GAP_SECONDS:
-        time.sleep(MIN_CALL_GAP_SECONDS - elapsed)
+def _set_cooldown(seconds):
+    """Make every thread wait out a rate-limit window one thread just hit."""
+    with _rate_lock:
+        _cooldown_until[0] = max(_cooldown_until[0], time.monotonic() + seconds)
+
+
+def _acquire_call_slot():
+    """
+    Block until issuing one more call keeps us under LLM_RPM for the trailing
+    60 seconds, and until any global cooldown has expired.
+    """
+    while True:
+        with _rate_lock:
+            now = time.monotonic()
+
+            cooldown_left = _cooldown_until[0] - now
+            if cooldown_left > 0:
+                wait = cooldown_left
+            else:
+                while _call_window and (now - _call_window[0]) >= 60.0:
+                    _call_window.popleft()
+                if len(_call_window) < LLM_RPM:
+                    _call_window.append(now)
+                    return
+                # Oldest call in the window falls out at +60s; that is the
+                # earliest moment another call can be issued.
+                wait = 60.0 - (now - _call_window[0]) + 0.05
+
+        time.sleep(min(max(wait, 0.05), 5.0))
 
 
 def call_deepinfra(prompt, retries=3, max_tokens=1000):
     """Call DeepInfra API with Gemini 2.5 Flash.
+
+    Every call passes through the semaphore (at most LLM_CONCURRENCY in
+    flight) and the sliding window (at most LLM_RPM issued per rolling
+    minute), so parallel filing processing cannot outrun the quota.
 
     A 429 is treated separately from every other failure. It means "you're
     inside a rate-limit window right now," which is recoverable by waiting
@@ -114,9 +172,15 @@ def call_deepinfra(prompt, retries=3, max_tokens=1000):
     backoff below is meant for transient network blips, not a per-minute
     quota, so it's nowhere near long enough to let a 429 clear. A 429 gets
     its own longer, capped wait (honoring a Retry-After header if DeepInfra
-    sends one) and its own retry budget (MAX_RATE_LIMIT_RETRIES), instead of
-    burning through the same few attempts meant for real errors.
+    sends one), its own retry budget (MAX_RATE_LIMIT_RETRIES), and it parks
+    every other thread behind the same cooldown.
     """
+    with _llm_semaphore:
+        return _call_deepinfra_locked(prompt, retries, max_tokens)
+
+
+def _call_deepinfra_locked(prompt, retries, max_tokens):
+    """The request loop itself. Only ever runs with a semaphore slot held."""
     headers = {
         "Authorization": f"Bearer {DEEPINFRA_API_KEY}",
         "Content-Type": "application/json"
@@ -131,19 +195,16 @@ def call_deepinfra(prompt, retries=3, max_tokens=1000):
     rate_limit_attempt = 0
 
     while True:
-        _pace_before_call()
+        _acquire_call_slot()
         try:
             r = requests.post(DEEPINFRA_URL, headers=headers, json=payload, timeout=30)
         except Exception as e:
-            _last_call_at[0] = time.monotonic()
             normal_attempt += 1
             print(f"[DEEPINFRA] Attempt {normal_attempt} error: {e}")
             if normal_attempt >= retries:
                 return None
             time.sleep(2 ** normal_attempt)
             continue
-
-        _last_call_at[0] = time.monotonic()
 
         if r.status_code == 200:
             resp = r.json()
@@ -181,6 +242,10 @@ def call_deepinfra(prompt, retries=3, max_tokens=1000):
             retry_after = r.headers.get("Retry-After")
             wait = float(retry_after) if retry_after and retry_after.isdigit() else min(15 * rate_limit_attempt, 60)
             print(f"[DEEPINFRA] Rate limited (429) -- waiting {wait:.0f}s before retry {rate_limit_attempt}/{MAX_RATE_LIMIT_RETRIES}")
+            # Park every other worker behind the same window. Without this the
+            # other threads keep firing into an already-exhausted quota while
+            # this one backs off, so one 429 immediately becomes N.
+            _set_cooldown(wait)
             time.sleep(wait)
             continue
 
@@ -622,10 +687,28 @@ def run_pipeline():
             print("No PENDING filings found.")
             return 0
 
-        print(f"Found {len(filings)} PENDING filings -- processing...")
-        for filing in filings:
-            process_filing(filing)
-            time.sleep(1)
+        print(f"Found {len(filings)} PENDING filings -- processing "
+              f"({LLM_CONCURRENCY} at a time)...")
+
+        # Filings are independent of each other, and each one spends nearly all
+        # its wall-clock time waiting on DeepInfra. Processing them one after
+        # another (plus a 1s sleep between each) meant a batch of 10 took the
+        # sum of all ten round-trips before ANY of their alerts reached the
+        # delivery queue -- the single largest remaining source of alert
+        # latency. They now overlap, bounded by the same semaphore and RPM
+        # window that protect the API, so throughput goes up without the call
+        # rate going up.
+        def _run_one(filing):
+            try:
+                process_filing(filing)
+            except Exception as e:
+                # One bad filing must not sink the rest of the batch.
+                print(f"[ERROR] Filing {filing.get('id')} "
+                      f"({filing.get('ticker', 'UNKNOWN')}) failed: {e}")
+
+        with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY,
+                                thread_name_prefix="pipeline") as pool:
+            list(pool.map(_run_one, filings))
 
         # Returned so the caller can drain a backlog back-to-back instead of
         # sleeping between batches. A full page means there is very likely more
