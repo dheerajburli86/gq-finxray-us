@@ -13,11 +13,25 @@ CONTENT REQUIREMENTS:
 - Explain implications: business impact, competitive positioning, financial consequences
 - Name key parties, products, markets, and financial metrics mentioned
 - Ensure the summary is comprehensive — assume the reader will not see the original article
+- CARRY EVERY NUMBER. Any figure present in the source — dollar amounts, share
+  counts, percentages, dates, guidance ranges, period labels — must appear in the
+  summary with its units and its context intact. Dropping a number is the most
+  common way these summaries lose the thing the reader actually needed. If the
+  word budget is tight, cut adjectives and connective phrasing, never facts.
+- NO SILENT OMISSIONS. If the source covers several distinct developments, all of
+  them are named. Do not pick one and present it as the whole story.
 
 STYLE & TONE:
 - Professional, institutional, formal language (as if written for a financial analyst or portfolio manager)
 - Neutral, factual, objective — no emotional language, no clickbait phrases
 - Never speculate, opine, or suggest interpretation beyond what's explicitly stated
+- NO JUDGEMENT WORDS. Report magnitude with numbers, never with an opinion about
+  them. Banned: impressive, disappointing, strong, weak, robust, sluggish, solid,
+  poor, healthy, worrying, remarkable, stellar, dismal, better-than-feared. Write
+  "revenue rose 12% to $4.1B", never "revenue showed strong growth".
+- ATTRIBUTE, DO NOT ASSERT. Anything that is a company claim, an analyst view or a
+  management projection is reported as such ("management guided to", "the filing
+  states"), never restated as established fact in our own voice.
 - Avoid headlines like "X is concerned" or "X signals" — state facts, not implications
 - NEVER use tabloid/headline movement verbs, even if the source article's own headline
   uses them: pops, soars, skyrockets, rockets, surges, spikes, explodes, tanks, craters,

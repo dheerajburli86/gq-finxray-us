@@ -10,7 +10,7 @@ This poller never touches Telegram.
 
 THE HARD PART: CHANGE vs RESTATEMENT
 ------------------------------------
-FMP's consensus endpoints return the *current* state of street coverage, not an
+FMP's consensus endpoints return the current state of street coverage, not an
 event feed. Polling them every two hours and alerting on whatever comes back
 would send the same "consensus is Buy, target $214" message twelve times a day.
 
@@ -22,7 +22,7 @@ for that ticker and emits only when something actually moved:
 
 The 5% floor exists because the consensus target drifts by a few tenths of a
 percent whenever any one of thirty analysts refreshes a model. That is not news.
-A 5% move in the *average* of the whole street requires either several revisions
+A 5% move in the average of the whole street requires either several revisions
 or one large one, which is.
 
 FIRST OBSERVATION OF A TICKER

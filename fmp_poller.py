@@ -1,18 +1,16 @@
 """
 fmp_poller.py
-GQ FinXray US — replaces eodhd_poller.py.
+GQ FinXray US — FMP poller.
 
 Covers Features 2 (Company & Sector News), 4 (Earnings Calendar Heads-Up),
-and 5 (Insider Transactions & Large Deals) on FMP instead of EODHD.
+and 5 (Insider Transactions & Large Deals), sourced from FMP.
 
-Mechanical differences from the old EODHD version, worth knowing:
-  - EODHD tagged articles with a sector via `tags`; FMP's stock-news/general-news
-    endpoints don't carry that same sector taxonomy, so per-ticker news stays
-    ticker-tagged and the broad sweep is stored as sector="MARKET" (detection-
-    by-keyword, same approach news_poller.py already uses for its RSS sources,
-    could be layered on here later if sector-tagged alerts turn out to matter).
+Notes:
+  - News is ticker-scoped only. The broad general-news sweep was removed: it had
+    no company to route on, so every article it produced was summarised at full
+    LLM cost and then dropped at delivery.
   - Earnings calendar: FMP's /stable/earnings-calendar returns date + epsEstimated
-    but not a before/after-market flag as cleanly as EODHD did; falls back to
+    but not a reliable before/after-market flag; falls back to
     "Market Hours" when absent rather than guessing.
   - Insider transactions: FMP's transactionType is a compact code like
     "S-Sale" / "P-Purchase" — parsed accordingly.
@@ -21,6 +19,7 @@ Mechanical differences from the old EODHD version, worth knowing:
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -31,6 +30,8 @@ from feature_map import tag_extra
 load_dotenv()
 
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+
+ET = ZoneInfo("America/New_York")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -206,24 +207,6 @@ def poll_ticker_news(tickers):
     return total
 
 
-# ── 2. Broad market news sweep (replaces EODHD sector news) ──────────────────
-def poll_market_news():
-    total = 0
-    articles = fmp_client.get_general_news(limit=25)
-    for article in articles:
-        url = article.get("url", "")
-        if not url or news_already_stored(url):
-            continue
-        title = article.get("title", "")
-        content = article.get("text", "") or article.get("content", "")
-        published_at = article.get("publishedDate", datetime.now(timezone.utc).isoformat())
-        source = article.get("site", "FMP")
-        store_news("MARKET", title, content, url, published_at, source, sector="MARKET")
-        total += 1
-        time.sleep(0.05)
-    return total
-
-
 # ── 3. Earnings calendar ───────────────────────────────────────────────────────
 def poll_earnings_calendar(tickers):
     """Feature 4 — 24h-ahead earnings heads-up.
@@ -253,8 +236,11 @@ def poll_earnings_calendar(tickers):
     if not tickers:
         return 0
 
-    # US market dates, not UTC dates.
-    et_now = datetime.now(timezone.utc) - timedelta(hours=5)
+    # US market dates, not UTC dates. This was `utcnow() - timedelta(hours=5)`,
+    # a hardcoded EST offset that is wrong by an hour for the ~8 months a year
+    # the US is on EDT, despite the docstring above claiming it was anchored to
+    # Eastern. ZoneInfo handles the DST transition itself.
+    et_now = datetime.now(ET)
     tomorrow = (et_now + timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Query exactly the day we care about.
@@ -385,14 +371,14 @@ def poll_insider_transactions(tickers):
                 qualifies = market_cap is not None and market_cap >= BULK_DEAL_MIN_MARKET_CAP
                 if qualifies and not bulk_deal_already_sent(ticker, insider_name, txn_date):
                     bulk_summary = (
-                        f"{action_emoji} *Bulk Deal Alert — ${ticker}*\n\n"
-                        f"*Insider:* {insider_name} ({role})\n"
-                        f"*Action:* {action}\n"
-                        f"*Shares:* {shares_str}\n"
-                        f"*Price:* {price_str}\n"
-                        f"*Total Value:* {value_str}\n"
-                        f"*Date:* {txn_date}\n"
-                        f"_Source: FMP Insider Trading | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
+                        f"{action_emoji} Bulk Deal Alert — {ticker}\n\n"
+                        f"Insider: {insider_name} ({role})\n"
+                        f"Action: {action}\n"
+                        f"Shares: {shares_str}\n"
+                        f"Price: {price_str}\n"
+                        f"Total Value: {value_str}\n"
+                        f"Date: {txn_date}\n"
+                        f"Source: FMP Insider Trading"
                     )
                     # Form 4 -> accession -> EDGAR, the pattern FMP recommends.
                     # Returns None when the Form 4 hasn't landed on EDGAR yet;
@@ -417,12 +403,25 @@ def poll_insider_transactions(tickers):
 
 # ── Master poll functions (same entry points main.py already imports) ────────
 def poll_fmp_news():
-    """Kept name for drop-in compatibility with main.py's scheduler wiring."""
+    """Kept name for drop-in compatibility with main.py's scheduler wiring.
+
+    THE BROAD SWEEP IS GONE, deliberately. poll_market_news() filed 25 general
+    articles under ticker="MARKET" every cycle. Each one ran the full AI pipeline
+    -- gibberish, relevance, S.1 (plus any S.3 retries), V.1, impact, dedup, so
+    5-8 DeepInfra calls apiece -- and then every single one was dropped at
+    delivery, because a general news article has no company to watchlist-route on
+    and company news is never broadcast. That was ~150-200 LLM calls per cycle
+    spent on content that structurally could not reach a user, and it was the
+    single largest consumer of both the daily call budget and the pipeline queue
+    that SEC filings had to wait behind.
+
+    Ticker news is unaffected: it carries a real symbol, routes on the watchlist,
+    and is what Feature 2 actually delivers.
+    """
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] FMP — Polling news...")
     tickers = get_watched_tickers()
     ticker_count = poll_ticker_news(tickers)
-    market_count = poll_market_news()
-    print(f"[FMP NEWS] Ticker articles: {ticker_count} | Market sweep: {market_count}")
+    print(f"[FMP NEWS] Ticker articles stored: {ticker_count}")
 
 
 def poll_fmp_events():
@@ -434,10 +433,6 @@ def poll_fmp_events():
     print(f"[FMP EVENTS] Earnings alerts: {earnings_count} | Insider transactions: {insider_count}")
 
 
-def run_fmp_poller():
-    poll_eodhd_news()
-    poll_eodhd_events()
-
-
 if __name__ == "__main__":
-    run_fmp_poller()
+    poll_fmp_news()
+    poll_fmp_events()

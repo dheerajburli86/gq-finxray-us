@@ -1,6 +1,6 @@
 """
 earnings_transcript_poller.py
-GQ FinXray US — Feature 11 (NEW). Earnings call transcripts.
+GQ FinXray US — Feature 10. Earnings call transcripts.
 
 Earnings call transcripts come from FMP (confirmed available at
 any tier — see AAPL_Finnhub_Complete_Report*.pdf in the project) and the
@@ -26,7 +26,7 @@ result_snapshot.py since it rides the same 10-Q/10-K trigger.
 import os
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -52,9 +52,11 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 # available transcript" instead of the exact quarter.
 FILING_LAG_DAYS = 40
 
+# How far back a 10-Q/10-K can be and still be worth checking for a transcript.
+TRIGGER_LOOKBACK_DAYS = int(os.getenv("GQ_TRANSCRIPT_LOOKBACK_DAYS", "21"))
+
 
 def _guess_period(filed_dt):
-    from datetime import timedelta
     period_end_estimate = filed_dt - timedelta(days=FILING_LAG_DAYS)
     quarter = max(1, min(4, ((period_end_estimate.month - 1) // 3) + 1))
     return period_end_estimate.year, quarter
@@ -194,16 +196,25 @@ def find_recent_10q_10k(watchlist_set):
     filtering to the watchlist here avoids spending that specifically
     expensive quota on companies nobody is actually following.
     """
+    if not watchlist_set:
+        return []
+    # BOUNDED WINDOW. This had no time filter at all: it took the 100 most recent
+    # 10-Q/10-K rows ever recorded and re-checked the same ~25 watchlisted ones
+    # every 30 minutes, forever. transcript_already_fetched() stopped duplicate
+    # STORES, but only after get_best_transcript() had already spent a
+    # transcripts-dates lookup per ticker against FMP's Ultimate tier — the most
+    # expensive quota in the stack — to learn nothing. A transcript that has not
+    # appeared within a few weeks of the filing is not going to.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=TRIGGER_LOOKBACK_DAYS)).isoformat()
     try:
         result = supabase.table("raw_filings") \
             .select("ticker, company_name, filing_type, filed_at") \
             .in_("filing_type", ["10-Q", "10-K"]) \
+            .gte("filed_at", cutoff) \
             .order("filed_at", desc=True) \
             .limit(100) \
             .execute()
         rows = result.data or []
-        if not watchlist_set:
-            return []
         return [r for r in rows if r.get("ticker") in watchlist_set][:25]
     except Exception as e:
         logger.error(f"[TRANSCRIPT] Failed to query recent 10-Q/10-K filings: {e}")

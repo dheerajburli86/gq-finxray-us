@@ -58,8 +58,14 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 ET = ZoneInfo("America/New_York")
 
-SOURCE = "MACRO_ROUNDUP"
-FILING_TYPE = "MACRO_BRIEFING"
+# Distinct from macro_policy_roundup.py, which also writes ticker="MARKET" rows
+# for Feature 12. Both used SOURCE="MACRO_ROUNDUP"/FILING_TYPE="MACRO_BRIEFING",
+# and that module's "already sent today" check keys on exactly that triple — so
+# whichever of the two ran first each day silently suppressed the other. Both
+# names are already registered to Feature 12 in feature_map, so the footer and
+# mute behaviour are unchanged.
+SOURCE = "MARKET_REPORT"
+FILING_TYPE = "MARKET_REPORT"
 
 INDICES = [
     ("^GSPC", "S&P 500", "SPY"),

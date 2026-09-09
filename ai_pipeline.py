@@ -33,7 +33,7 @@ from Prompt_S1N_NewsSummarization import get_prompt as s1n_prompt
 from Prompt_S1A_AnnouncementSummarization import get_prompt as s1a_prompt
 from Prompt_S1T_TranscriptSummarization import get_prompt as s1t_prompt
 from Prompt_S1F_Form4Insider import get_prompt as s1f_prompt
-from feature_map import resolve_feature
+from feature_map import resolve_feature, TOTAL_FEATURES
 
 
 # ── Word-count escalation ladder ──────────────────────────────────────────────
@@ -441,6 +441,41 @@ def effective_min_words(raw_text):
     return MIN_WORDS
 
 
+# Filing types whose source material is a handful of structured facts -- an
+# insider's name, a trade direction, a share count, a price, a date. There is no
+# honest 150-word summary of that, so they get their own short ladder.
+SHORT_FORM_TYPES = {"4", "INSIDER_FMP"}
+
+
+def ladder_for(filing_type, raw_text):
+    """
+    (starting_target, step, max_target, min_words) for this filing type.
+
+    THE BUG THIS FIXES. Form 4 ran a 30 -> 60 word ladder while min_words came
+    from effective_min_words(), which returns 35 / 50 / 70 purely by source
+    length. Those two were never reconciled, so:
+
+        raw_text  300 chars -> floor 35 vs ceiling 30 on attempt 1  -> always fails
+        raw_text 2000 chars -> floor 70 vs ceiling 60 at EVERY rung -> impossible
+
+    classify_failure() demands `min_words <= wc <= max_words`, so a floor above
+    the ceiling cannot be satisfied by any output. Every Form 4 burned the full
+    six-call ladder and then landed in flagged_summaries -- which is why SEC
+    Form 4, the fastest insider source in the stack, produced no alerts at all
+    while FMP's 90-minute-old copy did.
+
+    The floor is now clamped strictly below the starting ceiling, so rung 1 is
+    always satisfiable and the ladder means what it says.
+    """
+    if filing_type in SHORT_FORM_TYPES:
+        start, step, max_target = 30, 10, 70
+    else:
+        start, step, max_target = STARTING_TARGET, TARGET_STEP, MAX_TARGET
+
+    min_words = min(effective_min_words(raw_text), start - 10)
+    return start, step, max_target, max(min_words, 12)
+
+
 def classify_failure(summary, max_words, min_words=None):
     """Returns the failure reason for this attempt, or None if it passes."""
     min_words = MIN_WORDS if min_words is None else min_words
@@ -463,8 +498,10 @@ def classify_failure(summary, max_words, min_words=None):
 
 
 # ── S.1 — Primary summarisation (real S.1.N / S.1.A / S.1.T / S.1.F prompts) ───
-def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_words=None):
+def generate_s1(company_name, raw_text, filing_type="", sub_summary="",
+                min_words=None, target=None):
     min_words = MIN_WORDS if min_words is None else min_words
+    target = STARTING_TARGET if target is None else target
     if filing_type == "NEWS":
         # These two arguments were omitted, so S.1.N fell back to its own
         # defaults -- target 120 words, floor 100 -- while classify_failure
@@ -477,19 +514,23 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_word
         # of the "FLAGGED, NOT SENT" traffic. S.1.A and S.1.T always passed
         # these correctly; only this branch did not.
         prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT],
-                            target_word_count=STARTING_TARGET, min_word_count=min_words)
+                            target_word_count=target, min_word_count=min_words)
     elif filing_type == "EARNINGS_TRANSCRIPT":
         prompt = s1t_prompt(company_name, sub_summary, raw_text[:TRANSCRIPT_CHAR_LIMIT],
-                             target_word_count=STARTING_TARGET, min_word_count=min_words)
-    elif filing_type == "4":
-        # Form 4 (insider trading) is inherently brief: insider name, trade type,
-        # share count, price, date. Asking for 150 words is impossible and results
-        # in "empty" API failures. S.1.F asks for 20-30 words instead.
+                             target_word_count=target, min_word_count=min_words)
+    elif filing_type in SHORT_FORM_TYPES:
+        # Form 4 (SEC) and INSIDER_FMP (vendor mirror of the same event) are both
+        # inherently brief: insider name, trade type, share count, price, date.
+        # Asking for 150 words produces padding or an empty response. S.1.F asks
+        # for a tight factual extraction instead, and is now given the SAME
+        # target/floor the quality gate will actually judge it against -- the
+        # prompt used to hardcode 30/15 while the gate demanded up to 70, so the
+        # model was being told to write something guaranteed to be rejected.
         prompt = s1f_prompt(company_name, raw_text[:FILING_CHAR_LIMIT],
-                            target_word_count=30, min_word_count=min(15, min_words))
+                            target_word_count=target, min_word_count=min_words)
     else:
         prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
-                             target_word_count=STARTING_TARGET, min_word_count=min_words)
+                             target_word_count=target, min_word_count=min_words)
     return call_deepinfra(prompt, max_tokens=600)
 
 
@@ -500,6 +541,8 @@ def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=
         char_limit = TRANSCRIPT_CHAR_LIMIT
     elif filing_type in ("NEWS", ""):
         char_limit = NEWS_CHAR_LIMIT
+    elif filing_type in SHORT_FORM_TYPES:
+        char_limit = FILING_CHAR_LIMIT
     else:
         # Was falling through to NEWS_CHAR_LIMIT (6000) for every SEC filing type
         # and Form 4 -- filings can legitimately need more source text than a
@@ -548,7 +591,7 @@ def store_flagged_summary(filing_id, ticker, company_name, final_summary, failur
     try:
         fid, fname = resolve_feature(source, filing_type)
         if max_target_reached is None:
-            max_target_reached = 60 if filing_type == "4" else MAX_TARGET
+            max_target_reached = ladder_for(filing_type, "")[2]
         supabase.table("flagged_summaries").insert({
             "filing_id": filing_id,
             "ticker": ticker,
@@ -563,7 +606,7 @@ def store_flagged_summary(filing_id, ticker, company_name, final_summary, failur
             "source": source,
             "filing_type": filing_type
         }).execute()
-        print(f"[FLAGGED] {ticker} sent to review queue after exhausting retries ({failure_reason}) — Feature {fid}/11 {fname}")
+        print(f"[FLAGGED] {ticker} sent to review queue after exhausting retries ({failure_reason}) — Feature {fid}/{TOTAL_FEATURES} {fname}")
     except Exception as e:
         print(f"[ERROR] Failed to store flagged summary: {e}")
 
@@ -581,18 +624,8 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
     """
     attempts_log = []
 
-    # Form 4 has different word targets (it's inherently brief)
-    if filing_type == "4":
-        starting_target = 30
-        target_step = 5
-        max_target = 60
-    else:
-        starting_target = STARTING_TARGET
-        target_step = TARGET_STEP
-        max_target = MAX_TARGET
-
+    starting_target, target_step, max_target, min_words = ladder_for(filing_type, raw_text)
     target = starting_target
-    min_words = effective_min_words(raw_text)
 
     def _evaluate(raw_response):
         """
@@ -622,7 +655,7 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
         return text, verdict
 
     raw = generate_s1(company_name, raw_text, filing_type, sub_summary,
-                      min_words=min_words)
+                      min_words=min_words, target=target)
     summary, failure = _evaluate(raw)
     attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
 
@@ -885,11 +918,11 @@ def process_filing(filing):
         # so V.1 "correcting" a valid short summary flagged it as
         # v1_correction_too_short and the alert was lost after passing every
         # earlier gate. The rhetorical trim applies here too.
-        min_words = effective_min_words(raw_text)
-        failure = classify_failure(corrected, MAX_TARGET, min_words)
+        _, _, v1_ceiling, min_words = ladder_for(filing_type, raw_text)
+        failure = classify_failure(corrected, v1_ceiling, min_words)
         if failure and corrected.strip().endswith(("?", "!")):
             trimmed = strip_rhetorical_ending(corrected)
-            if trimmed and classify_failure(trimmed, MAX_TARGET, min_words) is None:
+            if trimmed and classify_failure(trimmed, v1_ceiling, min_words) is None:
                 corrected, failure = trimmed, None
         if failure:
             print(f"[FLAGGED] V.1-corrected summary still fails ({failure}) -- {ticker}")
@@ -1024,6 +1057,63 @@ def expire_stale_filings(force=False):
     return total
 
 
+# ── Queue priority ────────────────────────────────────────────────────────────
+# THE LATENCY BUG THIS FIXES. main.py gives SEC EDGAR a dedicated thread pool and
+# a 15-second cadence so a filing is captured seconds after publication -- and
+# then the pipeline threw that away, because it read the queue ordered ONLY by
+# created_at. News is by far the highest-volume source (10 articles x 25 tickers
+# every 15 minutes from FMP, plus 19 RSS feeds every 60s), so an 8-K routinely
+# queued behind dozens of news rows inserted moments after it and waited several
+# batches -- minutes -- for a summary. Prioritising in the poller and then
+# ignoring it here meant the SEC lane bought nothing end to end.
+#
+# Filings from the primary source now jump the queue. News still drains, it just
+# no longer sits in front of a material event the company filed itself.
+PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT"]
+PRIORITY_FILING_TYPES = ["8-K", "10-Q", "10-K", "4", "EARNINGS_TRANSCRIPT", "INSIDER_FMP"]
+PIPELINE_BATCH_SIZE = int(os.getenv("GQ_PIPELINE_BATCH_SIZE", "12"))
+
+
+def _fetch_prioritised_batch(limit):
+    """
+    One batch, SEC/primary-source filings first, then everything else newest-first.
+
+    Two queries rather than one so the ordering is explicit and cheap: PostgREST
+    cannot express "sort by a source allowlist" in a single indexed order clause
+    without a computed column.
+    """
+    def _q(builder):
+        try:
+            return builder.execute().data or []
+        except Exception as e:
+            print(f"[PIPELINE] Queue read failed: {e}")
+            return []
+
+    priority = _q(supabase.table("raw_filings")
+                  .select("*")
+                  .eq("status", "PENDING")
+                  .in_("source", PRIORITY_SOURCES)
+                  .order("created_at", desc=True)
+                  .limit(limit))
+
+    if len(priority) >= limit:
+        return priority[:limit]
+
+    seen = {r["id"] for r in priority}
+    # NEWEST FIRST for the remainder. Strict FIFO put fresh content BEHIND stale
+    # content, so a backlog larger than one batch meant the newest item could not
+    # be reached until the whole backlog cleared. The stale tail is expired by
+    # expire_stale_filings() above rather than being allowed to block the head.
+    rest = _q(supabase.table("raw_filings")
+              .select("*")
+              .eq("status", "PENDING")
+              .not_.in_("source", PRIORITY_SOURCES)
+              .order("created_at", desc=True)
+              .limit(limit - len(priority)))
+
+    return priority + [r for r in rest if r["id"] not in seen]
+
+
 # ── Main pipeline runner ──────────────────────────────────────────────────────
 def run_pipeline():
     mode = f"AI (DeepInfra - {DEEPINFRA_MODEL})"
@@ -1060,14 +1150,7 @@ def run_pipeline():
         # news that broke seconds ago. Freshness is the product, so the queue
         # is now LIFO and the stale tail is expired above rather than
         # blocking the head.
-        result = supabase.table("raw_filings") \
-            .select("*") \
-            .eq("status", "PENDING") \
-            .order("created_at", desc=True) \
-            .limit(10) \
-            .execute()
-
-        filings = result.data
+        filings = _fetch_prioritised_batch(PIPELINE_BATCH_SIZE)
         if not filings:
             if verbose_idle:
                 print("No PENDING filings found.")

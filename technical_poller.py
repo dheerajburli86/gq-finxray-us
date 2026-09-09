@@ -9,7 +9,7 @@ WHAT WAS WRONG WITH THE PREVIOUS VERSION (14 alerts produced, ever)
    6,353-name universe that is ~31,500 calls every 30 minutes, so in practice
    the run died on rate limits long before it finished and the alerts that did
    land were whatever happened to complete first.
-2. The volume-spike test divided *partial intraday* volume by a *full prior
+2. The volume-spike test divided partial intraday volume by a *full prior
    session* volume. At 10:00 ET a stock has ~13% of a day's volume on the tape,
    so the 2.0x threshold was unreachable until roughly 15:00 no matter how
    extreme the activity actually was.
@@ -33,7 +33,7 @@ THE REARCHITECTURE
 * 52-week high/low comes from `fmp_client.get_quotes()` (yearHigh/yearLow), and
   the levels are cached for the trading day — a 52-week extreme moves at most
   once per session, so re-fetching it every 30 minutes buys nothing. Comparing
-  today's price against the *start-of-day* level is also the more correct
+  today's price against the start-of-day level is also the more correct
   breakout test: FMP folds today's move into yearHigh, so a same-call comparison
   degenerates to `price >= price`.
 * Dedup is one batched query at the top of the run, and it fails CLOSED: if the

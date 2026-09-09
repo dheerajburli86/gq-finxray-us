@@ -14,10 +14,24 @@ CONTENT REQUIREMENTS:
 - Address forward guidance: management projections, confidence level, key drivers
 - Flag risks or catalysts management emphasized
 - Ensure comprehensive coverage — the reader should understand management's outlook without hearing the call
+- CARRY EVERY NUMBER. Any figure present in the source — dollar amounts, share
+  counts, percentages, dates, guidance ranges, period labels — must appear in the
+  summary with its units and its context intact. Dropping a number is the most
+  common way these summaries lose the thing the reader actually needed. If the
+  word budget is tight, cut adjectives and connective phrasing, never facts.
+- NO SILENT OMISSIONS. If the source covers several distinct developments, all of
+  them are named. Do not pick one and present it as the whole story.
 
 STYLE & TONE:
 - Professional, institutional language suitable for portfolio managers and securities analysts
 - Neutral, factual, objective — report what was said, not personal interpretations
+- NO JUDGEMENT WORDS. Report magnitude with numbers, never with an opinion about
+  them. Banned: impressive, disappointing, strong, weak, robust, sluggish, solid,
+  poor, healthy, worrying, remarkable, stellar, dismal, better-than-feared. Write
+  "revenue rose 12% to $4.1B", never "revenue showed strong growth".
+- ATTRIBUTE, DO NOT ASSERT. Anything that is a company claim, an analyst view or a
+  management projection is reported as such ("management guided to", "the filing
+  states"), never restated as established fact in our own voice.
 - Precise: name segments, cite specific percentages, margins, guidance metrics
 - NEVER use tabloid/headline movement verbs: pops, soars, skyrockets, rockets, surges,
   spikes, explodes, tanks, craters, plummets, plunges, tumbles, nosedives, dives, slides,

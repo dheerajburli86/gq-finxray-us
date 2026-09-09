@@ -77,7 +77,15 @@ ET = ZoneInfo("America/New_York")
 #      marked delivered. That is why heatmaps stopped arriving.
 #
 # The allowlist below re-enables (2) without touching (1).
-BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "false").strip().lower()
+#
+# Defaults ON. With it off, every ticker="MARKET" row fell through _is_market_wide()
+# into the watchlist branch, where _fetch_watchers() had already excluded "MARKET" --
+# so the audience was empty, the alert was recorded no_audience and marked
+# delivered=True, and Features 8, 9, 12 and the five scheduled market reports were
+# silently discarded after being fully built. Set GQ_ENABLE_MARKET_WIDE=false only
+# if you deliberately want those features off; it does NOT gate company news about
+# unwatched tickers, which stays closed by the ticker match below regardless.
+BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "true").strip().lower()
                      in ("1", "true", "yes"))
 
 
@@ -92,12 +100,34 @@ def broadcast_enabled():
 MARKET_WIDE_FILING_TYPES = {
     "SECTOR_HEATMAP", "HEATMAP_DAILY_MIDDAY", "HEATMAP_DAILY_AFTERNOON",
     "HEATMAP_WEEKLY", "HEATMAP_MONTHLY",
-    "MARKET_REPORT", "MACRO_BRIEFING", "ETF_XRAY",
-    "IPO_UPCOMING", "INFLOW", "OUTFLOW",
+    "MARKET_REPORT", "MACRO_BRIEFING",
+    "IPO_UPCOMING",
+    # etf_flow_poller emits these two, not INFLOW/OUTFLOW. The old names were
+    # left here after the poller was rewritten, so the source-level match below
+    # was the only thing still routing Feature 7.
+    "BULLISH_MOMENTUM", "BEARISH_MOMENTUM", "INFLOW", "OUTFLOW",
 }
 MARKET_WIDE_SOURCES = {
     "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "ETF_FLOW", "FMP_IPO",
 }
+
+# Personal-by-construction: rendered per user and delivered directly by
+# watchlist_heatmap.py with an explicit user_id. These must never be treated as
+# market-wide, or a restart could fan one user's holdings out to everybody.
+PERSONAL_FILING_TYPES = {"HEATMAP_WATCHLIST_MIDDAY", "HEATMAP_WATCHLIST_EOD"}
+
+# Content that is ALWAYS about one company, so it is only ever watchlist-routed.
+# Listed explicitly rather than inferred, because the ticker catch-all in
+# _is_market_wide() would otherwise broadcast any row whose symbol failed to
+# resolve — an 8-K with an unmapped CIK reaching every subscriber is a far worse
+# failure than that same 8-K reaching nobody.
+COMPANY_ONLY_SOURCES = {
+    "SEC_EDGAR", "SEC_XBRL", "FMP_NEWS", "FMP", "FMP_FUNDAMENTALS",
+    "FMP_TRANSCRIPT", "FMP_ANALYST", "TECHNICAL", "LARGE_TRADE",
+    "CNBC", "REUTERS", "MARKETWATCH", "NASDAQ", "IBD", "FORTUNE",
+    "CNN", "BLOOMBERG", "YAHOO", "SEEKINGALPHA",
+}
+COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 
 
 def _is_market_wide(alert):
@@ -110,10 +140,23 @@ def _is_market_wide(alert):
     if not BROADCAST_ENABLED:
         return False
 
+    if (alert.get("filing_type") or "").upper() in PERSONAL_FILING_TYPES:
+        return False
+
     if (alert.get("filing_type") or "").upper() in MARKET_WIDE_FILING_TYPES:
         return True
     if (alert.get("source") or "").upper() in MARKET_WIDE_SOURCES:
         return True
+
+    # Company-specific content is NEVER market-wide, whatever ticker it carries.
+    # A general news article filed under ticker="MARKET", or a filing whose CIK
+    # failed to resolve and landed as "UNKNOWN", would otherwise fall into the
+    # ticker catch-all below and broadcast to every subscriber — the exact
+    # firehose this module exists to prevent. It finds no audience instead.
+    if (alert.get("source") or "").upper() in COMPANY_ONLY_SOURCES:
+        return False
+    if (alert.get("filing_type") or "").upper() in COMPANY_ONLY_FILING_TYPES:
+        return False
 
     # A row with no company ticker cannot be watchlist-routed by definition.
     ticker = (alert.get("ticker") or "").upper()
@@ -516,6 +559,46 @@ def _log_payload(alert):
                        "2026-09-08_payload_log.sql?): %s", e)
 
 
+def _log_alert_run(alert, recipients, sent, failed, first_error):
+    """
+    LOG 1 OF 2 — `alert_run_log`, one row per alert that reached the fan-out.
+
+    This is the audit trail for every alert the system produces, whether it went
+    through the AI summarizer (news / filings / transcripts, where the attempt
+    and token counts on `extra` are real numbers) or was a templated alert with
+    no LLM involved (technical, IPO, ETF flow, result snapshot, heatmap, macro —
+    those fields are simply absent and land here as NULL, which is expected).
+
+    main.py used to define this and never call it, so the table was never
+    written. It lives here now because delivery is the only place that knows
+    whether Telegram actually accepted the message.
+
+    Never raises: a logging failure must not take down real delivery.
+    """
+    try:
+        extra = alert.get("extra") if isinstance(alert.get("extra"), dict) else {}
+        fid, fname = resolve_feature(alert.get("source"), alert.get("filing_type"))
+        supabase.table("alert_run_log").insert({
+            "alert_id": alert.get("id"),
+            "ticker": (alert.get("ticker") or "UNKNOWN").upper(),
+            "source": alert.get("source"),
+            "filing_type": alert.get("filing_type"),
+            "feature_id": extra.get("feature_id", fid),
+            "feature_name": extra.get("feature_name", fname),
+            "impact": alert.get("impact"),
+            "summarization_attempts": extra.get("summarization_attempts"),
+            "input_tokens": extra.get("input_tokens"),
+            "output_tokens": extra.get("output_tokens"),
+            "total_tokens": extra.get("total_tokens"),
+            "llm_calls": extra.get("llm_calls"),
+            "telegram_success": sent > 0,
+            "telegram_error": (str(first_error)[:500] if first_error else None),
+        }).execute()
+    except Exception as e:
+        logger.warning("[DELIVERY] alert_run_log insert failed for %s: %s",
+                       alert.get("id"), e)
+
+
 def _mark_fanned_out(alert_ids):
     if not alert_ids:
         return
@@ -604,7 +687,8 @@ async def deliver_pending_alerts():
             text = build_message(alert, reason=delivery_reason(alert))
             _log_payload(alert)
 
-            alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": False}
+            alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": False,
+                                "sent": 0, "failed": 0, "recipients": 0, "error": None}
 
             for user, reason in audience:
                 uid = user["user_id"]
@@ -618,6 +702,7 @@ async def deliver_pending_alerts():
                     continue
 
                 per_user_queue.setdefault(uid, []).append((aid, user, text, reason))
+                alert_state[aid]["recipients"] += 1
                 # Reserve the slot now so two alerts to the same user in this
                 # cycle both see the incremented count before either sends.
                 sent_today[uid] = sent_today.get(uid, 0) + 1
@@ -641,16 +726,21 @@ async def deliver_pending_alerts():
                 ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
                                "status": "SENT", "reason": reason})
                 stats["sent"] += 1
+                alert_state[aid]["sent"] += 1
             elif permanent:
                 # Nothing will ever make this send succeed. Record it as
                 # terminal so it is not retried forever.
                 ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
                                "status": "UNDELIVERABLE", "reason": reason, "error": err})
                 stats["failed"] += 1
+                alert_state[aid]["failed"] += 1
+                alert_state[aid]["error"] = alert_state[aid]["error"] or err
             else:
                 ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
                                "status": "FAILED", "reason": reason, "error": err})
                 stats["failed"] += 1
+                alert_state[aid]["failed"] += 1
+                alert_state[aid]["error"] = alert_state[aid]["error"] or err
                 alert_state[aid]["retry_needed"] = True
 
             # Telegram allows roughly one message per second per chat. This gap
@@ -669,8 +759,16 @@ async def deliver_pending_alerts():
             fanned.append(aid)
         elif state["retry_needed"] and not _past_retry_window(state["alert"]):
             stats["deferred"] += 1
+            continue          # still in flight — do not close the audit row yet
         else:
             fanned.append(aid)
+
+        # LOG 1: written once per alert, at the moment it is settled. Includes
+        # alerts that found no audience (sent=0), so "built but nobody wanted it"
+        # is visible in the table rather than invisible.
+        _log_alert_run(state["alert"], state.get("recipients", 0),
+                       state.get("sent", 0), state.get("failed", 0),
+                       state.get("error"))
 
     _record(ledger)
     _mark_fanned_out(fanned)

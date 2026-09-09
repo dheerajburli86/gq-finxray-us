@@ -209,14 +209,14 @@ def build_result_snapshot(ticker, form_type, cik=None):
 
     summary = "\n".join([l for l in lines if l is not None])
 
+    # Floor is MEDIUM, not LOW. A published quarterly result is material to
+    # anyone holding the stock by definition, and the default user preference
+    # (min_impact=MEDIUM in delivery.py) drops LOW outright — so grading a flat
+    # quarter as LOW meant the Result Snapshot was built, stored, and then
+    # silently filtered out of every subscriber's feed.
     try:
         rev_qoq = float(revenue_latest) / float(revenue_prev) - 1 if revenue_latest and revenue_prev else 0
-        if abs(rev_qoq) > 0.15:
-            impact = "HIGH"
-        elif abs(rev_qoq) > 0.05:
-            impact = "MEDIUM"
-        else:
-            impact = "LOW"
+        impact = "HIGH" if abs(rev_qoq) > 0.15 else "MEDIUM"
     except Exception:
         impact = "MEDIUM"
 
@@ -287,29 +287,51 @@ def store_snapshot_alert(snapshot):
         print(f"[SNAPSHOT] Failed to store: {e}")
 
 
+# An 8-K carrying Item 2.02 IS the quarterly earnings release — filed by the
+# company itself the moment it announces, hours ahead of any vendor and typically
+# WEEKS ahead of the 10-Q. edgar_poller_async already detects it and sets
+# extra["is_earnings_release"], but nothing consumed that flag, so the fastest
+# result signal SEC publishes was tagged and then ignored while Feature 3 waited
+# for the slow filing. It is a first-class trigger here now.
+SNAPSHOT_FORM_TYPES = ["10-Q", "10-K", "8-K"]
+
+
+def _mark_done(filing):
+    """Stamp the row so the next cycle does not re-fetch financials for it."""
+    try:
+        extra = dict(filing.get("extra") or {})
+        extra["snapshot_done"] = True
+        supabase.table("raw_filings").update({"extra": extra}).eq("id", filing["id"]).execute()
+    except Exception as e:
+        print(f"[SNAPSHOT] Could not mark {filing.get('ticker')} done: {e}")
+
+
 def process_pending_snapshots():
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for pending Result Snapshots...")
     try:
-        result = supabase.table("raw_filings") \
-            .select("*") \
-            .in_("filing_type", ["10-Q", "10-K"]) \
-            .eq("status", "PROCESSED") \
-            .eq("extra->>needs_result_snapshot", "true") \
-            .limit(10) \
-            .execute()
+        # THE STARVATION BUG THIS FIXES. The old query selected PROCESSED 10-Q/10-K
+        # rows with needs_result_snapshot=true and NEVER filtered on snapshot_done,
+        # which this function itself writes. So every 30 seconds it re-selected the
+        # same rows and re-fetched SEC XBRL / FMP financials for all of them. Worse,
+        # `.limit(10)` with no `.order()` meant that once ten already-processed rows
+        # existed, PostgREST kept returning those same ten and a newly filed 10-Q
+        # could never be reached — Feature 3 starved permanently.
+        base = (supabase.table("raw_filings")
+                .select("*")
+                .in_("filing_type", SNAPSHOT_FORM_TYPES)
+                .eq("status", "PROCESSED")
+                .is_("extra->>snapshot_done", "null")
+                .order("filed_at", desc=True)
+                .limit(10))
+        filings = base.execute().data or []
 
-        filings = result.data
-        if not filings:
-            result2 = supabase.table("raw_filings") \
-                .select("*") \
-                .in_("filing_type", ["10-Q", "10-K"]) \
-                .eq("status", "PENDING") \
-                .limit(10) \
-                .execute()
-            filings = result2.data
+        # 8-Ks only qualify when they actually carry Item 2.02.
+        filings = [f for f in filings
+                   if f.get("filing_type") != "8-K"
+                   or (f.get("extra") or {}).get("is_earnings_release")]
 
         if not filings:
-            print("[SNAPSHOT] No pending 10-Q/10-K filings found.")
+            print("[SNAPSHOT] No pending filings found.")
             return
 
         print(f"[SNAPSHOT] Found {len(filings)} filing(s) to process.")
@@ -318,20 +340,17 @@ def process_pending_snapshots():
             ticker = filing.get("ticker", "UNKNOWN")
             form_type = filing.get("filing_type", "10-Q")
             if ticker == "UNKNOWN":
+                _mark_done(filing)
                 continue
 
             cik = (filing.get("extra") or {}).get("cik")
             snapshot = build_result_snapshot(ticker, form_type, cik=cik)
             if snapshot:
                 store_snapshot_alert(snapshot)
-                try:
-                    extra = filing.get("extra") or {}
-                    extra["snapshot_done"] = True
-                    supabase.table("raw_filings").update({"extra": extra}).eq("id", filing["id"]).execute()
-                except Exception:
-                    pass
-
-            time.sleep(1)
+            # Marked done either way. A filer whose XBRL is unusable will still be
+            # unusable in thirty seconds, and retrying it forever is exactly what
+            # blocked the queue before.
+            _mark_done(filing)
 
     except Exception as e:
         print(f"[SNAPSHOT] Processing failed: {e}")

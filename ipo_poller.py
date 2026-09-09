@@ -1,10 +1,10 @@
 """
 ipo_poller.py
-GQ FinXray US — replaces eodhd_ipo_poller.py. Feature 8.
+GQ FinXray US — Feature 8, upcoming US IPOs (FMP).
 
 FMP's /stable/ipos-calendar returns: date, symbol, company, exchange,
 actions, shares, priceRange ("18.00-20.00" style string), marketCap.
-That's a different shape than EODHD's calendar/ipos (which split into
+FMP returns a single ipos-calendar shape (rather than splitting into
 price_from/price_to/offer_price/filing_date separately) — priceRange is
 parsed here into from/to since FMP gives it as one string.
 
@@ -147,14 +147,14 @@ def process_ipo(ipo):
         impact = "HIGH"
 
     summary = (
-        f"🏦 *IPO Alert — Upcoming Listing*\n\n"
-        f"*Company:* {name}\n"
-        f"*Ticker:* ${ticker}\n"
-        f"*Exchange:* {exchange}\n"
-        f"*Listing Date:* {start_date} ({timing})\n"
-        f"*Price Range:* {price_str}\n"
-        f"*Shares Offered:* {shares_str}\n"
-        f"*Status:* {actions if actions else 'N/A'}\n"
+        f"🏦 IPO Alert — Upcoming Listing\n\n"
+        f"Company: {name}\n"
+        f"Ticker: ${ticker}\n"
+        f"Exchange: {exchange}\n"
+        f"Listing Date: {start_date} ({timing})\n"
+        f"Price Range: {price_str}\n"
+        f"Shares Offered: {shares_str}\n"
+        f"Status: {actions if actions else 'N/A'}\n"
         f"_Source: FMP IPO Calendar | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
     )
 

@@ -73,7 +73,7 @@ def get_snapshot(ticker):
 def get_full_market_snapshot(tickers=None):
     """
     Whole-market snapshot in ONE call — covers 10,000+ tickers.
-    Used by technical_poller.py to replace EODHD's per-indicator screener
+    Used by technical_poller.py for per-indicator screening
     for volume-spike / 52-week breadth scans without per-ticker calls.
     """
     params = {}
@@ -160,7 +160,7 @@ def get_fund_flows(ticker, limit=1):
     return None
 
 
-# ── Crypto (replaces TwelveData test scripts — Massive covers crypto too) ────
+# ── Crypto (Massive covers crypto too) ──────────────────────────────────────
 def get_crypto_snapshot(pair):
     """pair like 'X:BTCUSD'."""
     data = _get(f"/v2/snapshot/locale/global/markets/crypto/tickers/{pair}")

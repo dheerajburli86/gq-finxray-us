@@ -2,7 +2,7 @@
 fmp_client.py
 GQ FinXray US — Financial Modeling Prep (FMP) shared client.
 
-Replaces EODHD across the codebase. All endpoints below are the current
+The single FMP HTTP wrapper. All endpoints below are the current
 "stable" FMP API (https://financialmodelingprep.com/stable/*), confirmed
 against FMP's own developer docs on 2026-07-27:
 
@@ -27,7 +27,7 @@ against FMP's own developer docs on 2026-07-27:
 NOTE ON LICENSING (see claude/us-market-data-licensing-risk.md in the
 project): FMP's personal-tier ToS prohibits redistribution to third
 parties / multi-user products. This client does not change that — it's
-a pure mechanical swap from EODHD. Get the commercial Data Display and
+a personal-tier integration. Get the commercial Data Display and
 Licensing Agreement sorted with FMP sales before this goes further into
 production with a growing subscriber base.
 """
@@ -137,7 +137,7 @@ def get_general_news(limit=25, page=0):
     return data if isinstance(data, list) else []
 
 
-# ── Screener (market-wide, replaces EODHD screener) ──────────────────────────
+# ── Screener (market-wide) ───────────────────────────────────────────────────
 def screener(params):
     """
     params example: {"marketCapMoreThan": 1e9, "volumeMoreThan": 50000,
@@ -231,7 +231,7 @@ def get_key_metrics(ticker, period="quarter", limit=8):
 
 
 def get_historical_prices(ticker, from_date, to_date):
-    """Daily OHLCV, matches EODHD's /eod/ shape closely enough for calc_returns()."""
+    """Daily OHLCV rows, shaped for calc_returns()."""
     data = _get("historical-price-eod/full", {"symbol": ticker, "from": from_date, "to": to_date})
     return data if isinstance(data, list) else []
 

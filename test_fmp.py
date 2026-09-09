@@ -1,6 +1,5 @@
 """
 test_fmp.py
-Replaces test_eodhd.py / test_eodhd_deep.py / test_eodhd_verify.py.
 
 Quick smoke test for the FMP client — run this after dropping FMP_API_KEY
 into .env to confirm the key works and the endpoints this codebase depends
