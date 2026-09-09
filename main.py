@@ -72,10 +72,9 @@ PIPELINE_IDLE_SECONDS = int(os.getenv("GQ_PIPELINE_IDLE_SECONDS", "1"))
 DELIVERY_IDLE_SECONDS = int(os.getenv("GQ_DELIVERY_IDLE_SECONDS", "1"))
 # 8-K and Form 4 are the time-critical ones (material events, insider trades).
 SEC_FAST_POLL_SECONDS = int(os.getenv("GQ_SEC_POLL_SECONDS", "15"))
-# S-1 IS NOT A LATENCY CONTROL. Nothing reads what this poll writes -- see the
-# scheduling block below. This interval is a freshness/cost trade-off for data
-# that is currently write-only, not a delay any subscriber experiences.
-SEC_S1_POLL_MINUTES = int(os.getenv("GQ_SEC_S1_POLL_MINUTES", "15"))
+# S-1 is Feature 8's early-warning half and now DOES produce alerts, so this is
+# a real detection delay. Off the fast lane only because it is market-wide.
+SEC_S1_POLL_MINUTES = int(os.getenv("GQ_SEC_S1_POLL_MINUTES", "5"))
 
 from delivery import deliver_pending_alerts as delivery_deliver
 from ai_pipeline import run_pipeline as process_with_ai
@@ -217,33 +216,28 @@ def run_scheduler():
     schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_10q))
     schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_10k))
 
-    # ── S-1: WRITE-ONLY TODAY. THIS INTERVAL AFFECTS NO ALERT. ────────────────
-    # Tuning this looks like a latency fix and is not one. Trace the rows:
+    # ── S-1 — Feature 8's early-warning half ──────────────────────────────────
+    # A company filing an S-1 is the first public signal it intends to go
+    # public, and it lands here weeks to months before the deal appears on any
+    # IPO calendar. EDGAR is the ONLY source for that leading edge: FMP's
+    # ipos-calendar lists a deal once it is scheduled and priced, which is a
+    # different (later) event. So this interval is a real detection delay.
     #
-    #   poll_sec_s1 writes raw_filings with status="IPO_PENDING"
-    #     -> ai_pipeline reads status="PENDING" only, so it never picks them up
-    #     -> ipo_poller (Feature 8) does NOT read them either: it takes its
-    #        deal list from FMP's ipos-calendar and resolves the S-1 link live
-    #        through edgar_link.find_filing_url() (ipo_poller.py:167)
-    #     -> nothing else queries IPO_PENDING anywhere in the repo
+    # These rows used to be stored status="IPO_PENDING" and read by nothing —
+    # the pipeline selects "PENDING", and ipo_poller resolved its S-1 link live
+    # from FMP rather than from the table. They now enter the pipeline like any
+    # other filing and route market-wide under source=SEC_IPO.
     #
-    # So no subscriber-visible alert is downstream of this poll at any interval,
-    # and edgar_poller_async.build_ipo_payload says so explicitly ("NOT WIRED
-    # YET, deliberately... it just has no caller"). Whether this data should
-    # drive Feature 8 is a product decision, not a scheduling one.
+    # Off the fast lane, not because it is unimportant but because it is the one
+    # market-wide SEC poll: it cannot filter by watchlist (a pre-IPO registrant
+    # is on nobody's), so a cold start fetches ~100 bodies (EDGAR_FEED_COUNT) at
+    # sec_client's 8 req/s ceiling — about 13 seconds, which overran a 15s tick
+    # and logged "Skipping poll_sec_s1 — previous run still active".
     #
-    # What the interval DOES control is cost and staleness. Each run costs one
-    # feed read plus a body fetch per S-1 filed since the last tick — cheap,
-    # because poll_edgar_generic_async drops already-seen URLs before fetching
-    # (known_filing_urls) — but it spends sec_client's GLOBAL 8 req/s budget,
-    # the same budget 8-K and Form 4 draw on. 15 minutes keeps the capture
-    # reasonably fresh for whenever Feature 8 is wired to consume it, without
-    # spending real request budget on rows nothing reads.
-    #
-    # It is off the fast lane because at 15s it could not finish before its own
-    # next tick: a cold start fetches ~100 bodies (EDGAR_FEED_COUNT) at 8 req/s,
-    # about 13 seconds, and logged "Skipping poll_sec_s1 — previous run still
-    # active" in production while holding SEC-lane workers.
+    # 5 minutes is affordable because the expensive part is now bounded: the CIK
+    # dedup in poll_edgar_generic_async drops amendments BEFORE any body is
+    # fetched, so a steady-state tick costs one feed read plus a body only for
+    # genuinely new registrants — a handful a day, not per tick.
     schedule.every(SEC_S1_POLL_MINUTES).minutes.do(sec_job(poll_sec_s1))
 
     # ── Feature 3 — Result Snapshot ───────────────────────────────────────────

@@ -248,7 +248,8 @@ def s1_to_ipo(
     deal_size: Optional[str],
     listing_date: Optional[str],
     form_link: str,
-    cik: str
+    cik: str,
+    filing_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Convert SEC S-1 IPO filing to GQuants `ipo` format.
@@ -284,7 +285,13 @@ def s1_to_ipo(
                 "deal_size": deal_size or "-",
             },
             "general_details_timeline": {
-                "filing_date": datetime.now().isoformat().split("T")[0],
+                # The date the S-1 was actually filed, which is the whole point
+                # of the field. This was datetime.now(), so every payload
+                # claimed the registration happened on the day it was rendered —
+                # for an S-1 filed months before the listing, off by months.
+                # Falls back to today only when the caller genuinely has no
+                # filing date to give.
+                "filing_date": (filing_date or datetime.now().isoformat()).split("T")[0],
                 "expected_listing_date": listing_date or "-",
             },
             "subscription_details": [],

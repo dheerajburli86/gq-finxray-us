@@ -109,6 +109,15 @@ MARKET_WIDE_FILING_TYPES = {
 }
 MARKET_WIDE_SOURCES = {
     "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "ETF_FLOW", "FMP_IPO",
+    # Feature 8's EDGAR half: an S-1 registration, captured by
+    # edgar_poller_async.poll_sec_s1_async under its own source rather than
+    # SEC_EDGAR. It has to route market-wide — the registrant is pre-IPO, so no
+    # ticker exists for a watchlist to match and the alert would otherwise
+    # resolve to an empty audience and be settled as delivered without being
+    # sent. Routing on the SOURCE and not on filing_type "S-1" is deliberate: a
+    # legacy SEC_EDGAR/S-1 row stays company-scoped, so this cannot retroactively
+    # start broadcasting rows written by the old sync poller.
+    "SEC_IPO",
 }
 
 # Personal-by-construction: rendered per user and delivered directly by

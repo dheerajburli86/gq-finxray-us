@@ -56,6 +56,12 @@ EDGAR_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
 FEED_COUNT = int(os.getenv("EDGAR_FEED_COUNT", "100"))
 DOC_TEXT_LIMIT = 6000
 
+# Feature 8's EDGAR half. Deliberately NOT "SEC_EDGAR": delivery.py lists that
+# in COMPANY_ONLY_SOURCES so a filing for an unwatched company can never be
+# broadcast, which is right for 8-K/10-Q/Form 4 and fatal for an S-1 — the
+# registrant is pre-IPO and cannot be on anyone's watchlist by definition.
+IPO_SOURCE = "SEC_IPO"
+
 CIK_MAP: dict[str, str] = {}
 
 # Watchlist cache — one Supabase read per WATCHLIST_TTL seconds, not per filing.
@@ -387,8 +393,47 @@ def known_filing_urls(urls: list[str]) -> set[str]:
         return set(urls)
 
 
+def known_registrant_ciks(ciks: list[str], source: str) -> set[str]:
+    """
+    CIKs that already have a stored row from `source`. One batched query.
+
+    Used to suppress S-1 AMENDMENT spam. The EDGAR feed pattern deliberately
+    matches "S-1/A" as well as "S-1" (an amendment is still the filing), and a
+    live IPO files a long string of them — every one a fresh URL, so the
+    filing_url dedup above lets all of them through. The initial registration is
+    the news ("X has filed to go public"); the amendments are procedural and
+    would each become an identical broadcast alert.
+    """
+    ciks = [c for c in ciks if c]
+    if not ciks:
+        return set()
+    try:
+        rows = (supabase.table("raw_filings")
+                .select("extra")
+                .eq("source", source)
+                .in_("extra->>cik", ciks)
+                .execute().data or [])
+        return {(r.get("extra") or {}).get("cik") for r in rows
+                if (r.get("extra") or {}).get("cik")}
+    except Exception as e:
+        log_poller_error("known_registrant_ciks", e, {"count": len(ciks)})
+        # Fail closed: a lookup outage must not turn into a broadcast storm.
+        return set(ciks)
+
+
 def store_filing(filing_type, company_name, ticker, raw_text, filing_url,
-                 extra=None, status="PENDING"):
+                 extra=None, status="PENDING", source="SEC_EDGAR"):
+    """
+    Insert one raw_filings row.
+
+    `source` is a parameter and not a constant because delivery.py routes on it:
+    SEC_EDGAR is in COMPANY_ONLY_SOURCES, which is correct for 8-K/10-Q/Form 4
+    (a filing for an unwatched company must never broadcast) and wrong for S-1,
+    whose whole point is a company nobody can have watchlisted yet. S-1 is stored
+    under SEC_IPO so it routes market-wide; everything else keeps SEC_EDGAR.
+    `source_priority` stays SEC_EDGAR either way — it records which FEED the row
+    came from, which is what the pipeline's precedence rules read.
+    """
     try:
         # Payloads are attached by the caller that actually has the parsed data
         # (Form 4 here, financial results in result_snapshot). No "needs_payload"
@@ -398,7 +443,7 @@ def store_filing(filing_type, company_name, ticker, raw_text, filing_url,
         stored_extra["source_priority"] = "SEC_EDGAR"
 
         supabase.table("raw_filings").insert({
-            "source": "SEC_EDGAR",
+            "source": source,
             "filing_type": filing_type,
             "company_name": company_name,
             "ticker": ticker,
@@ -511,7 +556,8 @@ def is_earnings_8k(item_codes):
 
 # ── Generic poller ────────────────────────────────────────────────────────────
 async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
-                                   status="PENDING"):
+                                   status="PENDING", source="SEC_EDGAR",
+                                   dedupe_by_cik=False):
     stamp = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{stamp}] Polling SEC EDGAR for {label}"
           f"{'' if watchlist_only else ' (market-wide)'}...")
@@ -565,6 +611,27 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
             print(f"[{stamp}] No new {label} filings.")
             return 0
 
+        # One registration per company, not one per amendment. See
+        # known_registrant_ciks(). Applied AFTER the URL check so the batched
+        # CIK query only runs for filings that are genuinely new.
+        if dedupe_by_cik:
+            already = known_registrant_ciks([c["cik"] for c in candidates], source)
+            fresh, suppressed = [], 0
+            for c in candidates:
+                # Guard within this batch too: the same CIK can appear twice in
+                # one feed page (S-1 and S-1/A filed minutes apart).
+                if c["cik"] and c["cik"] in already:
+                    suppressed += 1
+                    continue
+                already.add(c["cik"])
+                fresh.append(c)
+            if suppressed:
+                print(f"[{stamp}] Suppressed {suppressed} {label} amendment(s) "
+                      f"for companies already captured.")
+            candidates = fresh
+            if not candidates:
+                return 0
+
         print(f"[{stamp}] {len(candidates)} new {label} filing(s) to fetch.")
 
         # ---- FETCH (concurrent, rate-limited) ----
@@ -602,7 +669,7 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
                         extra["is_earnings_release"] = True
                         print(f"[8-K] {c['ticker']}: Item 2.02 earnings release")
             store_filing(form_type, c["company"], c["ticker"], text, c["url"],
-                         extra=extra, status=status)
+                         extra=extra, status=status, source=source)
             stored += 1
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {stored} {label} filings.")
@@ -733,31 +800,12 @@ def build_form4_structured_payload(
     )
 
 
-def build_s1_structured_payload(
-    company_name: str,
-    ticker: str,
-    price_range: str,
-    shares: str,
-    deal_size: str,
-    listing_date: str,
-    cik: str
-) -> Dict[str, Any]:
-    """
-    Convert S-1 IPO data to GQuants `ipo` format.
-
-    NOT WIRED YET, deliberately. S-1 rows are stored status="IPO_PENDING" and
-    the AI pipeline skips them, so nothing downstream would render this. It
-    also needs the Feature 8 merge (FMP calendar supplies price range, share
-    count and deal size; an initial S-1 usually carries none of them). Wire
-    this from ipo_poller once that merge exists -- the builder is correct and
-    tested, it just has no caller.
-    """
-    from gquants_format_converter import s1_to_ipo
-    form_link = f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-    return s1_to_ipo(
-        company_name, ticker, price_range, shares, deal_size,
-        listing_date, form_link, cik
-    )
+# build_s1_structured_payload() lived here: a caller-less wrapper that guessed
+# form_link as a bare CIK directory URL. The Feature 8 merge it was waiting for
+# now exists, and ipo_poller.process_ipo calls s1_to_ipo directly with the real
+# filing URL and filing date from our own S-1 capture — strictly better inputs
+# than this could produce, so the wrapper is gone rather than left as a second,
+# worse path to the same payload.
 
 
 async def poll_sec_8k_async():
@@ -773,11 +821,31 @@ async def poll_sec_10k_async():
 
 
 async def poll_sec_s1_async():
-    # Market-wide by design: S-1 filers are pre-IPO and on nobody's watchlist.
-    # IPO_PENDING keeps these rows out of the AI pipeline until Feature 8
-    # enriches them.
+    """
+    S-1 registrations — Feature 8's early-warning half.
+
+    Market-wide by design: an S-1 filer is pre-IPO, so it is on nobody's
+    watchlist and its CIK is not in the ticker map (these rows carry
+    ticker="UNKNOWN", which is correct, not a failure).
+
+    WHAT CHANGED. These rows were stored status="IPO_PENDING", source="SEC_EDGAR"
+    and then read by nothing at all — ai_pipeline selects status="PENDING", and
+    ipo_poller resolves its S-1 link live from FMP rather than from the table.
+    The poll fetched document bodies market-wide, wrote them, and no alert was
+    ever downstream of any of it.
+
+    Now:
+      status="PENDING"  -> the AI pipeline summarises the S-1 body with the same
+                           S.1.A machinery every other filing uses
+      source="SEC_IPO"  -> delivery routes it market-wide. It CANNOT be
+                           SEC_EDGAR: that is in COMPANY_ONLY_SOURCES, so the
+                           alert would resolve to an empty audience and be
+                           marked delivered without being sent.
+      dedupe_by_cik     -> the initial registration alerts, its amendments do not
+    """
     return await poll_edgar_generic_async(
-        "S-1", "S-1 (IPO Filing)", watchlist_only=False, status="IPO_PENDING"
+        "S-1", "S-1 (IPO Filing)", watchlist_only=False,
+        status="PENDING", source=IPO_SOURCE, dedupe_by_cik=True,
     )
 
 

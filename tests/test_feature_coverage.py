@@ -75,6 +75,15 @@ for src, ft in [("SECTOR_HEATMAP", "HEATMAP_DAILY_MIDDAY"), ("FMP_IPO", "IPO_UPC
     routed = delivery._is_market_wide({"source": src, "filing_type": ft, "ticker": "MARKET"})
     check(f"{src}/{ft} routes to an audience", routed, "would be dropped as no_audience")
 
+# An S-1 registrant is pre-listing, so ticker_from_cik() cannot resolve it and
+# the row carries ticker="UNKNOWN" BY CONSTRUCTION — not as a failure. That is
+# exactly the shape the COMPANY_ONLY guard suppresses for SEC_EDGAR, which is
+# why Feature 8's EDGAR half is emitted under its own source.
+check("SEC_IPO/S-1 (ticker='UNKNOWN') routes to an audience",
+      delivery._is_market_wide({"source": "SEC_IPO", "filing_type": "S-1",
+                                "ticker": "UNKNOWN"}),
+      "every IPO registration alert would be settled as delivered without being sent")
+
 print("\n=== 3. COMPANY CONTENT NEVER BROADCASTS ===")
 for src, ft, tk in [("FMP_NEWS", "NEWS", "MARKET"), ("SEC_EDGAR", "8-K", "UNKNOWN"),
                     ("SEC_EDGAR", "4", ""), ("TECHNICAL", "52W_HIGH", "UNKNOWN"),
@@ -99,7 +108,8 @@ EMISSIONS = [
     ("FMP_NEWS", "EARNINGS_CALENDAR"), ("FMP_NEWS", "INSIDER_FMP"), ("FMP_NEWS", "BULK_DEAL"),
     ("LARGE_TRADE", "LARGE_TRADE"), ("TECHNICAL", "RSI_OVERBOUGHT"), ("TECHNICAL", "52W_HIGH"),
     ("ETF_FLOW", "BULLISH_MOMENTUM"), ("ETF_FLOW", "BEARISH_MOMENTUM"),
-    ("FMP_IPO", "IPO_UPCOMING"), ("SECTOR_HEATMAP", "HEATMAP_DAILY_MIDDAY"),
+    ("FMP_IPO", "IPO_UPCOMING"), ("SEC_IPO", "S-1"),
+    ("SECTOR_HEATMAP", "HEATMAP_DAILY_MIDDAY"),
     ("SECTOR_HEATMAP", "HEATMAP_WEEKLY"), ("SECTOR_HEATMAP", "HEATMAP_MONTHLY"),
     ("FMP_TRANSCRIPT", "EARNINGS_TRANSCRIPT"), ("FMP_ANALYST", "ANALYST_RATING"),
     ("MACRO_ROUNDUP", "MACRO_BRIEFING"), ("MARKET_REPORT", "MARKET_REPORT"),

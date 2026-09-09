@@ -137,18 +137,17 @@ check("a cycle that settles nothing idles instead of spinning", len(sleeps) == 3
 # ── 3. Intervals ──────────────────────────────────────────────────────────────
 print("\n=== 3. POLL INTERVALS MATCH THE LATENCY BUDGET ===")
 
-# S-1 is deliberately NOT asserted as a latency control. poll_sec_s1 writes
-# raw_filings rows with status="IPO_PENDING"; ai_pipeline reads only "PENDING",
-# and ipo_poller resolves its S-1 link live from FMP rather than from these
-# rows, so nothing in the repo consumes them and no alert is downstream of this
-# poll at any interval. It is bounded here only so it cannot silently regress
-# to something that spends the shared SEC request budget for no reason.
-check(f"S-1 interval {main.SEC_S1_POLL_MINUTES}m is bounded (off the fast lane, <=30m)",
-      1 <= main.SEC_S1_POLL_MINUTES <= 30,
-      "S-1 is write-only today; this is a cost knob, not a latency one")
-check("nothing reads IPO_PENDING, so S-1 stays off the fast SEC lane",
+# S-1 IS a latency control now that Feature 8 consumes it: an S-1 is the first
+# public signal a company intends to list, and EDGAR is the only source for that
+# leading edge (FMP's calendar lists a deal once it is scheduled, which is a
+# later event). It stays off the seconds-cadence fast lane because it is the one
+# market-wide SEC poll and a cold start cannot finish inside a 15s tick.
+check(f"S-1 polls every {main.SEC_S1_POLL_MINUTES}m (<=5)",
+      main.SEC_S1_POLL_MINUTES <= 5,
+      "Feature 8's early-warning half is only as fresh as this interval")
+check("S-1 stays off the seconds-cadence SEC lane",
       "SEC_S1_POLL_MINUTES).minutes" in MAIN_SRC,
-      "S-1 back on a seconds cadence would burn 8-K/Form 4 request budget")
+      "a market-wide poll on a 15s tick starves 8-K/Form 4 of request budget")
 
 check(f"pipeline idles {main.PIPELINE_IDLE_SECONDS}s (<=1)",
       main.PIPELINE_IDLE_SECONDS <= 1, "idle gap adds straight to end-to-end latency")

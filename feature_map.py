@@ -22,9 +22,14 @@ watchlisted.
 FEATURES = {
     1: {
         "name": "SEC EDGAR Filings",
-        "detail": "8-K, 10-Q, 10-K, S-1, Form 4 — real-time SEC EDGAR RSS polling.",
+        "detail": "8-K, 10-Q, 10-K, Form 4 — real-time SEC EDGAR RSS polling.",
         "sources": {"SEC_EDGAR"},
-        "filing_types": {"8-K", "10-Q", "10-K", "S-1", "4"},
+        # S-1 moved to Feature 8. It is an IPO event, not routine company news,
+        # and it is the one EDGAR form whose registrant cannot be watchlisted —
+        # so it is emitted under SEC_IPO and routed market-wide. A legacy
+        # SEC_EDGAR/S-1 row still resolves here via resolve_feature's
+        # single-candidate second pass rather than landing Unmapped.
+        "filing_types": {"8-K", "10-Q", "10-K", "4"},
         "market_wide": False,
     },
     2: {
@@ -84,10 +89,21 @@ FEATURES = {
     },
     8: {
         "name": "IPO Deep Dive",
-        "detail": "Upcoming US IPO alerts — pricing, share count, deal size, listing date.",
-        "sources": {"FMP_IPO"},
-        "filing_types": {"IPO_UPCOMING"},
-        "market_wide": False,
+        "detail": ("US IPOs from both ends: an S-1 registration the moment it "
+                   "reaches EDGAR, then pricing, share count and listing date "
+                   "from FMP's calendar once the deal is scheduled."),
+        # TWO SOURCES, TWO STAGES, BY NECESSITY. EDGAR publishes the documents
+        # but no IPO calendar — an initial S-1 carries no listing date, price
+        # range or final share count (those appear later, as prose, in S-1/A
+        # amendments and the 424B4 pricing prospectus). FMP's ipos-calendar
+        # carries exactly those as structured fields but only once a deal is
+        # scheduled, which is weeks to months after the S-1 is filed. Neither
+        # source alone covers the event.
+        "sources": {"FMP_IPO", "SEC_IPO"},
+        "filing_types": {"IPO_UPCOMING", "S-1"},
+        # An IPO registrant is pre-listing: no ticker exists to match against a
+        # watchlist, so watchlist-scoping this feature delivers it to nobody.
+        "market_wide": True,
     },
     9: {
         "name": "Sector Heatmap",

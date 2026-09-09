@@ -1080,7 +1080,12 @@ def expire_stale_filings(force=False):
 #
 # Filings from the primary source now jump the queue. News still drains, it just
 # no longer sits in front of a material event the company filed itself.
-PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT"]
+# SEC_IPO is Feature 8's EDGAR half (S-1 registrations). It belongs here for the
+# same reason SEC_EDGAR does: it is a primary-source filing whose entire value is
+# arriving before the vendor calendars do, and it is low volume — the CIK dedup
+# in poll_edgar_generic_async means a handful of new registrants a day, not one
+# row per amendment — so it cannot crowd out the news tier.
+PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT", "SEC_IPO"]
 PRIORITY_FILING_TYPES = ["8-K", "10-Q", "10-K", "4", "EARNINGS_TRANSCRIPT", "INSIDER_FMP"]
 PIPELINE_BATCH_SIZE = int(os.getenv("GQ_PIPELINE_BATCH_SIZE", "12"))
 
