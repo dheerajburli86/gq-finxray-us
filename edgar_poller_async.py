@@ -12,8 +12,10 @@ Replaces edgar_poller.py. Two changes that matter:
    ticker nobody is watching.
 
    S-1 is the deliberate exception: pre-IPO filers cannot be on anyone's
-   watchlist, so poll_sec_s1 runs with watchlist_only=False and stores
-   rows as IPO_PENDING so the AI pipeline skips them.
+   watchlist, so poll_sec_s1 runs with watchlist_only=False. Those rows are
+   stored under source=SEC_IPO (Feature 8) rather than SEC_EDGAR, because
+   delivery.py treats SEC_EDGAR as company-scoped and an IPO registrant has
+   no ticker for a watchlist to match — see poll_sec_s1_async.
 
 2. ASYNC. Document bodies for the surviving filings are fetched
    concurrently through sec_client's rate-limited session instead of

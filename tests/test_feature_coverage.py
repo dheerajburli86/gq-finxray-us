@@ -43,7 +43,11 @@ REQUIRED = {
     "poll_sec_8k": 1, "poll_sec_form4": 1, "poll_sec_10q": 1, "poll_sec_10k": 1,
     "poll_all_news": 2, "poll_fmp_news": 2,
     "process_pending_snapshots": 3,
-    "poll_fmp_events": 4,
+    # Feature 4 has two halves: the heads-up that earnings are due
+    # (poll_fmp_events) and the EPS surprise itself (poll_earnings_for_tickers).
+    # feature_map listed EARNINGS_MISS/EARNINGS_BEAT as Feature 4 types
+    # "emitted by earnings_alerts.py" while nothing ever scheduled that module.
+    "poll_fmp_events": 4, "poll_earnings_for_tickers": 4,
     "run_large_trades_poller": 5,
     "run_technical_poller": 6,
     "run_etf_flow_poller": 7,
@@ -106,6 +110,7 @@ EMISSIONS = [
     ("SEC_EDGAR", "8-K"), ("SEC_EDGAR", "10-Q"), ("SEC_EDGAR", "10-K"), ("SEC_EDGAR", "4"),
     ("FMP_NEWS", "NEWS"), ("CNBC", "NEWS"), ("SEC_XBRL", "RESULT_SNAPSHOT"),
     ("FMP_NEWS", "EARNINGS_CALENDAR"), ("FMP_NEWS", "INSIDER_FMP"), ("FMP_NEWS", "BULK_DEAL"),
+    ("FMP", "EARNINGS_MISS"), ("FMP", "EARNINGS_BEAT"),
     ("LARGE_TRADE", "LARGE_TRADE"), ("TECHNICAL", "RSI_OVERBOUGHT"), ("TECHNICAL", "52W_HIGH"),
     ("ETF_FLOW", "BULLISH_MOMENTUM"), ("ETF_FLOW", "BEARISH_MOMENTUM"),
     ("FMP_IPO", "IPO_UPCOMING"), ("SEC_IPO", "S-1"),

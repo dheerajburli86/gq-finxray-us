@@ -85,6 +85,8 @@ from edgar_poller_async import (poll_sec_8k, poll_sec_form4, poll_sec_10q,
 # ── Feature 2: Company & Sector News ──────────────────────────────────────────
 from news_poller import poll_all_news
 from fmp_poller import poll_fmp_news, poll_fmp_events      # Features 2, 4, 5
+# ── Feature 4: EPS surprise (the other half of the earnings feature) ──────────
+from earnings_alerts import poll_earnings_for_tickers
 # ── Feature 3: Result Snapshot ────────────────────────────────────────────────
 from result_snapshot import process_pending_snapshots
 # ── Feature 5: Large block/bulk trades ────────────────────────────────────────
@@ -258,6 +260,19 @@ def run_scheduler():
     # cannot — forward earnings calendars and off-exchange block prints.
     schedule.every(30).minutes.do(job(poll_fmp_events))
     schedule.every(30).minutes.do(job(run_large_trades_poller))
+
+    # Feature 4's OTHER half: the EPS surprise itself, not just the heads-up
+    # that earnings are due. feature_map already listed EARNINGS_MISS and
+    # EARNINGS_BEAT as Feature 4 filing types "emitted by earnings_alerts.py" —
+    # but nothing ever called that module, and it carried an undefined-variable
+    # bug that would have failed every insert if anything had. Both fixed.
+    #
+    # Hourly is affordable at any watchlist size: /stable/earnings-calendar has
+    # no per-symbol filter, so this is ONE market-wide call per poll that is then
+    # indexed by ticker locally — not one call per name. Actual EPS lands within
+    # hours of the close, and the poller looks back 24h, so nothing is missed
+    # between ticks; the interval only decides how quickly a surprise surfaces.
+    schedule.every(60).minutes.do(job(poll_earnings_for_tickers))
 
     # ── Feature 6 — Technical Alerts ──────────────────────────────────────────
     schedule.every(45).minutes.do(job(run_technical_poller))

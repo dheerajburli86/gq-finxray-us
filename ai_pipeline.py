@@ -1058,6 +1058,24 @@ def expire_stale_filings(force=False):
                    .lt("created_at", _cutoff_iso(MAX_FILING_AGE_MINUTES))
                    .execute()).data or []
         total += len(filings)
+
+        # Orphans. S-1 rows used to be written status="IPO_PENDING", which no
+        # reader ever selected — not this function either, since both updates
+        # above filter on "PENDING". They therefore accumulated forever, one per
+        # S-1 filed market-wide, each carrying a full document body. poll_sec_s1
+        # writes "PENDING" now, so nothing new lands here; this retires the
+        # backlog the old behaviour left behind. The rows and their raw_text are
+        # kept — only the status changes, so nothing is lost if this data is ever
+        # wanted again.
+        orphans = (supabase.table("raw_filings")
+                   .update({"status": "EXPIRED"})
+                   .eq("status", "IPO_PENDING")
+                   .lt("created_at", _cutoff_iso(MAX_FILING_AGE_MINUTES))
+                   .execute()).data or []
+        if orphans:
+            print(f"[EXPIRE] Retired {len(orphans)} orphaned IPO_PENDING row(s) "
+                  f"(status no longer written or read by anything)")
+        total += len(orphans)
     except Exception as e:
         print(f"[EXPIRE] Could not expire stale filings: {e}")
         return 0
@@ -1086,7 +1104,13 @@ def expire_stale_filings(force=False):
 # in poll_edgar_generic_async means a handful of new registrants a day, not one
 # row per amendment — so it cannot crowd out the news tier.
 PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT", "SEC_IPO"]
-PRIORITY_FILING_TYPES = ["8-K", "10-Q", "10-K", "4", "EARNINGS_TRANSCRIPT", "INSIDER_FMP"]
+# EARNINGS_MISS/BEAT arrive under source="FMP", which is shared with ordinary
+# vendor content, so they need the filing_type axis to be prioritised at all —
+# exactly the gap that left INSIDER_FMP stuck behind the news backlog. An EPS
+# surprise is material and rare (one per ticker per quarter), so it cannot crowd
+# the tier.
+PRIORITY_FILING_TYPES = ["8-K", "10-Q", "10-K", "4", "EARNINGS_TRANSCRIPT",
+                         "INSIDER_FMP", "EARNINGS_MISS", "EARNINGS_BEAT"]
 PIPELINE_BATCH_SIZE = int(os.getenv("GQ_PIPELINE_BATCH_SIZE", "12"))
 
 

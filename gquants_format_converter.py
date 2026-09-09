@@ -300,7 +300,10 @@ def s1_to_ipo(
         "_metadata": {
             "fetched_at": datetime.now().isoformat(),
             "cik": cik,
-            "status": "IPO_PENDING",
+            # Was "IPO_PENDING", a raw_filings status that no longer exists —
+            # S-1 rows are stored PENDING now. This field describes the DEAL,
+            # not our row, so it says what is true of the deal.
+            "status": "Upcoming",
         }
     }
 
