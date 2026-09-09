@@ -27,6 +27,7 @@ poll_sec_s1, load_cik_map.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -54,6 +55,9 @@ EDGAR_FEED = (
       "&search_text=&output=atom"
 )
 EDGAR_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
+# Survives a restart within the same container, which is what turns a startup
+# 429 from "this process is blind for its whole life" into "one stale cycle".
+CIK_CACHE_PATH = os.getenv("GQ_CIK_CACHE_PATH", "/tmp/gq_cik_map.json")
 
 FEED_COUNT = int(os.getenv("EDGAR_FEED_COUNT", "100"))
 DOC_TEXT_LIMIT = 6000
@@ -88,19 +92,89 @@ def log_poller_error(job_name, error, context=None):
 
 
 # ── CIK map ───────────────────────────────────────────────────────────────────
-async def load_cik_map_async():
+def cik_map_ready() -> bool:
+    """
+    True once the CIK->ticker map is usable.
+
+    WHY THIS EXISTS. An empty CIK_MAP is not a degraded state, it is a total
+    outage of every watchlist-scoped SEC feature — ticker_from_cik() returns
+    "UNKNOWN" for every filing, so poll_edgar_generic_async's watchlist filter
+    discards ALL of them and logs the cheerful "No watchlisted 8-K filings."
+    Features 1, 3 and 10 then produce nothing, and the only clue in the logs is
+    a single line at startup. Observed in production 2026-09-09: SEC answered
+    429 to company_tickers.json three times, the loader returned, and the
+    process ran for its whole life with an empty map.
+    """
+    return bool(CIK_MAP)
+
+
+def _save_cik_cache():
+    """Keep the last good map on disk so a throttled restart is not fatal."""
+    try:
+        with open(CIK_CACHE_PATH, "w") as fh:
+            json.dump(CIK_MAP, fh)
+    except Exception as e:
+        logger.warning("[SETUP] Could not write CIK cache to %s: %s", CIK_CACHE_PATH, e)
+
+
+def _load_cik_cache() -> int:
+    try:
+        with open(CIK_CACHE_PATH) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        logger.warning("[SETUP] Could not read CIK cache: %s", e)
+        return 0
+    if isinstance(data, dict) and data:
+        CIK_MAP.update(data)
+        return len(data)
+    return 0
+
+
+async def load_cik_map_async(force: bool = False):
+    """
+    Populate CIK_MAP. Safe to call repeatedly — a no-op once loaded.
+
+    SEC rate-limits this file like any other endpoint, and it is fetched at
+    startup when nothing else has warmed the limiter, so a 429 here is both
+    likely and maximally damaging. Three fallbacks, in order: the live file, the
+    on-disk cache from a previous run, and finally a loud error plus a retry
+    scheduled by main.py — never a silent empty map.
+    """
+    if CIK_MAP and not force:
+        return len(CIK_MAP)
+
     print("[SETUP] Loading SEC CIK-to-ticker mapping...")
     data = await sec_client.get_json(EDGAR_CIK_URL)
-    if not data:
-        log_poller_error("load_cik_map", "empty response from company_tickers.json")
-        return
-    try:
-        for val in data.values():
-            cik = str(val["cik_str"]).zfill(10)
-            CIK_MAP[cik] = val["ticker"].upper()
-        print(f"[SETUP] Loaded {len(CIK_MAP):,} ticker mappings")
-    except Exception as e:
-        log_poller_error("load_cik_map", e)
+
+    if data:
+        try:
+            for val in data.values():
+                cik = str(val["cik_str"]).zfill(10)
+                CIK_MAP[cik] = val["ticker"].upper()
+            print(f"[SETUP] Loaded {len(CIK_MAP):,} ticker mappings")
+            _save_cik_cache()
+            return len(CIK_MAP)
+        except Exception as e:
+            log_poller_error("load_cik_map", e)
+
+    cached = _load_cik_cache()
+    if cached:
+        print(f"[SETUP] SEC unavailable — using cached CIK map ({cached:,} mappings). "
+              f"Will refresh on the next scheduled attempt.")
+        return cached
+
+    # Nothing live, nothing cached. Say plainly what is now broken, because the
+    # symptom downstream is silence, not an error.
+    logger.error(
+        "[SETUP] CIK MAP IS EMPTY — SEC returned nothing and no cache exists. "
+        "Every watchlist-scoped SEC feature (Features 1, 3, 10) will discard "
+        "every filing as UNKNOWN until this loads. Retrying on schedule."
+    )
+    log_poller_error("load_cik_map", "empty response from company_tickers.json "
+                                     "and no on-disk cache")
+    return 0
 
 
 def load_cik_map():
@@ -112,7 +186,22 @@ def load_cik_map():
     bound to a loop that was then closed, so it was never closed itself --
     aiohttp reports that as an unclosed-connector warning at startup.
     """
-    asyncio.run(_with_session_cleanup(load_cik_map_async()))
+    return asyncio.run(_with_session_cleanup(load_cik_map_async()))
+
+
+def ensure_cik_map():
+    """
+    Scheduled retry. No-op once the map is loaded, so this is cheap to run often.
+
+    Startup is the worst possible moment to fetch company_tickers.json — the
+    rate limiter is cold and every poller is firing at once — and giving up
+    there left the process permanently blind. This gives it repeated chances
+    without blocking boot.
+    """
+    if cik_map_ready():
+        return len(CIK_MAP)
+    logger.warning("[SETUP] CIK map still empty — retrying company_tickers.json")
+    return load_cik_map()
 
 
 def ticker_from_cik(cik: str) -> str:
@@ -575,6 +664,19 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
         entries = _parse_feed(feed)
         if not entries:
             print(f"[{stamp}] No entries in {label} feed.")
+            return 0
+
+        # Refuse to filter against a map we do not have. Without this the loop
+        # below resolves every CIK to "UNKNOWN", drops every filing, and prints
+        # "No watchlisted 8-K filings." — a sentence that is indistinguishable
+        # from a genuinely quiet feed and is why an empty map went unnoticed for
+        # a whole production run. Returning here also leaves the filings
+        # unstored and unmarked, so they are picked up normally once the map
+        # loads, provided they are still inside the feed window.
+        if watchlist_only and not cik_map_ready():
+            logger.error("[EDGAR] %s poll SKIPPED — CIK map is empty, so no filing "
+                         "can be matched to a watchlist. This is an outage, not a "
+                         "quiet feed.", label)
             return 0
 
         watchlist = get_watchlist() if watchlist_only else None

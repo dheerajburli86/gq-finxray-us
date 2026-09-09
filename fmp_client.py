@@ -158,6 +158,33 @@ def get_ipo_calendar(from_date, to_date):
     return data if isinstance(data, list) else []
 
 
+# ── Macro (Feature 12) ────────────────────────────────────────────────────────
+# Both were missing while macro_policy_roundup called them on every run. Each
+# call site catches the exception and returns an empty section, so the digest
+# rendered without its yields line and without its calendar and looked merely
+# quiet rather than broken.
+def get_treasury_rates(from_date, to_date):
+    """
+    Daily Treasury yield curve. Returns a list (possibly empty).
+
+    macro_policy_roundup reads `date` and `year10` off each row and sorts by
+    date itself rather than trusting the endpoint's ordering.
+    """
+    data = _get("treasury-rates", {"from": from_date, "to": to_date})
+    return data if isinstance(data, list) else []
+
+
+def get_economic_calendar(from_date, to_date):
+    """
+    Scheduled macro releases for a date range. Returns a list (possibly empty).
+
+    macro_policy_roundup filters these down to US, high-impact events before
+    they reach the digest.
+    """
+    data = _get("economic-calendar", {"from": from_date, "to": to_date})
+    return data if isinstance(data, list) else []
+
+
 # ── SEC filings (the ONLY FMP endpoint family that returns real URLs) ─────────
 def get_sec_filings(symbol, from_date, to_date, form_type=None, limit=100):
     """FMP confirmed this is the only endpoint family carrying canonical URLs:
@@ -242,6 +269,48 @@ def get_etf_info(ticker):
     every caller treats a None/empty result as "not available" and degrades
     gracefully rather than crashing, same as the rest of this client."""
     data = _get("etf/info", {"symbol": ticker})
+    if data and isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+# ── Analyst coverage (Feature 11) ─────────────────────────────────────────────
+# THE MISSING METHODS THIS ADDS. analyst_ratings_poller called both of these on
+# every watched ticker, and neither existed on this module. _fetch_snapshot
+# guards each call with its own try/except and logs the failure as a warning, so
+# production printed two "module 'fmp_client' has no attribute ..." lines per
+# ticker per run and reported "no-coverage=25, alerts=0" — indistinguishable in
+# the summary line from a watchlist nobody covers. Feature 11 has never emitted
+# an alert.
+#
+# Both endpoints are single-symbol and return a ONE-ELEMENT LIST, so both unwrap
+# it. Returning the bare list would leave every .get() in _fetch_snapshot reading
+# from a list and silently yielding None, which fails the same quiet way.
+def get_grades_consensus(ticker):
+    """
+    Analyst rating breakdown for one symbol. Returns dict or None.
+
+    Fields consumed by analyst_ratings_poller: strongBuy, buy, hold, sell,
+    strongSell (counts) and consensus (a label such as "Buy" / "Hold").
+    """
+    data = _get("grades-consensus", {"symbol": ticker})
+    if data and isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def get_price_target_consensus(ticker):
+    """
+    Analyst price-target consensus for one symbol. Returns dict or None.
+
+    Fields consumed by analyst_ratings_poller: targetConsensus, targetMedian,
+    targetHigh, targetLow.
+    """
+    data = _get("price-target-consensus", {"symbol": ticker})
     if data and isinstance(data, list) and data:
         return data[0]
     if isinstance(data, dict):

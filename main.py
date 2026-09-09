@@ -81,7 +81,8 @@ from ai_pipeline import run_pipeline as process_with_ai
 
 # ── Feature 1 / 5 / 8-trigger: SEC EDGAR ──────────────────────────────────────
 from edgar_poller_async import (poll_sec_8k, poll_sec_form4, poll_sec_10q,
-                                poll_sec_10k, poll_sec_s1, load_cik_map)
+                                poll_sec_10k, poll_sec_s1, load_cik_map,
+                                ensure_cik_map)
 # ── Feature 2: Company & Sector News ──────────────────────────────────────────
 from news_poller import poll_all_news
 from fmp_poller import poll_fmp_news, poll_fmp_events      # Features 2, 4, 5
@@ -241,6 +242,15 @@ def run_scheduler():
     # fetched, so a steady-state tick costs one feed read plus a body only for
     # genuinely new registrants — a handful a day, not per tick.
     schedule.every(SEC_S1_POLL_MINUTES).minutes.do(sec_job(poll_sec_s1))
+
+    # The CIK map is fetched once, at boot, from a rate-limited endpoint, at the
+    # exact moment every other poller is also starting. When SEC answered 429 to
+    # it three times on 2026-09-09 the loader gave up and the process ran its
+    # whole life with an empty map — which silently disables every
+    # watchlist-scoped SEC feature, because a filing whose CIK will not resolve
+    # is indistinguishable from a filing for a company nobody watches. This is a
+    # no-op once loaded, so it costs one boolean check per tick.
+    schedule.every(10).minutes.do(sec_job(ensure_cik_map))
 
     # ── Feature 3 — Result Snapshot ───────────────────────────────────────────
     # The 10-Q/10-K poll only files the filing; this turns it into an alert, so

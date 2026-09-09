@@ -108,6 +108,82 @@ def get_grouped_daily(date_str):
     return []
 
 
+# ── Trades / movers / clock ───────────────────────────────────────────────────
+# ALL FOUR WERE MISSING while production called them every cycle. Each caller
+# wraps the call in its own try/except, so an AttributeError surfaced as a
+# WARNING and the feature reported a normal-looking empty result:
+#
+#   get_trades      large_trades_poller.fetch_recent_trades — Feature 5's ONLY
+#                   data source. No fallback: Feature 5 found zero block trades.
+#   get_gainers     market_data.movers — falls back to scanning the full
+#   get_losers      snapshot, so this degraded rather than died, at the cost of
+#                   a whole-market scan on every market report.
+#   is_market_open  market_data — falls back to a wall-clock check.
+#
+# Paths follow the Polygon-compatible surface documented in this module's
+# header. The callers are unambiguous about the shapes they expect
+# (fetch_recent_trades reads sip_timestamp/participant_timestamp off each row;
+# _normalise_massive reads day/prevDay/lastTrade/todaysChangePerc), which is the
+# v3 trades and v2 snapshot schema respectively — so these signatures are pinned
+# to what the code already consumes, not guessed at. They have NOT been
+# exercised against a live key from this environment; every caller degrades
+# gracefully on None/[] exactly as it did while they were missing.
+def get_trades(ticker, timestamp_gte=None, timestamp_lte=None,
+               limit=50000, order="desc"):
+    """
+    Raw tape for one ticker. Returns a list of trade rows (possibly empty).
+
+    Timestamps are NANOSECONDS, matching what large_trades_poller passes and the
+    `sip_timestamp` it reads back out for paging.
+    """
+    params = {"limit": limit, "order": order, "sort": "timestamp"}
+    if timestamp_gte is not None:
+        params["timestamp.gte"] = timestamp_gte
+    if timestamp_lte is not None:
+        params["timestamp.lte"] = timestamp_lte
+    data = _get(f"/v3/trades/{ticker}", params)
+    if data and isinstance(data.get("results"), list):
+        return data["results"]
+    return []
+
+
+def _movers(direction):
+    data = _get(f"/v2/snapshot/locale/us/markets/stocks/{direction}")
+    if data and isinstance(data.get("tickers"), list):
+        return data["tickers"]
+    return []
+
+
+def get_gainers():
+    """Top gainers, in the same snapshot shape as get_full_market_snapshot()."""
+    return _movers("gainers")
+
+
+def get_losers():
+    """Top losers, in the same snapshot shape as get_full_market_snapshot()."""
+    return _movers("losers")
+
+
+def is_market_open(allow_extended=False):
+    """
+    True/False for the US equity session, or None when the status is unavailable.
+
+    None is meaningful and must not be collapsed to False: market_data treats it
+    as "ask the clock instead", whereas False would assert the market is shut.
+    """
+    data = _get("/v1/marketstatus/now")
+    if not data:
+        return None
+    market = str(data.get("market") or "").lower()
+    if market == "open":
+        return True
+    if allow_extended and (data.get("afterHours") or data.get("preMarket")):
+        return True
+    if market in ("closed", "extended-hours"):
+        return bool(allow_extended and market == "extended-hours")
+    return None
+
+
 # ── News ──────────────────────────────────────────────────────────────────────
 def get_news(ticker=None, limit=10):
     params = {"limit": limit, "order": "desc", "sort": "published_utc"}
