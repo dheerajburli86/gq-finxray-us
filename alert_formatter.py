@@ -210,6 +210,34 @@ def _source_link(alert_or_extra):
     return None
 
 
+def _clean_headline(text):
+    """
+    Keep headlines neutral and factual, same standard the summary is held to.
+
+    The summarization pipeline (S.1/S.3 prompts + the deterministic
+    ends_with_question_or_exclamation gate + V.1 validation) guarantees the
+    SUMMARY never asks a question or editorializes. The headline bypassed all
+    of it: Prompt_H1 is not wired into ai_pipeline, so `extra.headline` is
+    normally absent and this falls through to `extra.title` -- the raw article
+    title straight from the news source. Publisher titles are frequently
+    clickbait questions ("Is Apple Stock A Buy After Earnings?", "Should You
+    Sell NVDA Now?"), and this is rendered in bold as the FIRST line of the
+    alert, so the loudest line in a message whose body is scrupulously neutral
+    was a third party's leading question.
+
+    A question is dropped outright rather than rewritten: rewriting means an
+    LLM call per alert (cost + latency), and the alert reads fine without it --
+    the ticker/company header and the summary carry the substance. An
+    exclamation just loses the "!".
+    """
+    if not text:
+        return ""
+    cleaned = str(text).strip()
+    if cleaned.endswith("?"):
+        return ""
+    return cleaned.rstrip("!").rstrip()
+
+
 def build_message(alert, reason=None):
     """
     Render one alert row into Telegram HTML.
@@ -226,7 +254,7 @@ def build_message(alert, reason=None):
     extra       = alert.get("extra") or {}
 
     company  = extra.get("company_name") or extra.get("company") or ""
-    headline = extra.get("headline") or extra.get("title") or ""
+    headline = _clean_headline(extra.get("headline") or extra.get("title") or "")
 
     emoji        = IMPACT_EMOJI.get(impact, "🟢")
     source_name  = SOURCE_LABELS.get(source, source.replace("_", " ").title())

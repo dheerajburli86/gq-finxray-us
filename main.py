@@ -556,21 +556,37 @@ def run_scheduler():
         job(warm)()
     # SEC lane — 8-K and Form 4 at 15s, the tightest interval SEC's fair-access
     # policy allows at 10 req/s with the required User-Agent.
+    # EVERY SEC form type polls at the same fast interval. SEC EDGAR is where
+    # these filings originate -- FMP/Massive are downstream resellers that read
+    # this same feed and republish minutes later -- so any gap here is latency
+    # we are choosing to add to the one source that has the news first.
+    #
+    # The old 2min/3min intervals were the dominant delay left in the system:
+    # at 2 minutes a 10-Q waits 60s on average (120s worst case) purely for the
+    # next tick, dwarfing the ~20s the AI pipeline needs. At 15s that becomes
+    # ~7.5s.
+    #
+    # Cost of doing this: SEC's fair-access policy allows 10 requests/second.
+    # Five feeds at 15s is 20 requests/MINUTE -- 0.33/s, about 3% of the
+    # allowance -- and each tick is one conditional feed read that returns
+    # nothing to fetch when nothing has been filed. Document fetches only
+    # happen for genuinely new filings and are separately capped at
+    # SEC_MAX_CONCURRENCY. The dedicated _SEC_POOL lane means these never
+    # queue behind an FMP/Massive job, and the scheduler's running-set guard
+    # drops a tick if the previous one is still working, so a slow poll (Form 4
+    # fans out to per-filing XML fetches) degrades to back-to-back runs rather
+    # than piling up.
     schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_8k))
     schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_form4))
-    # SEC is the creator of these filings, not FMP/Massive re-publishing them
-    # later — 5min/10min meant a 10-Q could sit unnoticed for most of that
-    # window even though SEC published it instantly. Tightened to 2min/3min,
-    # still comfortably inside SEC's fair-access rate limit since these share
-    # the dedicated _SEC_POOL lane and never queue behind FMP/Massive jobs.
-    schedule.every(2).minutes.do(sec_job(poll_sec_10q))
-    schedule.every(2).minutes.do(sec_job(poll_sec_10k))
-    schedule.every(3).minutes.do(sec_job(poll_sec_s1))
-    # Matches the tightened 10-Q/10-K interval above — no point polling SEC
-    # every 2 minutes if the snapshot builder that turns those filings into
-    # alerts only wakes up every 5. The job is a no-op when nothing is
-    # PENDING, so the extra ticks cost one indexed Supabase query each.
-    schedule.every(2).minutes.do(sec_job(process_pending_snapshots))
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_10q))
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_10k))
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_s1))
+    # The 10-Q/10-K poll only files the filing; this is what turns it into a
+    # Result Snapshot alert, so its interval adds directly on top of the poll's.
+    # Leaving it at 2min would have capped Result Snapshot latency at ~2min no
+    # matter how fast the poller got. It is a single indexed Supabase query
+    # when nothing is pending.
+    schedule.every(30).seconds.do(sec_job(process_pending_snapshots))
     schedule.every(30).minutes.do(job(run_earnings_transcript_poller))
     schedule.every(60).seconds.do(job(poll_all_news))
 

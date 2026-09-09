@@ -411,7 +411,8 @@ def generate_s3(company_name, raw_text, target_words, filing_type=""):
 Rules:
 - Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {MIN_WORDS} words and never more than {target_words} words.
 - Do not pad the summary with filler phrases, restated facts, or generic commentary just to reach the word count -- every added word must carry real information from the content below.
-- Must end with a complete sentence ending in . ! or ?
+- Must end with a complete factual sentence ending in a period. Never end with a question mark or an exclamation point
+- Never end with a rhetorical question, speculation, or a sentence asking what happens next. State what happened; take no position on it
 - Do not start with "This", "The following", "Summary:", "Note:" or similar
 - Plain English only, neutral and factual, no first person, no word count mentions
 
