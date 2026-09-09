@@ -308,6 +308,18 @@ def build_message(alert, reason=None):
     # feature shipped nothing to users despite its tests passing.
     # make_frontend_link() returns "" while GQUANTS_ALERT_BASE_URL is unset, so
     # this is a no-op until the frontend route is known.
+    # SEC's own structured data for this filing. SEC does not publish earnings
+    # CALL transcripts -- the spoken Q&A is never filed -- but everything the
+    # call discusses is here as XBRL, and for an 8-K 2.02 the filing index
+    # points at the EX-99.1 earnings release itself. Linking it lets the
+    # reader go straight to the primary source with no vendor in between.
+    sec_json = extra.get("sec_json") or {}
+    sec_link = sec_json.get("filing_index") or sec_json.get("companyfacts")
+    if sec_link:
+        label = ("SEC filing data (JSON)" if sec_json.get("filing_index")
+                 else "SEC XBRL facts (JSON)")
+        lines.append(f'🗂 <a href="{esc_attr(sec_link)}">{esc(label)}</a>')
+
     payload = extra.get("structured_payload")
     if payload:
         try:

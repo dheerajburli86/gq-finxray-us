@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 import sec_client
+import sec_financials
 from typing import Dict, Any
 
 load_dotenv()
@@ -572,6 +573,14 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
                      "watchlist_only": watchlist_only}
             if form_type in ("10-Q", "10-K"):
                 extra["needs_result_snapshot"] = True
+            # SEC's own machine-readable endpoints for this filing/company.
+            # Carrying them means an alert can point at the structured source
+            # data itself -- companyfacts XBRL, and the filing index that
+            # lists the EX-99.1 earnings release -- with no vendor involved.
+            sec_json = sec_financials.build_sec_json_links(c["cik"], c["url"])
+            if sec_json:
+                extra["sec_json"] = sec_json
+
             if form_type.startswith("8-K"):
                 items = extract_8k_items(text)
                 if items:

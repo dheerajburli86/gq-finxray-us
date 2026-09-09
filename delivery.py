@@ -475,20 +475,33 @@ def _log_payload(alert):
     """
     extra = alert.get("extra") if isinstance(alert.get("extra"), dict) else {}
     payload = extra.get("structured_payload")
-    if not payload:
+    sec_json = extra.get("sec_json") or {}
+
+    # Log anything carrying machine-readable data, not just a built payload:
+    # an SEC filing alert's value here is the XBRL/JSON endpoints themselves,
+    # which is exactly the "json/xbrl link based alert" this table is for.
+    if not payload and not sec_json:
         return
+
     try:
-        link = make_frontend_link(payload, str(alert.get("id") or "")) or None
+        link = make_frontend_link(payload, str(alert.get("id") or "")) if payload else None
     except Exception:
         link = None
+    # With no frontend link, the SEC endpoint IS the link worth keeping.
+    link = link or sec_json.get("filing_index") or sec_json.get("companyfacts")
+
+    record = dict(payload) if payload else {}
+    if sec_json:
+        record["sec_json"] = sec_json
+
     try:
         supabase.table("payload_log").upsert({
             "alert_id": alert.get("id"),
             "ticker": (alert.get("ticker") or "").upper(),
-            "payload_type": payload.get("type"),
+            "payload_type": (payload or {}).get("type") or "sec_json",
             "filing_type": alert.get("filing_type"),
             "source": alert.get("source"),
-            "payload": payload,
+            "payload": record,
             "frontend_link": link,
         }, on_conflict="alert_id", ignore_duplicates=True).execute()
     except Exception as e:
