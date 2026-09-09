@@ -1,28 +1,29 @@
 """Prompt_S1A_AnnouncementSummarization.py — Summarize SEC filings"""
 
-def get_prompt(company_name, sub_summary, raw_text, target_word_count=120, min_word_count=100):
-    return f"""You are a financial analyst. Summarize this SEC filing from {company_name}.
+def get_prompt(company_name, sub_summary, raw_text, target_word_count=150, min_word_count=120):
+    return f"""You are a professional securities analyst. Summarize this SEC filing from {company_name} in a formal, institutional tone suitable for investment professionals.
 
 Target: exactly {target_word_count} words
 Minimum: {min_word_count} words (never shorter)
 Maximum: {target_word_count} words
 
-KEY PRIORITIES:
-- Lead with what happened: the material event, transaction, or announcement
-- Include financial impact: dollar amounts, percentages, affected units
-- Explain why it matters: strategic implications, market impact, risk factors
-- Specific dates, parties, terms if material to the news
-- No SEC boilerplate, no legal disclaimers, no repeat of submission format
+CONTENT REQUIREMENTS:
+- Lead with the material event: what is being announced, disclosed, or transacted
+- Include complete financial impact: dollar amounts, percentages, affected business units, timeframes
+- Explain strategic significance: competitive implications, market position impact, risk factors
+- Provide context: parties involved, terms, conditions, contingencies if material
+- Name all material details: products, geographies, customer/partner names, specific risks
+- Exclude SEC boilerplate, legal disclaimers, and submission format language
+- Ensure comprehensive coverage — the reader should understand the filing without the original
 
-MUST FOLLOW:
-- Exactly {target_word_count} words if possible; never below {min_word_count}
-- Must end with a complete factual sentence, ending in a period. Never end with a question mark or exclamation point
-- Never end with a rhetorical question, speculation, or any sentence asking what will happen next
-- State only what is reported. Do not speculate, editorialize, or suggest an interpretation
+STYLE & TONE:
+- Professional, institutional, formal language (as if written for portfolio managers and securities analysts)
+- Neutral, factual, objective — present facts only, no editorializing or speculation
+- Precise and clear: name parties, amounts, timeframes, specific impacts
+- Cannot end with questions, exclamations, or speculation about future outcomes
 - Never start with: "This filing", "The following", "Summary:", "Note:", "This document"
-- Plain English, neutral factual tone, no personal opinion, no stance-taking
-- Every word must convey real information; no filler or padding
-- If exact word count impossible, come as close as possible while staying accurate
+- Every word must carry substantive information — no padding, no repetition, no filler
+- If exact word count impossible, come as close as possible while staying accurate and comprehensive
 
 {sub_summary or ""}
 

@@ -162,6 +162,13 @@ ALTER TABLE public.user_preferences ADD COLUMN IF NOT EXISTS max_alerts_per_day 
 ALTER TABLE public.user_preferences ADD COLUMN IF NOT EXISTS receive_market_wide boolean NOT NULL DEFAULT true;
 ALTER TABLE public.user_preferences ADD COLUMN IF NOT EXISTS created_at          timestamptz NOT NULL DEFAULT now();
 
+-- alerts and raw_filings: both carry metadata (SEC JSON links, item types,
+-- filing classification, token usage, etc.) in a jsonb extra field. This rides
+-- from raw_filings -> ai_pipeline -> alerts -> delivery, so both tables must
+-- have it for the pipeline to work correctly.
+ALTER TABLE public.alerts ADD COLUMN IF NOT EXISTS extra jsonb DEFAULT '{}'::jsonb;
+ALTER TABLE public.raw_filings ADD COLUMN IF NOT EXISTS extra jsonb DEFAULT '{}'::jsonb;
+
 
 -- ----------------------------------------------------------------------------
 -- SECTION 3 — indexes

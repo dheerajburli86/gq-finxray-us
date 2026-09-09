@@ -24,6 +24,7 @@ class FakeTable:
     def select(self, *a, **k): return self
     def eq(self, *a, **k): return self
     def gte(self, *a, **k): return self
+    def lt(self, *a, **k): return self
     def in_(self, *a, **k): return self
     def order(self, *a, **k): return self
     def limit(self, *a, **k): return self
