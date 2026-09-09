@@ -39,7 +39,6 @@ from result_snapshot import process_pending_snapshots
 from technical_poller import run_technical_poller
 from ipo_poller import run_ipo_poller
 from earnings_transcript_poller import run_earnings_transcript_poller
-from news_roundup import run_etf_xray
 from etf_flow_poller import run_etf_flow_poller
 from heatmap_generator import (run_sector_heatmap_midday, run_sector_heatmap_afternoon,
                                run_sector_heatmap_weekly, run_sector_heatmap_monthly)
@@ -119,7 +118,6 @@ def _format_alert_body(alert):
         "FMP_TRANSCRIPT": "FMP Earnings Call Transcript",
         "ETF_FLOW": "ETF Flow (Massive)",
         "SECTOR_HEATMAP": "Sector Heatmap",
-        "ETF_XRAY": "ETF Xray",
     }
 
     emoji = impact_emoji.get(impact, "🟢")
@@ -607,9 +605,7 @@ def run_scheduler():
     # 08:00 ET = 13:00 UTC (EST)
     schedule.every().day.at("13:00").do(job(run_ipo_poller))
 
-    # ETF Xray + ETF Flow (Features 7, 10)
-    # 09:00 ET = 14:00 UTC (EST)
-    schedule.every().day.at("14:00").do(job(run_etf_xray))
+    # ETF Flow (Feature 7)
     schedule.every(90).minutes.do(job(run_etf_flow_poller))
 
     # Market reports + Sector Heatmap (Feature 9)

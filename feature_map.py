@@ -98,13 +98,6 @@ FEATURES = {
         "market_wide": False,
     },
     10: {
-        "name": "ETF Xray",
-        "detail": "Structured ETF fundamentals snapshot — expense ratio, AUM, holdings.",
-        "sources": {"ETF_XRAY"},
-        "filing_types": {"ETF_XRAY"},
-        "market_wide": False,
-    },
-    11: {
         "name": "Earnings Call Transcripts",
         "detail": "Full transcript pulled via FMP when EDGAR flags a 10-Q/10-K, "
                   "AI-summarized through the same S.1/S.3/V.1 pipeline as news & filings.",
@@ -112,14 +105,14 @@ FEATURES = {
         "filing_types": {"EARNINGS_TRANSCRIPT"},
         "market_wide": False,
     },
-    12: {
+    11: {
         "name": "Analyst Ratings & Price Targets",
         "detail": "Consensus rating changes and price-target revisions from FMP.",
         "sources": {"FMP_ANALYST"},
         "filing_types": {"ANALYST_RATING", "PRICE_TARGET"},
         "market_wide": False,
     },
-    13: {
+    12: {
         "name": "Macro & Policy Digest",
         "detail": "Fed decisions, Treasury yields, jobs/inflation prints, commodities, USD.",
         # MARKET_REPORT covers the five scheduled index/mover digests (pre-market,
@@ -135,7 +128,7 @@ FEATURES = {
 # The personal watchlist heatmap is generated per user and delivered directly by
 # watchlist_heatmap.py, so it never goes through the shared alerts fan-out. It is
 # listed here only so the footer can name it.
-WATCHLIST_HEATMAP_FEATURE = 14
+WATCHLIST_HEATMAP_FEATURE = 13
 FEATURES[WATCHLIST_HEATMAP_FEATURE] = {
     "name": "Watchlist Heatmap",
     "detail": "Per-user performance heatmap of the stocks on that user's watchlist.",
