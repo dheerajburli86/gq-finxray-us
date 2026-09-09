@@ -139,12 +139,50 @@ MAX_RETRY_AGE_HOURS = float(os.getenv("MAX_CONTENT_AGE_HOURS", "24"))
 
 
 # ── Loading ───────────────────────────────────────────────────────────────────
+# Past this, an alert is no longer news to the reader -- they have seen it
+# elsewhere, and delivering it makes the product look slow rather than
+# thorough. Matches the pipeline's own content window.
+MAX_ALERT_AGE_MINUTES = float(os.getenv("GQ_MAX_ALERT_AGE_MINUTES", "90"))
+
+
+def _expire_stale_alerts():
+    """
+    Settle alerts too old to be worth sending, in one bulk UPDATE.
+
+    Without this the undelivered queue is append-only whenever delivery falls
+    behind: it never drains, and every cycle re-reads the same stale head.
+    Marking them delivered retires them without sending -- the alert row and
+    its summary stay in the table for review, they just stop being queued.
+    """
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(minutes=MAX_ALERT_AGE_MINUTES)).isoformat()
+    try:
+        stale = (supabase.table("alerts")
+                 .update({"delivered": True})
+                 .eq("delivered", False)
+                 .lt("created_at", cutoff)
+                 .execute()).data or []
+        if stale:
+            logger.info("[DELIVERY] Retired %d alert(s) older than %.0f minutes "
+                        "without sending", len(stale), MAX_ALERT_AGE_MINUTES)
+        return len(stale)
+    except Exception as e:
+        logger.error("[DELIVERY] Failed to expire stale alerts: %s", e)
+        return 0
+
+
 def _fetch_undelivered(limit=BATCH_LIMIT):
     try:
+        # NEWEST FIRST. This was .order("created_at") -- strict FIFO -- so
+        # whenever a backlog built up, fresh alerts queued BEHIND stale ones
+        # and, because a cycle takes only BATCH_LIMIT, could not be reached
+        # until the whole backlog drained. That is how an alert generated 12
+        # hours ago went out ahead of news that broke seconds ago. The stale
+        # tail is expired above rather than being allowed to block the head.
         res = (supabase.table("alerts")
                .select("*")
                .eq("delivered", False)
-               .order("created_at")
+               .order("created_at", desc=True)
                .limit(limit)
                .execute())
         return res.data or []
@@ -471,6 +509,8 @@ async def deliver_pending_alerts():
     queues run concurrently via asyncio.gather, so N users drop their alerts
     at roughly the same moment instead of one after another.
     """
+    _expire_stale_alerts()
+
     alerts = _fetch_undelivered()
     if not alerts:
         return

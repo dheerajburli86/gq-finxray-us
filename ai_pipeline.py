@@ -8,7 +8,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from supabase import create_client
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # The budget day is the market/delivery day, matching delivery.py's daily cap.
@@ -883,6 +883,57 @@ def process_filing(filing):
           f"{usage['input']}+{usage['output']} tokens in+out)")
 
 
+# ── Freshness ─────────────────────────────────────────────────────────────────
+# An alert is only worth sending while it is still news. Past this window the
+# reader has seen it elsewhere, and delivering it makes the product look slow
+# rather than thorough. Filings are given a longer life than news because a
+# 10-K matters for longer than a headline does.
+MAX_CONTENT_AGE_MINUTES = int(os.getenv("GQ_MAX_CONTENT_AGE_MINUTES", "90"))
+MAX_FILING_AGE_MINUTES = int(os.getenv("GQ_MAX_FILING_AGE_MINUTES", "360"))
+
+NEWS_LIKE = ("NEWS",)
+
+
+def _cutoff_iso(minutes):
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+
+
+def expire_stale_filings():
+    """
+    Retire PENDING rows that are too old to be news.
+
+    Two windows, because the two kinds of content age differently: a news
+    article is worthless within the hour, an SEC filing is not. Runs as two
+    bulk UPDATEs, so a backlog of any size clears in constant time instead of
+    being summarized one expensive filing at a time.
+    """
+    total = 0
+    try:
+        news = (supabase.table("raw_filings")
+                .update({"status": "EXPIRED"})
+                .eq("status", "PENDING")
+                .in_("filing_type", list(NEWS_LIKE))
+                .lt("created_at", _cutoff_iso(MAX_CONTENT_AGE_MINUTES))
+                .execute()).data or []
+        total += len(news)
+
+        filings = (supabase.table("raw_filings")
+                   .update({"status": "EXPIRED"})
+                   .eq("status", "PENDING")
+                   .not_.in_("filing_type", list(NEWS_LIKE))
+                   .lt("created_at", _cutoff_iso(MAX_FILING_AGE_MINUTES))
+                   .execute()).data or []
+        total += len(filings)
+    except Exception as e:
+        print(f"[EXPIRE] Could not expire stale filings: {e}")
+        return 0
+
+    if total:
+        print(f"[EXPIRE] Retired {total} stale PENDING filing(s) "
+              f"(news >{MAX_CONTENT_AGE_MINUTES}m, filings >{MAX_FILING_AGE_MINUTES}m)")
+    return total
+
+
 # ── Main pipeline runner ──────────────────────────────────────────────────────
 def run_pipeline():
     mode = f"AI (DeepInfra - {DEEPINFRA_MODEL})"
@@ -900,10 +951,24 @@ def run_pipeline():
         return 0
 
     try:
+        # Retire anything too old to be news before picking work up. Without
+        # this the queue is append-only under load: a backlog never drains,
+        # and every LLM call spent on a 12-hour-old article is money spent on
+        # something nobody should receive.
+        expire_stale_filings()
+
+        # NEWEST FIRST. This was .order("created_at") -- strict FIFO -- so a
+        # backlog put fresh filings BEHIND stale ones, and since each cycle
+        # takes only 10, a backlog larger than one cycle meant the newest
+        # filing could not be reached until the entire backlog cleared. That
+        # is how a Feature 2 alert generated 12 hours ago went out ahead of
+        # news that broke seconds ago. Freshness is the product, so the queue
+        # is now LIFO and the stale tail is expired above rather than
+        # blocking the head.
         result = supabase.table("raw_filings") \
             .select("*") \
             .eq("status", "PENDING") \
-            .order("created_at") \
+            .order("created_at", desc=True) \
             .limit(10) \
             .execute()
 

@@ -435,6 +435,72 @@ def _parse_feed(xml_text: str):
     return out
 
 
+# ── 8-K item classification ───────────────────────────────────────────────────
+# An 8-K is "a material event happened" -- the item number says WHICH, and that
+# is the whole meaning of the filing. 2.02 is the quarterly earnings release,
+# 1.01 a material agreement, 5.02 an executive departure; they are entirely
+# different alerts. alert_formatter already renders extra["item_types"], but
+# nothing ever populated it, so every 8-K reached the reader as an unlabelled
+# "material event" and the earnings releases -- the most valuable filing SEC
+# publishes, out hours before any vendor re-reports them -- were
+# indistinguishable from routine ones.
+EIGHT_K_ITEMS = {
+    "1.01": "Entry into a Material Agreement",
+    "1.02": "Termination of a Material Agreement",
+    "1.03": "Bankruptcy or Receivership",
+    "2.01": "Completion of Acquisition or Disposition",
+    "2.02": "Results of Operations and Financial Condition",
+    "2.03": "Creation of a Material Direct Financial Obligation",
+    "2.04": "Triggering Events Accelerating a Financial Obligation",
+    "2.05": "Costs Associated with Exit or Disposal Activities",
+    "2.06": "Material Impairments",
+    "3.01": "Delisting or Failure to Satisfy a Listing Rule",
+    "3.02": "Unregistered Sale of Equity Securities",
+    "3.03": "Material Modification to Rights of Security Holders",
+    "4.01": "Changes in Registrant's Certifying Accountant",
+    "4.02": "Non-Reliance on Previously Issued Financial Statements",
+    "5.01": "Changes in Control of Registrant",
+    "5.02": "Departure or Election of Directors or Officers",
+    "5.03": "Amendments to Articles or Bylaws",
+    "5.07": "Submission of Matters to a Vote of Security Holders",
+    "7.01": "Regulation FD Disclosure",
+    "8.01": "Other Events",
+    "9.01": "Financial Statements and Exhibits",
+}
+
+# "Item 2.02" / "ITEM 2.02." / "Item&nbsp;2.02"
+_ITEM_RE = re.compile(r"item\s*(\d\.\d{2})", re.IGNORECASE)
+
+# Item 9.01 is on nearly every 8-K (it just lists the exhibits) and 7.01 is a
+# disclosure wrapper, so neither identifies what the filing is ABOUT. They are
+# kept out of the headline label so the meaningful item leads.
+_LOW_SIGNAL_ITEMS = {"9.01", "7.01"}
+
+
+def extract_8k_items(text):
+    """
+    The 8-K item numbers present in the filing, most meaningful first.
+
+    Returns ["2.02: Results of Operations and Financial Condition", ...].
+    """
+    if not text:
+        return []
+    found = []
+    for code in dict.fromkeys(_ITEM_RE.findall(text[:20000])):
+        code = code.strip()
+        if code in EIGHT_K_ITEMS:
+            found.append(code)
+    if not found:
+        return []
+    found.sort(key=lambda c: (c in _LOW_SIGNAL_ITEMS, c))
+    return [f"{c}: {EIGHT_K_ITEMS[c]}" for c in found]
+
+
+def is_earnings_8k(item_codes):
+    """True when this 8-K carries the quarterly results (Item 2.02)."""
+    return any(str(i).startswith("2.02") for i in (item_codes or []))
+
+
 # ── Generic poller ────────────────────────────────────────────────────────────
 async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
                                    status="PENDING"):
@@ -506,6 +572,19 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
                      "watchlist_only": watchlist_only}
             if form_type in ("10-Q", "10-K"):
                 extra["needs_result_snapshot"] = True
+            if form_type.startswith("8-K"):
+                items = extract_8k_items(text)
+                if items:
+                    extra["item_types"] = items
+                    # An earnings 8-K is the quarterly result, reported by the
+                    # company itself the moment it announces -- hours ahead of
+                    # any vendor, and typically WEEKS ahead of the 10-Q that
+                    # currently triggers the Result Snapshot. Flagging it lets
+                    # downstream treat it as earnings rather than as a generic
+                    # material event.
+                    if is_earnings_8k(items):
+                        extra["is_earnings_release"] = True
+                        print(f"[8-K] {c['ticker']}: Item 2.02 earnings release")
             store_filing(form_type, c["company"], c["ticker"], text, c["url"],
                          extra=extra, status=status)
             stored += 1
