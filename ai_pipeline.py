@@ -9,6 +9,10 @@ from concurrent.futures import ThreadPoolExecutor
 from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+# The budget day is the market/delivery day, matching delivery.py's daily cap.
+ET = ZoneInfo("America/New_York")
 
 load_dotenv()
 
@@ -119,13 +123,51 @@ def get_token_usage():
 # thread waits out that same window instead of piling straight back into the
 # exhausted quota and turning one 429 into N.
 LLM_CONCURRENCY = int(os.getenv("GQ_LLM_CONCURRENCY", "4"))
-LLM_RPM = int(os.getenv("GQ_LLM_RPM", "55"))
+
+# RPM is a RATE rail, not a spend control -- the same 12 alerts cost the same
+# number of tokens at 55 RPM or 200, they just clear slower at 55. So size it
+# to the burst we actually want absorbed, and control money with the daily
+# budget below instead.
+#
+# Sizing: one filing costs ~5-8 DeepInfra calls (gibberish, relevance, S.1,
+# V.1, impact, plus the prefiltered dedup comparisons; a filing that needs the
+# full S.3 retry ladder costs up to 4 more). A 12-alert burst is therefore
+# ~60-100 calls. At 100 RPM that burst clears in about a minute instead of
+# being drip-fed over two, and the ceiling still stops a runaway loop from
+# free-running.
+LLM_RPM = int(os.getenv("GQ_LLM_RPM", "100"))
+
+# The actual money guard. A rate limit alone cannot stop a bad day from
+# spending: 100 RPM sustained for 24h is 144,000 calls. This caps the total
+# for a calendar day (ET, matching the delivery day) and is checked BEFORE a
+# batch is picked up, so hitting it leaves filings PENDING for tomorrow rather
+# than failing them mid-flight and flagging them as undeliverable.
+LLM_DAILY_CALL_BUDGET = int(os.getenv("GQ_LLM_DAILY_CALL_BUDGET", "6000"))
+
 MAX_RATE_LIMIT_RETRIES = 5
 
 _llm_semaphore = threading.BoundedSemaphore(LLM_CONCURRENCY)
 _rate_lock = threading.Lock()
 _call_window = deque()      # monotonic timestamps of recently issued calls
 _cooldown_until = [0.0]     # global "everybody wait" deadline, set on a 429
+_calls_today = [0]          # calls issued since _budget_day
+_budget_day = [None]        # ET date the counter belongs to
+
+
+def _budget_state():
+    """(calls_used, budget). Rolls the counter over at ET midnight."""
+    today = datetime.now(ET).date()
+    if _budget_day[0] != today:
+        _budget_day[0] = today
+        _calls_today[0] = 0
+    return _calls_today[0], LLM_DAILY_CALL_BUDGET
+
+
+def budget_exhausted():
+    """True once today's call budget is spent. Checked between batches."""
+    with _rate_lock:
+        used, budget = _budget_state()
+        return used >= budget
 
 
 def _set_cooldown(seconds):
@@ -151,6 +193,8 @@ def _acquire_call_slot():
                     _call_window.popleft()
                 if len(_call_window) < LLM_RPM:
                     _call_window.append(now)
+                    _budget_state()          # roll the day over if needed
+                    _calls_today[0] += 1
                     return
                 # Oldest call in the window falls out at +60s; that is the
                 # earliest moment another call can be issued.
@@ -485,6 +529,65 @@ def get_recent_summaries(ticker, limit=10):
     except Exception:
         return []
 
+# Words carried by almost every financial summary — they signal nothing about
+# whether two summaries describe the same event, so they are excluded from the
+# overlap score that decides which pairs are worth an LLM call.
+_DEDUP_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "at", "by",
+    "for", "with", "from", "as", "is", "are", "was", "were", "be", "been",
+    "has", "have", "had", "it", "its", "this", "that", "these", "those",
+    "will", "would", "may", "also", "which", "than", "then", "company",
+    "inc", "corp", "corporation", "said", "reported", "quarter", "year",
+    "million", "billion", "percent", "shares", "stock", "usd",
+}
+
+# Below this word-overlap ratio two summaries share almost no substance, so an
+# LLM comparison can only come back "not similar". Deliberately permissive --
+# it is a prefilter for obvious non-matches, not the duplicate decision.
+DEDUP_MIN_OVERLAP = float(os.getenv("GQ_DEDUP_MIN_OVERLAP", "0.25"))
+# Real duplicates are near-simultaneous reprints, so they sort to the top of
+# the overlap ranking. Comparing more than a handful buys nothing.
+DEDUP_MAX_LLM_COMPARISONS = int(os.getenv("GQ_DEDUP_MAX_COMPARISONS", "3"))
+
+
+def _content_words(text):
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in _DEDUP_STOPWORDS}
+
+
+def rank_dedup_candidates(summary, recent_summaries,
+                          min_overlap=None, max_candidates=None):
+    """
+    The subset of `recent_summaries` worth an LLM duplicate check, most
+    similar first.
+
+    Scored by Jaccard overlap of content words. Anything below min_overlap is
+    dropped without a call; the rest are capped at max_candidates.
+    """
+    min_overlap = DEDUP_MIN_OVERLAP if min_overlap is None else min_overlap
+    max_candidates = (DEDUP_MAX_LLM_COMPARISONS if max_candidates is None
+                      else max_candidates)
+
+    new_words = _content_words(summary)
+    if not new_words:
+        return list(recent_summaries or [])[:max_candidates]
+
+    scored = []
+    for old in (recent_summaries or []):
+        old_words = _content_words(old)
+        if not old_words:
+            continue
+        union = new_words | old_words
+        if not union:
+            continue
+        overlap = len(new_words & old_words) / len(union)
+        if overlap >= min_overlap:
+            scored.append((overlap, old))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [old for _, old in scored[:max_candidates]]
+
+
 def store_summary(filing_id, ticker, summary, impact, event_type):
     try:
         result = supabase.table("ai_summaries").insert({
@@ -637,14 +740,27 @@ def process_filing(filing):
         impact = "LOW"
     print(f"[IMPACT] {impact}")
 
-    # Step 6: Semantic deduplication
-    for old_summary in get_recent_summaries(ticker):
+    # Step 6: Semantic deduplication.
+    #
+    # This used to send EVERY one of the last 10 summaries for the ticker to
+    # the LLM, one call each -- so a heavily-followed ticker cost up to 10
+    # extra calls per filing purely to ask "is this a duplicate?", dwarfing
+    # the 5 calls that actually produce the alert. Most of those comparisons
+    # are between summaries with almost no words in common, which no model
+    # needs to read to reject.
+    #
+    # A local lexical prefilter drops those for free and only spends a call on
+    # candidates close enough to plausibly be the same story. The LLM still
+    # makes every actual duplicate/not-duplicate decision -- it just stops
+    # being asked about obviously unrelated pairs.
+    candidates = rank_dedup_candidates(summary, get_recent_summaries(ticker))
+    for old_summary in candidates:
         sim_result = parse_json_response(call_deepinfra(similarity_prompt(old_summary, summary)))
         if sim_result.get("is_similar") == "True":
             print(f"[DISCARDED] Duplicate -- {ticker}")
             update_filing_status(filing_id, "DISCARDED")
             return
-    print(f"[PASS] Deduplication check")
+    print(f"[PASS] Deduplication check ({len(candidates)} LLM comparison(s))")
 
     # Record what it cost to produce this alert -- how many summarization
     # attempts the retry ladder needed, and total input/output tokens across
@@ -674,6 +790,18 @@ def process_filing(filing):
 def run_pipeline():
     mode = f"AI (DeepInfra - {DEEPINFRA_MODEL})"
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for PENDING filings... [{mode} MODE]")
+
+    # Checked here, between batches, rather than inside call_deepinfra: a call
+    # refused mid-filing would surface as api_unavailable and get the filing
+    # flagged as undeliverable. Stopping before we pick anything up leaves the
+    # queue PENDING, so it resumes on its own when the budget rolls over.
+    if budget_exhausted():
+        used, budget = _budget_state()
+        print(f"[BUDGET] Daily DeepInfra call budget spent ({used}/{budget}). "
+              f"Filings stay PENDING until ET midnight. "
+              f"Raise GQ_LLM_DAILY_CALL_BUDGET to lift this.")
+        return 0
+
     try:
         result = supabase.table("raw_filings") \
             .select("*") \
