@@ -89,4 +89,15 @@ assert ap.classify_failure("", 100, 35) == "empty"
 assert ap.strip_rhetorical_ending("Is this the future?") == ""
 print("real quality failures still rejected ✓")
 
+# ── 5. Tabloid headline verbs are rejected, not just "clickbait" in the abstract ──
+# Production sent "Meta stock pops after unveiling AI agent Muse" -- "pops" slipped
+# past every existing gate because none of them checked for movement slang.
+clickbait_summary = " ".join(["Meta"] * 30) + " stock pops after unveiling AI agent Muse."
+assert ap.classify_failure(clickbait_summary, 100, 35) == "clickbait_language"
+neutral_summary = " ".join(["Meta"] * 30) + " shares rose 2.4% after unveiling AI agent Muse."
+assert ap.classify_failure(neutral_summary, 100, 35) is None
+for word in ("soars", "tanks", "plunges", "skyrockets", "surges", "craters"):
+    assert ap.contains_clickbait_language(f"The stock {word} today.") is True, word
+print("tabloid movement verbs (pops/soars/tanks/...) are rejected ✓")
+
 print("\n✅ SUMMARY GATE TEST PASS")

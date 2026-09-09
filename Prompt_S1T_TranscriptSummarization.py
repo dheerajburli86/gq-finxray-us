@@ -19,6 +19,10 @@ STYLE & TONE:
 - Professional, institutional language suitable for portfolio managers and securities analysts
 - Neutral, factual, objective — report what was said, not personal interpretations
 - Precise: name segments, cite specific percentages, margins, guidance metrics
+- NEVER use tabloid/headline movement verbs: pops, soars, skyrockets, rockets, surges,
+  spikes, explodes, tanks, craters, plummets, plunges, tumbles, nosedives, dives, slides,
+  goes wild, blows past, smashes, crushes it, shatters. Use a neutral, quantified verb
+  paired with the actual number instead: "rose 2.4%", "declined 1.1%", "increased", "fell".
 - Never speculate or editorialize; distinguish management's projections from historical facts
 
 WRITING RULES:

@@ -309,6 +309,31 @@ BAD_START_KEYWORDS = [
     "the company has filed", "pursuant to", "in accordance with"
 ]
 
+# Headline slang for price/stock movement. "Meta stock pops after unveiling..."
+# reads like a tabloid ticker crawl, not an institutional summary -- the old
+# prompt only said "no clickbait phrases" in the abstract, which the model
+# reliably ignored the moment the source article's own headline used one of
+# these verbs (news headlines are written to be punchy; that's the entire
+# reason this list exists). This is the deterministic backstop: even if a
+# retry re-introduces one of these, the gate below catches it and forces
+# another attempt rather than letting a tabloid verb reach a subscriber.
+CLICKBAIT_MOVEMENT_WORDS = [
+    "pops", "pop after", "soars", "soaring", "skyrockets", "rockets",
+    "surges", "surging", "spikes", "spiking", "explodes", "erupts",
+    "tanks", "craters", "cratering", "plummets", "plunges", "plunging",
+    "tumbles", "tumbling", "nosedives", "dives", "slides", "sliding",
+    "goes wild", "goes crazy", "skyrocketing", "blows past", "smashes",
+    "obliterates", "crushes it", "shatters",
+]
+
+def contains_clickbait_language(text):
+    """True if the summary uses a tabloid-style movement verb instead of a
+    neutral, quantified one (e.g. 'rose 2.4%', 'declined 1.1%')."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(re.search(rf"\b{re.escape(w)}\b", lowered) for w in CLICKBAIT_MOVEMENT_WORDS)
+
 def clean_summary(text):
     if not text:
         return text
@@ -428,6 +453,8 @@ def classify_failure(summary, max_words, min_words=None):
         return "too_short"
     if starts_with_bad_keyword(summary):
         return "bad_start"
+    if contains_clickbait_language(summary):
+        return "clickbait_language"
     if ends_with_question_or_exclamation(summary):
         return "rhetorical_or_exclamatory_ending"
     if last_sentence_incomplete(summary):
@@ -469,7 +496,16 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_word
 # ── S.3 — Resummarize at an escalated word target ─────────────────────────────
 def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=None):
     min_words = MIN_WORDS if min_words is None else min_words
-    char_limit = TRANSCRIPT_CHAR_LIMIT if filing_type == "EARNINGS_TRANSCRIPT" else NEWS_CHAR_LIMIT
+    if filing_type == "EARNINGS_TRANSCRIPT":
+        char_limit = TRANSCRIPT_CHAR_LIMIT
+    elif filing_type in ("NEWS", ""):
+        char_limit = NEWS_CHAR_LIMIT
+    else:
+        # Was falling through to NEWS_CHAR_LIMIT (6000) for every SEC filing type
+        # and Form 4 -- filings can legitimately need more source text than a
+        # news article, so retries were seeing less content than the S.1 attempt
+        # that already failed on the fuller text.
+        char_limit = FILING_CHAR_LIMIT
     prompt = f"""You are a professional financial analyst. Write a comprehensive, formal summary of the following content in exactly {target_words} words.
 
 CONTENT REQUIREMENTS:
@@ -482,6 +518,11 @@ STYLE & TONE:
 - Professional, institutional tone suitable for investment professionals
 - Neutral, objective, factual — no editorializing, speculation, or emotional language
 - Precise: name parties, specific products, markets, financial metrics
+- NEVER use tabloid/headline movement verbs, even if the source material itself uses
+  them: pops, soars, skyrockets, rockets, surges, spikes, explodes, tanks, craters,
+  plummets, plunges, tumbles, nosedives, dives, slides, goes wild, blows past, smashes,
+  crushes it, shatters. Use a neutral, quantified verb paired with the actual number
+  instead: "rose 2.4%", "declined 1.1%", "increased", "fell".
 - Never speculate about future outcomes
 
 WRITING RULES:

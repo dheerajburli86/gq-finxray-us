@@ -29,6 +29,8 @@ Extract and report:
 - Resulting ownership percentage (if available)
 
 Format: Plain English, one sentence per transaction. Be concise — no padding.
+Never use tabloid/headline verbs (pops, soars, tanks, plunges, etc.) — state the
+transaction facts (shares, price, date) neutrally.
 
 FILING TEXT:
 {raw_text[:4000]}

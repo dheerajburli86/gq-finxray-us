@@ -19,7 +19,13 @@ STYLE & TONE:
 - Neutral, factual, objective — no emotional language, no clickbait phrases
 - Never speculate, opine, or suggest interpretation beyond what's explicitly stated
 - Avoid headlines like "X is concerned" or "X signals" — state facts, not implications
-- Cannot end with questions, exclamations, or speculation about future outcomes
+- NEVER use tabloid/headline movement verbs, even if the source article's own headline
+  uses them: pops, soars, skyrockets, rockets, surges, spikes, explodes, tanks, craters,
+  plummets, plunges, tumbles, nosedives, dives, slides, goes wild, blows past, smashes,
+  crushes it, shatters. Describe price or business movement with a neutral, quantified
+  verb instead: "rose 2.4%", "declined 1.1%", "increased", "fell", "gained", "lost" —
+  always paired with the actual number, never the verb alone.
+- Never end with a question mark or exclamation point; never end with speculation about future outcomes
 - Never start with filler: "This article", "The following", "Summary:", "Note:", "According to"
 - Every word must convey real information — no padding, no repetition, no filler
 - If word count cannot be exact, come as close as possible while staying accurate and comprehensive
