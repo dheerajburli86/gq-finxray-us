@@ -49,9 +49,9 @@ from feature_map import resolve_feature
 # infinite loop burning tokens) and gets flagged for manual review instead
 # of silently discarded or sent out as a low-quality alert.
 MIN_WORDS = 70
-STARTING_TARGET = 75
-TARGET_STEP = 5
-MAX_TARGET = 100
+STARTING_TARGET = 150  # Increased from 75 to allow comprehensive coverage
+TARGET_STEP = 10       # Increased from 5 for larger jumps during retries
+MAX_TARGET = 250       # Increased from 100 to support detailed summaries of complex stories
 
 # Summary class selection: News uses S.1.N, Announcements/filings use S.1.A,
 # Earnings call transcripts (Feature 11) use S.1.T. Transcripts run several
@@ -463,15 +463,27 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_word
 def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=None):
     min_words = MIN_WORDS if min_words is None else min_words
     char_limit = TRANSCRIPT_CHAR_LIMIT if filing_type == "EARNINGS_TRANSCRIPT" else NEWS_CHAR_LIMIT
-    prompt = f"""You are a financial analyst. Write a summary of the following content using exactly {target_words} words.
+    prompt = f"""You are a professional financial analyst. Write a comprehensive, formal summary of the following content in exactly {target_words} words.
 
-Rules:
-- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {min_words} words and never more than {target_words} words.
-- Do not pad the summary with filler phrases, restated facts, or generic commentary just to reach the word count -- every added word must carry real information from the content below.
-- Must end with a complete factual sentence ending in a period. Never end with a question mark or an exclamation point
-- Never end with a rhetorical question, speculation, or a sentence asking what happens next. State what happened; take no position on it
+CONTENT REQUIREMENTS:
+- Cover all major developments and material facts from the content
+- Include quantified impacts: specific numbers, percentages, amounts, timeframes
+- Explain strategic significance and why investors should care
+- Ensure comprehensive coverage that stands alone without reference to the original
+
+STYLE & TONE:
+- Professional, institutional tone suitable for investment professionals
+- Neutral, objective, factual — no editorializing, speculation, or emotional language
+- Precise: name parties, specific products, markets, financial metrics
+- Never speculate about future outcomes
+
+WRITING RULES:
+- Write exactly {target_words} words. If exact {target_words} is impossible while staying strictly accurate, come as close as possible, but never fewer than {min_words} and never more than {target_words}.
+- Do not pad with filler phrases, restated facts, or generic commentary — every word must carry real information.
+- Must end with a complete factual sentence ending in a period. Never end with a question mark or exclamation point.
+- Never end with a rhetorical question, speculation, or a sentence asking what happens next.
 - Do not start with "This", "The following", "Summary:", "Note:" or similar
-- Plain English only, neutral and factual, no first person, no word count mentions
+- Plain English only, neutral and factual, no first person
 
 Company: {company_name}
 
