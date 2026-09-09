@@ -372,14 +372,58 @@ def ends_with_question_or_exclamation(text):
         return False
     return text.strip().endswith(("?", "!"))
 
-def classify_failure(summary, max_words):
+def strip_rhetorical_ending(text):
+    """
+    Drop trailing rhetorical question / exclamation sentences.
+
+    The model reliably pads to a word target by tacking a closer onto the end
+    ("What does this mean for investors?"). The gate then rejects the whole
+    summary and the ladder re-rolls it from scratch -- several LLM calls to
+    fix one removable sentence, and when the ladder runs out the alert is
+    flagged and never sent, losing a summary whose actual reporting was fine.
+    Removing the offending sentence is deterministic, costs nothing, and is
+    exactly the edit we would ask for.
+    """
+    if not text:
+        return text
+    stripped = text.strip()
+    if not stripped.endswith(("?", "!")):
+        return stripped
+    parts = re.split(r"(?<=[.!?])\s+", stripped)
+    while parts and parts[-1].strip().endswith(("?", "!")):
+        parts.pop()
+    return " ".join(parts).strip()
+
+
+def effective_min_words(raw_text):
+    """
+    The word floor this source can honestly support.
+
+    MIN_WORDS (70) assumes a filing or a full article. A lot of what the news
+    pollers surface is a two-line institutional-holding item -- there is no
+    honest way to write 70 words about "HB Wealth Management reduced its AMD
+    stake by 5.6%". The prompts forbid padding, the gate demands 70, and the
+    result was a deadlock that always ended in FLAGGED, NOT SENT: a permanent
+    loss of a real alert because the source was short, not because anything
+    was wrong. Scale the floor to the material instead.
+    """
+    chars = len(raw_text or "")
+    if chars < 600:
+        return 35
+    if chars < 1500:
+        return 50
+    return MIN_WORDS
+
+
+def classify_failure(summary, max_words, min_words=None):
     """Returns the failure reason for this attempt, or None if it passes."""
+    min_words = MIN_WORDS if min_words is None else min_words
     if not summary:
         return "empty"
     wc = count_words(summary)
     if wc > max_words:
         return "too_long"
-    if wc < MIN_WORDS:
+    if wc < min_words:
         return "too_short"
     if starts_with_bad_keyword(summary):
         return "bad_start"
@@ -391,25 +435,38 @@ def classify_failure(summary, max_words):
 
 
 # ── S.1 — Primary summarisation (real S.1.N / S.1.A / S.1.T prompts) ─────────
-def generate_s1(company_name, raw_text, filing_type="", sub_summary=""):
+def generate_s1(company_name, raw_text, filing_type="", sub_summary="", min_words=None):
+    min_words = MIN_WORDS if min_words is None else min_words
     if filing_type == "NEWS":
-        prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT])
+        # These two arguments were omitted, so S.1.N fell back to its own
+        # defaults -- target 120 words, floor 100 -- while classify_failure
+        # rejects anything over STARTING_TARGET (75). Every news item was
+        # therefore instructed to write ~120 words and then failed as
+        # "too_long" on arrival, guaranteed, before the ladder even started;
+        # the ladder then climbed 80/85/90/95/100, never reaching the length
+        # the prompt had asked for, and usually ended flagged and unsent.
+        # NEWS is the highest-volume feature, so this alone accounted for most
+        # of the "FLAGGED, NOT SENT" traffic. S.1.A and S.1.T always passed
+        # these correctly; only this branch did not.
+        prompt = s1n_prompt(company_name, sub_summary, raw_text[:NEWS_CHAR_LIMIT],
+                            target_word_count=STARTING_TARGET, min_word_count=min_words)
     elif filing_type == "EARNINGS_TRANSCRIPT":
         prompt = s1t_prompt(company_name, sub_summary, raw_text[:TRANSCRIPT_CHAR_LIMIT],
-                             target_word_count=STARTING_TARGET, min_word_count=MIN_WORDS)
+                             target_word_count=STARTING_TARGET, min_word_count=min_words)
     else:
         prompt = s1a_prompt(company_name, sub_summary, raw_text[:FILING_CHAR_LIMIT],
-                             target_word_count=STARTING_TARGET, min_word_count=MIN_WORDS)
+                             target_word_count=STARTING_TARGET, min_word_count=min_words)
     return call_deepinfra(prompt, max_tokens=600)
 
 
 # ── S.3 — Resummarize at an escalated word target ─────────────────────────────
-def generate_s3(company_name, raw_text, target_words, filing_type=""):
+def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=None):
+    min_words = MIN_WORDS if min_words is None else min_words
     char_limit = TRANSCRIPT_CHAR_LIMIT if filing_type == "EARNINGS_TRANSCRIPT" else NEWS_CHAR_LIMIT
     prompt = f"""You are a financial analyst. Write a summary of the following content using exactly {target_words} words.
 
 Rules:
-- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {MIN_WORDS} words and never more than {target_words} words.
+- Write exactly {target_words} words. If exactly {target_words} cannot be achieved while staying strictly accurate, come as close as possible, but never fewer than {min_words} words and never more than {target_words} words.
 - Do not pad the summary with filler phrases, restated facts, or generic commentary just to reach the word count -- every added word must carry real information from the content below.
 - Must end with a complete factual sentence ending in a period. Never end with a question mark or an exclamation point
 - Never end with a rhetorical question, speculation, or a sentence asking what happens next. State what happened; take no position on it
@@ -460,10 +517,38 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
     """
     attempts_log = []
     target = STARTING_TARGET
+    min_words = effective_min_words(raw_text)
 
-    raw = generate_s1(company_name, raw_text, filing_type, sub_summary)
-    summary = standardize_numbers(clean_summary(raw)) if raw else None
-    failure = "api_unavailable" if raw is None else classify_failure(summary, target)
+    def _evaluate(raw_response):
+        """
+        Clean, repair what is deterministically repairable, then judge.
+
+        Returns (summary, failure). A trailing rhetorical sentence is removed
+        here rather than being bounced back to the model: it is the single
+        most common failure and the only one we can fix without another call.
+        """
+        if raw_response is None:
+            return None, "api_unavailable"
+        text = standardize_numbers(clean_summary(raw_response))
+        verdict = classify_failure(text, target, min_words)
+        # Attempt the repair whenever the text ENDS rhetorically, not only
+        # when that is the reported verdict. classify_failure checks length
+        # before the rhetorical ending, and the padding closer is frequently
+        # the very thing that pushed the summary over the ceiling -- so the
+        # reported failure reads "too_long" while the actual defect is one
+        # removable sentence. Only checking for the rhetorical verdict would
+        # miss exactly the case that occurs most.
+        if verdict and text and text.strip().endswith(("?", "!")):
+            trimmed = strip_rhetorical_ending(text)
+            if trimmed and classify_failure(trimmed, target, min_words) is None:
+                print(f"[SUMMARY] Trimmed a trailing rhetorical sentence, "
+                      f"resolving '{verdict}' without a retry")
+                return trimmed, None
+        return text, verdict
+
+    raw = generate_s1(company_name, raw_text, filing_type, sub_summary,
+                      min_words=min_words)
+    summary, failure = _evaluate(raw)
     attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
 
     # "api_unavailable" (call_deepinfra returned None — DeepInfra/Gemini gave up
@@ -477,9 +562,9 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
     while failure and failure != "api_unavailable" and target < MAX_TARGET:
         target += TARGET_STEP
         print(f"[SUMMARY] Retry — previous failure: {failure}, new target: {target} words")
-        raw = generate_s3(company_name, raw_text, target, filing_type)
-        summary = standardize_numbers(clean_summary(raw)) if raw else None
-        failure = "api_unavailable" if raw is None else classify_failure(summary, target)
+        raw = generate_s3(company_name, raw_text, target, filing_type,
+                          min_words=min_words)
+        summary, failure = _evaluate(raw)
         attempts_log.append({"attempt": len(attempts_log) + 1, "target": target, "words": count_words(summary), "failure": failure})
 
     if not failure:
@@ -718,7 +803,18 @@ def process_filing(filing):
             update_filing_status(filing_id, "FLAGGED_FOR_REVIEW")
             return
         corrected = standardize_numbers(clean_summary(corrected))
-        failure = classify_failure(corrected, MAX_TARGET)
+        # Judge the correction by the same floor the summary was written to.
+        # Using the bare MIN_WORDS here re-imposed 70 words on a thin source
+        # that summarise() had already, correctly, accepted at a lower floor --
+        # so V.1 "correcting" a valid short summary flagged it as
+        # v1_correction_too_short and the alert was lost after passing every
+        # earlier gate. The rhetorical trim applies here too.
+        min_words = effective_min_words(raw_text)
+        failure = classify_failure(corrected, MAX_TARGET, min_words)
+        if failure and corrected.strip().endswith(("?", "!")):
+            trimmed = strip_rhetorical_ending(corrected)
+            if trimmed and classify_failure(trimmed, MAX_TARGET, min_words) is None:
+                corrected, failure = trimmed, None
         if failure:
             print(f"[FLAGGED] V.1-corrected summary still fails ({failure}) -- {ticker}")
             store_flagged_summary(
