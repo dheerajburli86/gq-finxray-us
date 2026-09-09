@@ -16,7 +16,7 @@ sys.modules["dotenv"] = MagicMock()
 sys.modules["dotenv"].load_dotenv = lambda *a, **k: None
 
 # ── 1. Both queues order newest-first and expire the stale tail ────────────
-calls = {"order": [], "expired": []}
+calls = {"order": [], "expired": [], "or_": []}
 
 
 class Q:
@@ -26,6 +26,9 @@ class Q:
     def eq(self, *a, **k): return self
     def lt(self, *a, **k): return self
     def in_(self, *a, **k): return self
+    def or_(self, filter_string):
+        calls["or_"].append((self.table, filter_string))
+        return self
     @property
     def not_(self): return self
     def limit(self, *a, **k): return self
@@ -54,7 +57,21 @@ assert any(t == "raw_filings" and p.get("status") == "EXPIRED"
            for t, p in calls["expired"]), "pipeline never expires its stale tail"
 print("pipeline: newest-first + stale tail expired ✓")
 
-calls["order"].clear(); calls["expired"].clear()
+# The priority tier must match on filing_type as well as source. PRIORITY_FILING_TYPES
+# was defined and never referenced, so anything in it that does NOT arrive under a
+# priority source was silently never prioritised — in practice INSIDER_FMP, which FMP
+# writes as source="FMP_NEWS", queueing insider trades behind the news backlog they
+# were listed to jump.
+prio = [f for t, f in calls["or_"] if t == "raw_filings"]
+assert prio, "pipeline no longer prioritises its queue at all"
+assert "source.in." in prio[0], "priority tier stopped matching on source"
+assert "filing_type.in." in prio[0], \
+    "priority tier matches source only — PRIORITY_FILING_TYPES is dead again"
+for ft in ap.PRIORITY_FILING_TYPES:
+    assert f'"{ft}"' in prio[0], f"{ft} listed as priority but not in the query"
+print(f"pipeline: priority tier matches source OR filing_type ✓")
+
+calls["order"].clear(); calls["expired"].clear(); calls["or_"].clear()
 
 import fmp_client
 fmp_client.get_quote = lambda t: None

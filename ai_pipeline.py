@@ -123,7 +123,18 @@ def get_token_usage():
 # Plus a shared cooldown: when any thread does get rate limited, every other
 # thread waits out that same window instead of piling straight back into the
 # exhausted quota and turning one 429 into N.
-LLM_CONCURRENCY = int(os.getenv("GQ_LLM_CONCURRENCY", "4"))
+# Raised 4 -> 8. Filings spend nearly all their wall-clock time blocked on a
+# DeepInfra round trip, so the pool is I/O-bound and more slots means more of a
+# batch in flight at once.
+#
+# BE HONEST ABOUT THE CEILING: this is not the binding constraint at typical
+# Gemini Flash latency. Eight workers at a ~3s round trip want ~160 calls/min,
+# and LLM_RPM below caps issuance at 100, so the sliding window — not this
+# number — decides throughput once the queue is deep. What the extra slots
+# actually buy is headroom when calls run slow (a retry ladder, a 429 cooldown,
+# a long transcript), where 4 workers left RPM budget unspent. If the pipeline
+# still lags with this at 8, GQ_LLM_RPM is the knob to turn, not this one.
+LLM_CONCURRENCY = int(os.getenv("GQ_LLM_CONCURRENCY", "8"))
 
 # RPM is a RATE rail, not a spend control -- the same 12 alerts cost the same
 # number of tokens at 55 RPM or 200, they just clear slower at 55. So size it
@@ -1074,13 +1085,32 @@ PRIORITY_FILING_TYPES = ["8-K", "10-Q", "10-K", "4", "EARNINGS_TRANSCRIPT", "INS
 PIPELINE_BATCH_SIZE = int(os.getenv("GQ_PIPELINE_BATCH_SIZE", "12"))
 
 
+def _pg_in(values):
+    """PostgREST `in.(...)` list. Quoted because "8-K"/"10-Q" contain a hyphen."""
+    return ",".join('"{}"'.format(str(v).replace('"', '')) for v in values)
+
+
+# Matched on EITHER axis. Source alone was not enough: FMP writes insider
+# transactions to raw_filings as source="FMP_NEWS", filing_type="INSIDER_FMP"
+# (fmp_poller.py), which is the same time-critical content as an SEC Form 4 but
+# arrives under the same source label as ordinary news.
+_PRIORITY_OR_FILTER = (f"source.in.({_pg_in(PRIORITY_SOURCES)}),"
+                       f"filing_type.in.({_pg_in(PRIORITY_FILING_TYPES)})")
+
+
 def _fetch_prioritised_batch(limit):
     """
-    One batch, SEC/primary-source filings first, then everything else newest-first.
+    One batch, primary-source filings first, then everything else newest-first.
 
     Two queries rather than one so the ordering is explicit and cheap: PostgREST
-    cannot express "sort by a source allowlist" in a single indexed order clause
+    cannot express "sort by an allowlist" in a single indexed order clause
     without a computed column.
+
+    THE DEAD-CONSTANT BUG THIS FIXES. PRIORITY_FILING_TYPES was defined and then
+    never referenced — the query filtered on source alone. Every type in it that
+    does not arrive under a priority SOURCE was therefore never prioritised at
+    all, which in practice meant INSIDER_FMP: FMP insider trades queued behind
+    the news backlog they were listed specifically to jump.
     """
     def _q(builder):
         try:
@@ -1092,7 +1122,7 @@ def _fetch_prioritised_batch(limit):
     priority = _q(supabase.table("raw_filings")
                   .select("*")
                   .eq("status", "PENDING")
-                  .in_("source", PRIORITY_SOURCES)
+                  .or_(_PRIORITY_OR_FILTER)
                   .order("created_at", desc=True)
                   .limit(limit))
 
@@ -1104,14 +1134,19 @@ def _fetch_prioritised_batch(limit):
     # content, so a backlog larger than one batch meant the newest item could not
     # be reached until the whole backlog cleared. The stale tail is expired by
     # expire_stale_filings() above rather than being allowed to block the head.
+    #
+    # Deliberately NOT the complement filter. `not.in` on a nullable column is
+    # NULL, not true, for a NULL filing_type — such a row would be excluded from
+    # this query AND from the priority query above, and would never be processed
+    # by anything. Over-fetching a full page and de-duplicating on id in Python
+    # cannot drop a row that way, and costs one page of rows we already index.
     rest = _q(supabase.table("raw_filings")
               .select("*")
               .eq("status", "PENDING")
-              .not_.in_("source", PRIORITY_SOURCES)
               .order("created_at", desc=True)
-              .limit(limit - len(priority)))
+              .limit(limit))
 
-    return priority + [r for r in rest if r["id"] not in seen]
+    return (priority + [r for r in rest if r["id"] not in seen])[:limit]
 
 
 # ── Main pipeline runner ──────────────────────────────────────────────────────

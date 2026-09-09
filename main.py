@@ -62,13 +62,20 @@ logger = logging.getLogger("main")
 # End-to-end delay is the sum of three queue drains: SEC poll -> AI pipeline ->
 # delivery fan-out. Each drain is a single indexed Supabase query when its queue
 # is empty, so tightening the idle gaps costs queries, not tokens or API quota.
-PIPELINE_IDLE_SECONDS = int(os.getenv("GQ_PIPELINE_IDLE_SECONDS", "3"))
-DELIVERY_IDLE_SECONDS = int(os.getenv("GQ_DELIVERY_IDLE_SECONDS", "3"))
+#
+# Both loops now only sleep when their queue came back EMPTY (see run_pipeline
+# and delivery_loop below), so these are idle-poll intervals, not per-batch
+# pauses. An idle tick is one indexed query returning zero rows; the bulk
+# expiry UPDATEs both loops run are separately throttled to once a minute, so
+# dropping 3s -> 1s triples a cheap read and adds no writes.
+PIPELINE_IDLE_SECONDS = int(os.getenv("GQ_PIPELINE_IDLE_SECONDS", "1"))
+DELIVERY_IDLE_SECONDS = int(os.getenv("GQ_DELIVERY_IDLE_SECONDS", "1"))
 # 8-K and Form 4 are the time-critical ones (material events, insider trades).
 SEC_FAST_POLL_SECONDS = int(os.getenv("GQ_SEC_POLL_SECONDS", "15"))
-# S-1 is market-wide and nothing downstream consumes it in real time, so it does
-# not belong on the fast lane. See the scheduling block below.
-SEC_S1_POLL_MINUTES = int(os.getenv("GQ_SEC_S1_POLL_MINUTES", "30"))
+# S-1 IS NOT A LATENCY CONTROL. Nothing reads what this poll writes -- see the
+# scheduling block below. This interval is a freshness/cost trade-off for data
+# that is currently write-only, not a delay any subscriber experiences.
+SEC_S1_POLL_MINUTES = int(os.getenv("GQ_SEC_S1_POLL_MINUTES", "15"))
 
 from delivery import deliver_pending_alerts as delivery_deliver
 from ai_pipeline import run_pipeline as process_with_ai
@@ -109,15 +116,27 @@ from watchlist_heatmap import (run_watchlist_heatmap_midday,
 # ── Delivery ──────────────────────────────────────────────────────────────────
 async def deliver_pending_alerts():
     """Dispatch to delivery.py, which owns per-user routing, watchlist filtering,
-    message rendering, alert_run_log and payload_log."""
+    message rendering, alert_run_log and payload_log.
+
+    Returns how many alerts left the queue, so delivery_loop can drain a backlog
+    back-to-back instead of sleeping between batches.
+    """
     try:
-        await delivery_deliver()
+        return await delivery_deliver() or 0
     except Exception as e:
         logger.error("Delivery failed: %s", e)
+        return 0
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
-_JOB_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="job")
+# Sized for the worst alignment, not the average one. Fifteen non-SEC jobs run
+# on this pool and their intervals (60s, 15m, 30m, 45m, 60m) all divide an hour,
+# so at the top of every hour six or more fire in the same tick — at 6 workers
+# the rest queued behind whichever slow FMP job took a worker first. FMP has no
+# global rate limiter (only per-call 429 backoff), so this is deliberately 8 and
+# not higher: enough to clear the hourly pile-up, not enough to turn a burst
+# into a quota problem.
+_JOB_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="job")
 # SEC EDGAR gets its own lane. Sharing one pool meant the latency-critical 8-K
 # and Form 4 polls queued behind whatever slow FMP/Massive/news/technical job
 # happened to hold the workers — the heatmap and transcript jobs are minutes
@@ -198,12 +217,33 @@ def run_scheduler():
     schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_10q))
     schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_10k))
 
-    # S-1 is OFF the fast lane. It is the only market-wide SEC poll — it fetches
-    # document bodies for every S-1 anyone files, because pre-IPO filers cannot
-    # be watchlisted — and at 15s it could not finish before its next tick
-    # ("Skipping poll_sec_s1 — previous run still active" in production). It was
-    # burning SEC-lane workers and sec.gov rate budget that 8-K and Form 4 need,
-    # for rows stored IPO_PENDING that only ipo_poller reads, daily.
+    # ── S-1: WRITE-ONLY TODAY. THIS INTERVAL AFFECTS NO ALERT. ────────────────
+    # Tuning this looks like a latency fix and is not one. Trace the rows:
+    #
+    #   poll_sec_s1 writes raw_filings with status="IPO_PENDING"
+    #     -> ai_pipeline reads status="PENDING" only, so it never picks them up
+    #     -> ipo_poller (Feature 8) does NOT read them either: it takes its
+    #        deal list from FMP's ipos-calendar and resolves the S-1 link live
+    #        through edgar_link.find_filing_url() (ipo_poller.py:167)
+    #     -> nothing else queries IPO_PENDING anywhere in the repo
+    #
+    # So no subscriber-visible alert is downstream of this poll at any interval,
+    # and edgar_poller_async.build_ipo_payload says so explicitly ("NOT WIRED
+    # YET, deliberately... it just has no caller"). Whether this data should
+    # drive Feature 8 is a product decision, not a scheduling one.
+    #
+    # What the interval DOES control is cost and staleness. Each run costs one
+    # feed read plus a body fetch per S-1 filed since the last tick — cheap,
+    # because poll_edgar_generic_async drops already-seen URLs before fetching
+    # (known_filing_urls) — but it spends sec_client's GLOBAL 8 req/s budget,
+    # the same budget 8-K and Form 4 draw on. 15 minutes keeps the capture
+    # reasonably fresh for whenever Feature 8 is wired to consume it, without
+    # spending real request budget on rows nothing reads.
+    #
+    # It is off the fast lane because at 15s it could not finish before its own
+    # next tick: a cold start fetches ~100 bodies (EDGAR_FEED_COUNT) at 8 req/s,
+    # about 13 seconds, and logged "Skipping poll_sec_s1 — previous run still
+    # active" in production while holding SEC-lane workers.
     schedule.every(SEC_S1_POLL_MINUTES).minutes.do(sec_job(poll_sec_s1))
 
     # ── Feature 3 — Result Snapshot ───────────────────────────────────────────
@@ -238,9 +278,22 @@ def run_scheduler():
     schedule.every(30).minutes.do(job(run_earnings_transcript_poller))
 
     # ── Feature 11 — Analyst Ratings & Price Targets ──────────────────────────
-    # FMP's consensus endpoints return current state, not an event feed, and the
-    # poller only emits on an actual change, so two-hourly is plenty.
-    schedule.every(2).hours.do(job(poll_analyst_ratings))
+    # FMP's consensus endpoints return current state, not an event feed, so the
+    # poll interval IS the detection delay: a downgrade published one minute
+    # after a tick waited the rest of the interval. Two-hourly made that up to
+    # 119 minutes on a HIGH-impact alert.
+    #
+    # POLLING FASTER CANNOT DUPLICATE. _evaluate() compares the live snapshot
+    # against _latest_prior_alert() — the last alert STORED for that ticker, not
+    # the last poll — so an unchanged consensus is silently "nochange" however
+    # often it is read. Four times the polls is four times the reads, not four
+    # times the alerts.
+    #
+    # Cost is one FMP call plus one indexed Supabase lookup per watched ticker,
+    # paced 0.1s apart inside the poller, and the _JOB_RUNNING guard drops a
+    # tick if the previous pass is still running — so a watchlist too large to
+    # finish in 30 minutes degrades to "as often as it can" instead of stacking.
+    schedule.every(30).minutes.do(job(poll_analyst_ratings))
 
     # ── Feature 12 — Macro & Policy Digest + market reports ───────────────────
     # All ET wall-clock. Market hours are 09:30–16:00 ET.
@@ -297,14 +350,29 @@ def run_pipeline():
 
 # ── Delivery loop ─────────────────────────────────────────────────────────────
 async def delivery_loop():
-    """Last hop before the user's phone. An empty cycle is one indexed query."""
+    """
+    Last hop before the user's phone. An empty cycle is one indexed query.
+
+    THE BACKLOG BUG THIS FIXES. This slept DELIVERY_IDLE_SECONDS after every
+    cycle, including cycles that did work. delivery.py settles at most
+    BATCH_LIMIT (100) alerts per call, so a backlog drained at 100 alerts per
+    (cycle + idle gap) with the gap added for no reason — the queue was known
+    to be non-empty at that exact moment. The pipeline loop below already only
+    sleeps when its queue comes back empty; this now matches it.
+
+    The return value counts alerts that LEFT the queue, not alerts examined, so
+    a cycle that only defers in-flight retries reports 0 and idles rather than
+    spinning on rows it cannot settle yet.
+    """
     logger.info("[DELIVERY] Starting")
     while True:
+        settled = 0
         try:
-            await deliver_pending_alerts()
+            settled = await deliver_pending_alerts()
         except Exception as e:
             logger.error("[DELIVERY] %s", e)
-        await asyncio.sleep(DELIVERY_IDLE_SECONDS)
+        if not settled:
+            await asyncio.sleep(DELIVERY_IDLE_SECONDS)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

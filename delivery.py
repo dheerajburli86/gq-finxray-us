@@ -624,18 +624,25 @@ async def deliver_pending_alerts():
     three alerts this cycle gets them spaced out safely); different users'
     queues run concurrently via asyncio.gather, so N users drop their alerts
     at roughly the same moment instead of one after another.
+
+    Returns the number of alerts SETTLED this cycle — rows that left the
+    undelivered queue, whether they were sent, found no audience or were
+    abandoned as unsendable. main.delivery_loop uses it to drain a backlog
+    back-to-back instead of pausing between batches; deferred rows (still in
+    flight, to be retried) deliberately do not count, so a cycle that settles
+    nothing reports 0 and lets the loop idle instead of spinning.
     """
     _expire_stale_alerts()
 
     alerts = _fetch_undelivered()
     if not alerts:
-        return
+        return 0
 
     users = _fetch_active_users()
     if not users:
         logger.warning("[DELIVERY] %d alerts pending but no active users with a chat_id. "
                        "Leaving them undelivered.", len(alerts))
-        return
+        return 0
 
     tickers = {
         (a.get("ticker") or "").upper()
@@ -778,6 +785,8 @@ async def deliver_pending_alerts():
                     "no_audience=%d deferred=%d errored=%d",
                     len(fanned), stats["sent"], stats["failed"], stats["skipped"],
                     stats["no_audience"], stats["deferred"], stats["errored"])
+
+    return len(fanned)
 
 
 async def deliver_photo(image_path, caption, source, filing_type,
