@@ -31,6 +31,7 @@ issue thousands of round-trips per cycle at 6,300 tickers.
 import os
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -145,7 +146,11 @@ MAX_RETRY_AGE_HOURS = float(os.getenv("MAX_CONTENT_AGE_HOURS", "24"))
 MAX_ALERT_AGE_MINUTES = float(os.getenv("GQ_MAX_ALERT_AGE_MINUTES", "90"))
 
 
-def _expire_stale_alerts():
+_last_expiry_at = [0.0]
+EXPIRY_INTERVAL_SECONDS = float(os.getenv("GQ_EXPIRY_INTERVAL_SECONDS", "60"))
+
+
+def _expire_stale_alerts(force=False):
     """
     Settle alerts too old to be worth sending, in one bulk UPDATE.
 
@@ -154,6 +159,14 @@ def _expire_stale_alerts():
     Marking them delivered retires them without sending -- the alert row and
     its summary stay in the table for review, they just stop being queued.
     """
+    # Throttled: the delivery loop cycles every few seconds, and re-running a
+    # bulk UPDATE that enforces a 90-minute window on every cycle is ~20
+    # pointless writes a minute.
+    now = time.monotonic()
+    if not force and (now - _last_expiry_at[0]) < EXPIRY_INTERVAL_SECONDS:
+        return 0
+    _last_expiry_at[0] = now
+
     cutoff = (datetime.now(timezone.utc)
               - timedelta(minutes=MAX_ALERT_AGE_MINUTES)).isoformat()
     try:

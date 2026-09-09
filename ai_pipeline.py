@@ -898,7 +898,11 @@ def _cutoff_iso(minutes):
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
 
 
-def expire_stale_filings():
+_last_expiry_at = [0.0]
+EXPIRY_INTERVAL_SECONDS = float(os.getenv("GQ_EXPIRY_INTERVAL_SECONDS", "60"))
+
+
+def expire_stale_filings(force=False):
     """
     Retire PENDING rows that are too old to be news.
 
@@ -906,7 +910,17 @@ def expire_stale_filings():
     article is worthless within the hour, an SEC filing is not. Runs as two
     bulk UPDATEs, so a backlog of any size clears in constant time instead of
     being summarized one expensive filing at a time.
+
+    Throttled to once a minute. run_pipeline() ticks every few seconds when
+    the queue is empty, and firing two UPDATEs on every one of those ticks
+    would add ~40 pointless writes a minute against Supabase to enforce a
+    window measured in hours.
     """
+    now = time.monotonic()
+    if not force and (now - _last_expiry_at[0]) < EXPIRY_INTERVAL_SECONDS:
+        return 0
+    _last_expiry_at[0] = now
+
     total = 0
     try:
         news = (supabase.table("raw_filings")
@@ -937,7 +951,12 @@ def expire_stale_filings():
 # ── Main pipeline runner ──────────────────────────────────────────────────────
 def run_pipeline():
     mode = f"AI (DeepInfra - {DEEPINFRA_MODEL})"
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for PENDING filings... [{mode} MODE]")
+    # Only announce a cycle that has work. The loop ticks every few seconds, so
+    # logging every idle poll printed ~40 lines a minute and buried the events
+    # that matter (a filing arriving, a summary failing) in scrollback.
+    verbose_idle = os.getenv("GQ_VERBOSE_IDLE", "").strip().lower() in ("1", "true", "yes")
+    if verbose_idle:
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking for PENDING filings... [{mode} MODE]")
 
     # Checked here, between batches, rather than inside call_deepinfra: a call
     # refused mid-filing would surface as api_unavailable and get the filing
@@ -974,8 +993,12 @@ def run_pipeline():
 
         filings = result.data
         if not filings:
-            print("No PENDING filings found.")
+            if verbose_idle:
+                print("No PENDING filings found.")
             return 0
+
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] "
+              f"{len(filings)} PENDING filing(s) [{mode} MODE]")
 
         print(f"Found {len(filings)} PENDING filings -- processing "
               f"({LLM_CONCURRENCY} at a time)...")

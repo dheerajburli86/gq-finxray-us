@@ -766,11 +766,26 @@ async def poll_sec_s1_async():
 
 
 # ── Sync shims so main.py / schedule keep working unchanged ───────────────────
+async def _with_session_cleanup(coro):
+    """
+    Run one poll, then close the HTTP session that poll opened.
+
+    sec_client keeps one keep-alive session per event loop so the requests
+    within a poll reuse connections instead of paying a TLS handshake each.
+    Every poll gets a fresh loop from asyncio.run() below, so the session has
+    to be closed before that loop goes away or its connector outlives it.
+    """
+    try:
+        return await coro
+    finally:
+        await sec_client.close_session()
+
+
 def _run(coro):
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(_with_session_cleanup(coro))
     raise RuntimeError(
         "Sync shim called from inside an event loop — use the *_async variant."
     )
