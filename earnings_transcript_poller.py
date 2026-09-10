@@ -56,6 +56,24 @@ FILING_LAG_DAYS = 40
 TRIGGER_LOOKBACK_DAYS = int(os.getenv("GQ_TRANSCRIPT_LOOKBACK_DAYS", "21"))
 
 
+def transcript_json_link(ticker, year, quarter):
+    """
+    The source link that rides on every transcript alert.
+
+    Points at our own `transcript` edge function, which serves the stored
+    transcript as raw JSON, rather than at FMP. Three things ruled FMP out as
+    the user-facing link: /api/ answers 401 without a key, embedding the key
+    would publish a paid Ultimate-tier credential to every subscriber, and
+    FMP's public transcript pages 404. The text is already in raw_filings, so
+    the alert links to the copy we hold.
+    """
+    base = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    if not base:
+        return None
+    return (f"{base}/functions/v1/transcript"
+            f"?ticker={ticker}&year={year}&quarter={quarter}")
+
+
 def _guess_period(filed_dt):
     period_end_estimate = filed_dt - timedelta(days=FILING_LAG_DAYS)
     quarter = max(1, min(4, ((period_end_estimate.month - 1) // 3) + 1))
@@ -135,8 +153,7 @@ def store_transcript_for_pipeline(ticker, company_name, year, quarter, transcrip
         logger.info(f"[TRANSCRIPT] {ticker} Q{quarter} FY{year} transcript too short/empty, skipping.")
         return False
 
-    # FMP URL without API key — safe for user-facing alerts
-    fmp_link = f"https://financialmodelingprep.com/api/v4/earning-call-transcript?symbol={ticker}&year={year}&quarter={quarter}"
+    fmp_link = transcript_json_link(ticker, year, quarter)
 
     try:
         supabase.table("raw_filings").insert({
