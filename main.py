@@ -269,7 +269,8 @@ def run_scheduler():
     # EDGAR already caught, and caught faster. These cover what EDGAR structurally
     # cannot — forward earnings calendars and off-exchange block prints.
     schedule.every(30).minutes.do(job(poll_fmp_events))
-    schedule.every(30).minutes.do(job(run_large_trades_poller))
+    # PAUSED: Feature 5 (Large Trades) — uncomment to re-enable
+    # schedule.every(30).minutes.do(job(run_large_trades_poller))
 
     # Feature 4's OTHER half: the EPS surprise itself, not just the heads-up
     # that earnings are due. feature_map already listed EARNINGS_MISS and
