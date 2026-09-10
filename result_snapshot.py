@@ -252,7 +252,7 @@ def store_snapshot_alert(snapshot):
     src = snapshot.get("data_source") or "FMP"
     label = ("SEC XBRL companyfacts" if src == "SEC_XBRL"
              else "FMP Income Statement")
-    
+
     # Build structured GQuants payload for the frontend
     structured_payload = gq_fmt.xbrl_to_financial_results(
         ticker=snapshot["ticker"],
@@ -261,7 +261,18 @@ def store_snapshot_alert(snapshot):
         company_name=snapshot["company_name"],
         form_type=snapshot["form_type"]
     )
-    
+
+    # Build SEC EDGAR link for the filing
+    cik = snapshot.get("cik", "")
+    ticker = snapshot["ticker"]
+    form_type = snapshot["form_type"]
+    filing_url = None
+    if cik:
+        filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type={form_type}&dateb=&owner=exclude&count=10"
+    else:
+        # Fallback to ticker-based SEC EDGAR browse URL
+        filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company={ticker}&type={form_type}&owner=exclude&count=10"
+
     try:
         extra = tag_extra({
             "period": snapshot["period"],
@@ -272,7 +283,7 @@ def store_snapshot_alert(snapshot):
             "structured_payload": structured_payload,
             "data_source": src,
         }, src, "RESULT_SNAPSHOT")
-        
+
         supabase.table("alerts").insert({
             "ticker": snapshot["ticker"],
             "summary": snapshot["summary"],
@@ -280,7 +291,8 @@ def store_snapshot_alert(snapshot):
             "source": src,
             "filing_type": "RESULT_SNAPSHOT",
             "extra": extra,
-            "delivered": False
+            "delivered": False,
+            "filing_url": filing_url,
         }).execute()
         print(f"[SNAPSHOT] {snapshot['impact']} — {snapshot['ticker']} {snapshot['period']} stored (source: {label})")
     except Exception as e:
