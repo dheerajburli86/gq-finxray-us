@@ -42,6 +42,11 @@ load_dotenv()
 FMP_API_KEY = os.getenv("FMP_API_KEY")
 BASE_URL = "https://financialmodelingprep.com/stable"
 
+# Validate API key on module load
+if not FMP_API_KEY:
+    import logging
+    logging.warning("[FMP] FMP_API_KEY not set in environment — all requests will fail")
+
 
 class FMPError(Exception):
     """Raised when FMP returns a hard failure worth distinguishing from 'no data'."""
@@ -81,7 +86,16 @@ def _get(path, params=None, timeout=20, retries=2):
                 wait *= 2
                 continue
             last_was_429 = False
-            print(f"[FMP] {path} returned {r.status_code}: {r.text[:200]}")
+            # Log response error with context
+            error_snippet = r.text[:300]
+            if r.status_code == 401:
+                print(f"[FMP] AUTHENTICATION ERROR (401) on {path}: Invalid or missing API key")
+                print(f"[FMP] Response: {error_snippet}")
+            elif r.status_code == 403:
+                print(f"[FMP] AUTHORIZATION ERROR (403) on {path}: API key lacks permission (may need Ultimate tier)")
+                print(f"[FMP] Response: {error_snippet}")
+            else:
+                print(f"[FMP] {path} returned {r.status_code}: {error_snippet}")
             return None
         except Exception as e:
             last_was_429 = False
@@ -209,9 +223,15 @@ def get_insider_trading(ticker, page=0, limit=50):
     return data if isinstance(data, list) else []
 
 
-# ── Earnings call transcripts (Feature 11 — new) ─────────────────────────────
+# ── Earnings call transcripts (Feature 10) ─────────────────────────────────
 def get_earnings_transcript(ticker, year, quarter):
-    """Returns full transcript text (list of dicts w/ 'content') or None."""
+    """Returns full transcript text (dict w/ 'content' field) or None.
+
+    Requires FMP Ultimate tier — personal tier does not include transcripts.
+    Returns None if not found or API error. Invalid API key results in an
+    "Invalid API KEY" error from FMP (check that your FMP_API_KEY is valid
+    and has Ultimate tier access).
+    """
     data = _get("earning-call-transcript", {"symbol": ticker, "year": year, "quarter": quarter})
     if data and isinstance(data, list) and data:
         return data[0]
@@ -219,12 +239,18 @@ def get_earnings_transcript(ticker, year, quarter):
 
 
 def get_latest_transcripts(limit=50):
+    """Returns list of most recent transcripts. Requires FMP Ultimate tier."""
     data = _get("latest-transcripts", {"limit": limit})
     return data if isinstance(data, list) else []
 
 
 def get_transcript_dates(ticker):
-    """List of (year, quarter, date) tuples available for a ticker."""
+    """List of available transcript dates for a ticker (year, quarter, date tuples).
+
+    Returns empty list if ticker has no transcripts or API error occurs.
+    This is a cheaper call than get_earnings_transcript() — use this first
+    to check availability before fetching.
+    """
     data = _get("transcripts-dates-by-symbol", {"symbol": ticker})
     return data if isinstance(data, list) else []
 

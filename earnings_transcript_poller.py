@@ -242,7 +242,17 @@ def run_earnings_transcript_poller():
 
         transcript = fmp_client.get_earnings_transcript(ticker, year, quarter)
         if not transcript:
-            logger.info(f"[TRANSCRIPT] No transcript available yet for {ticker} Q{quarter} FY{year}")
+            logger.debug(f"[TRANSCRIPT] No transcript available yet for {ticker} Q{quarter} FY{year}")
+            continue
+
+        # Validate transcript has content
+        if isinstance(transcript, dict):
+            content = transcript.get("content", "")
+            if not content:
+                logger.warning(f"[TRANSCRIPT] Transcript for {ticker} Q{quarter} FY{year} has no content field")
+                continue
+        else:
+            logger.warning(f"[TRANSCRIPT] Unexpected transcript format for {ticker}: {type(transcript)}")
             continue
 
         company_name = filing.get("company_name", ticker)
