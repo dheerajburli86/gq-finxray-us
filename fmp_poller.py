@@ -359,7 +359,17 @@ def poll_insider_transactions(tickers):
                         "value": value_str,
                         "role": role,
                         "transaction_date": txn_date,
-                        "source": "FMP"
+                        "source": "FMP",
+                        # The link goes in extra, NOT in filing_url: that column
+                        # carries a synthetic per-transaction dedup key backed by
+                        # a UNIQUE index, so pointing every insider row at the
+                        # same issuer URL would make the second trade for a
+                        # company collide and drop the alert. alert_formatter
+                        # reads extra first, and raw_filings.extra is carried
+                        # into alerts.extra by ai_pipeline unchanged.
+                        "url": ("https://www.sec.gov/cgi-bin/browse-edgar"
+                                f"?action=getcompany&CIK={ticker}&type=4"
+                                "&dateb=&owner=include&count=40"),
                     }, "FMP_NEWS", "INSIDER_FMP")
                 }).execute()
                 print(f"[FMP INSIDER] {action_emoji} {ticker} — {insider_name} {action}S {shares_str} @ {price_str}")

@@ -28,6 +28,7 @@ Quality decisions made here, and why:
 """
 
 import html
+import os
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -40,6 +41,35 @@ ET = ZoneInfo("America/New_York")
 
 DISCLAIMER_URL = "https://gquants.com/disclaimer"
 MANAGE_URL = "https://gquants.com/build"
+
+# Features whose alert IS the artefact — an image or a whole-market digest with
+# no per-row detail worth opening. Everything else gets a JSON link.
+NO_DATA_LINK_TYPES = {
+    "SECTOR_HEATMAP", "HEATMAP_DAILY_MIDDAY", "HEATMAP_DAILY_AFTERNOON",
+    "HEATMAP_WEEKLY", "HEATMAP_MONTHLY",
+    "HEATMAP_WATCHLIST_MIDDAY", "HEATMAP_WATCHLIST_EOD",
+    "MARKET_REPORT", "MACRO_BRIEFING",
+}
+
+
+def _data_link(alert):
+    """
+    Per-alert JSON, served by our own `alert` edge function.
+
+    Several features have no upstream document to link to: a large block print,
+    an aggregated insider summary and an upcoming earnings date are events we
+    computed rather than fetched, so there is no vendor URL that describes them
+    and they shipped with no link at all. The numbers behind them are on the
+    alert row, so this points there — which also gives every feature the same
+    shape of link instead of a source link on some and nothing on others.
+    """
+    alert_id = str(alert.get("id") or "")
+    base = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    if not (alert_id and base):
+        return None
+    if (alert.get("filing_type") or "") in NO_DATA_LINK_TYPES:
+        return None
+    return f"{base}/functions/v1/alert?id={alert_id}"
 
 IMPACT_EMOJI = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
 
@@ -299,6 +329,10 @@ def build_message(alert, reason=None):
     url = _source_link(alert)
     if url:
         lines.append(f'🔗 <a href="{esc_attr(url)}">View source</a>')
+
+    data_url = _data_link(alert)
+    if data_url:
+        lines.append(f'🧾 <a href="{esc_attr(data_url)}">Alert data (JSON)</a>')
 
     # ── GQuants deep link ────────────────────────────────────────────────────
     # The structured payload (fr / it / ipo / earning_calls / tradingview) rides

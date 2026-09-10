@@ -14,6 +14,7 @@ Runs every 24 hours via scheduler in main.py.
 import logging
 import re
 from datetime import datetime, timezone, date, timedelta
+from urllib.parse import quote_plus
 from supabase import create_client
 from dotenv import load_dotenv
 import os
@@ -311,6 +312,17 @@ def process_ipo(ipo):
         )
         if s1_url:
             extra["s1_source"] = "fmp_lookup"
+
+    if not s1_url:
+        # A registrant whose S-1 we could not resolve still has an EDGAR
+        # presence, and that page is where the S-1 appears once it is filed.
+        # Without this the whole feature shipped unlinked whenever the lookup
+        # missed — which, for a company that has not started trading, is most
+        # of the time.
+        s1_url = ("https://www.sec.gov/cgi-bin/browse-edgar"
+                  f"?action=getcompany&company={quote_plus(name or ticker)}"
+                  "&type=S-1&dateb=&owner=include&count=40")
+        extra["s1_source"] = "edgar_search"
 
     save_alert(ticker, summary, impact, extra, link=s1_url)
 

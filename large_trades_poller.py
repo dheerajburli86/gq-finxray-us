@@ -256,7 +256,15 @@ def save_alert(ticker, block):
                 "fills": block.get("fills", 1),
                 "traded_at": dt.isoformat(),
             }, "LARGE_TRADE", "LARGE_TRADE"),
-            "filing_url": None,
+            # A block print has no filing behind it — the tape reports the
+            # trade, not who made it. The summary above tells the reader to
+            # watch 13D/G for the ownership answer, so link them there rather
+            # than sending the one alert type with nothing to tap. EDGAR's
+            # browse-edgar resolves a ticker in the CIK parameter, so this
+            # needs no CIK lookup.
+            "filing_url": ("https://www.sec.gov/cgi-bin/browse-edgar"
+                           f"?action=getcompany&CIK={ticker}&type=SC+13"
+                           "&dateb=&owner=include&count=40"),
         }).execute()
         logger.info(f"[LARGE_TRADES] {ticker}: {int(block['size']):,} sh @ "
                     f"${block['price']:.2f} = {_fmt_notional(block['notional'])}")
