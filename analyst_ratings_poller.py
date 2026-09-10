@@ -160,9 +160,8 @@ def _company_names(tickers):
 
 def _insert_alert(ticker, summary, impact, extra, delivered=False):
     try:
-        # Link to FMP analyst estimates API endpoint (JSON)
-        fmp_api_key = os.getenv('FMP_API_KEY')
-        filing_url = f"https://financialmodelingprep.com/stable/analyst-estimates?symbol={ticker.upper()}&apikey={fmp_api_key}"
+        # Link to FMP analyst estimates endpoint — no API key in user-facing URL
+        filing_url = f"https://financialmodelingprep.com/stable/analyst-estimates?symbol={ticker.upper()}"
 
         supabase.table("alerts").insert({
             "ticker": ticker,
