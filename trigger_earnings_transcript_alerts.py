@@ -52,17 +52,18 @@ FILING_TYPE = "EARNINGS_TRANSCRIPT"
 
 def transcript_link(ticker, year, quarter):
     """
-    The human-viewable transcript page.
+    Raw-JSON source link, served by our own `transcript` edge function.
 
-    Deliberately NOT /api/v4/earning-call-transcript: that endpoint answers 401
-    to an unauthenticated request, so it renders as a broken "View source" for
-    every subscriber, and appending our apikey to fix that would publish the
-    credential to all of them.
+    Deliberately not FMP: /api/ answers 401 unauthenticated, embedding our
+    apikey would publish a paid credential to every subscriber, and FMP's
+    public transcript pages 404. The transcript text is already in
+    raw_filings, so the alert links to the copy we hold.
     """
-    if not (ticker and year and quarter):
+    base = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    if not (ticker and year and quarter and base):
         return None
-    return (f"https://www.financialmodelingprep.com/earnings-call-transcript/"
-            f"{ticker}?year={year}&quarter={quarter}")
+    return (f"{base}/functions/v1/transcript"
+            f"?ticker={ticker}&year={year}&quarter={quarter}")
 
 
 def fetch_transcript_alerts(ticker=None, limit=50):
