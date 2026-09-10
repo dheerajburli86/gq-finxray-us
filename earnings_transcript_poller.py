@@ -135,8 +135,11 @@ def store_transcript_for_pipeline(ticker, company_name, year, quarter, transcrip
         logger.info(f"[TRANSCRIPT] {ticker} Q{quarter} FY{year} transcript too short/empty, skipping.")
         return False
 
-    # FMP URL without API key — safe for user-facing alerts
-    fmp_link = f"https://financialmodelingprep.com/api/v4/earning-call-transcript?symbol={ticker}&year={year}&quarter={quarter}"
+    # The human-viewable transcript page, NOT the /api/ endpoint. An API URL
+    # without an apikey answers 401 to anyone who taps "View source", and
+    # putting the key in it would publish our credential to every subscriber.
+    fmp_link = (f"https://www.financialmodelingprep.com/earnings-call-transcript/"
+                f"{ticker}?year={year}&quarter={quarter}")
 
     try:
         supabase.table("raw_filings").insert({

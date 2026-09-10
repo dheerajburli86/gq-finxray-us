@@ -1,191 +1,188 @@
 #!/usr/bin/env python3
 """
 trigger_earnings_transcript_alerts.py
-GQ FinXray US — Trigger earnings call transcript alerts to users' watchlists.
+GQ FinXray US — Feature 10. Re-queue an earnings call transcript alert so it
+goes out to every user watching that ticker, carrying a working source link.
 
-This script processes pending earnings transcripts and sends them to users
-who have those tickers on their watchlist, with proper JSON links included.
+WHY THIS DOES NOT SEND ANYTHING ITSELF
+--------------------------------------
+delivery.py owns fan-out. It resolves the audience from the watchlist, applies
+each user's min_impact / muted_features / daily cap, renders the Telegram
+message, and records one row per (alert, user) in `alert_deliveries` — whose
+UNIQUE key is what makes a crash mid-fan-out safe to retry. Sending from here
+too would duplicate all of that and bypass the ledger.
+
+So this script's only job is to put a well-formed row in `alerts` with
+delivered=False. The running delivery loop picks it up within a second.
+
+TWO THINGS THAT MAKE A RE-SEND FAIL, BOTH HANDLED HERE
+------------------------------------------------------
+1. `alert_deliveries` suppresses a resend of the SAME alert id to the same user
+   once it is SENT. Flipping delivered back to False on the original row
+   therefore re-queues it and then delivers it to nobody.
+2. delivery._expire_stale_alerts() retires anything undelivered and older than
+   GQ_MAX_ALERT_AGE_MINUTES (90 by default) — without sending it. An old row
+   flipped back to False is silently re-retired on the next cycle, usually
+   within a minute.
+
+Both are avoided the same way: insert a NEW row (new id, fresh created_at)
+rather than reviving the old one.
 
 Usage:
-    python trigger_earnings_transcript_alerts.py
+    python trigger_earnings_transcript_alerts.py            # everything missing a link
+    python trigger_earnings_transcript_alerts.py AVGO       # just this ticker
 """
 
 import os
+import sys
 import logging
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 from supabase import create_client
-
-import gquants_format_converter as gq_fmt
-from feature_map import tag_extra
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-ET = ZoneInfo("America/New_York")
 SOURCE = "FMP_TRANSCRIPT"
 FILING_TYPE = "EARNINGS_TRANSCRIPT"
 
 
-def get_processed_transcripts():
+def transcript_link(ticker, year, quarter):
     """
-    Find earnings transcripts that were processed by ai_pipeline
-    and turned into summarized alerts, but haven't been delivered yet.
+    The human-viewable transcript page.
+
+    Deliberately NOT /api/v4/earning-call-transcript: that endpoint answers 401
+    to an unauthenticated request, so it renders as a broken "View source" for
+    every subscriber, and appending our apikey to fix that would publish the
+    credential to all of them.
     """
+    if not (ticker and year and quarter):
+        return None
+    return (f"https://www.financialmodelingprep.com/earnings-call-transcript/"
+            f"{ticker}?year={year}&quarter={quarter}")
+
+
+def fetch_transcript_alerts(ticker=None, limit=50):
     try:
-        result = supabase.table("alerts") \
-            .select("*") \
-            .eq("source", SOURCE) \
-            .eq("filing_type", FILING_TYPE) \
-            .eq("delivered", False) \
-            .order("created_at", desc=True) \
-            .limit(50) \
-            .execute()
-        return result.data or []
+        q = (supabase.table("alerts")
+             .select("*")
+             .eq("source", SOURCE)
+             .eq("filing_type", FILING_TYPE))
+        if ticker:
+            q = q.eq("ticker", ticker.upper())
+        return (q.order("created_at", desc=True).limit(limit).execute()).data or []
     except Exception as e:
-        logger.error(f"[TRANSCRIPT_ALERT] Failed to fetch processed transcripts: {e}")
+        logger.error("[TRANSCRIPT_ALERT] Could not read transcript alerts: %s", e)
         return []
 
 
-def get_users_for_ticker(ticker):
-    """
-    Get all users who have this ticker on their watchlist.
-    Returns list of user dicts with user_id, username.
-    """
+def has_watchers(ticker):
+    """No point queueing an alert nobody will match."""
     try:
-        result = supabase.table("watchlists") \
-            .select("user_id, username") \
-            .eq("ticker", ticker) \
-            .execute()
-        return result.data or []
+        rows = (supabase.table("watchlists")
+                .select("user_id")
+                .eq("ticker", ticker)
+                .limit(1)
+                .execute()).data or []
+        return len(rows) > 0
     except Exception as e:
-        logger.error(f"[TRANSCRIPT_ALERT] Failed to fetch users for {ticker}: {e}")
-        return []
-
-
-def send_alert_to_user(user_id, alert_data):
-    """
-    Send an individual alert to a specific user.
-    Returns True if successful.
-    """
-    try:
-        # Mark as delivered to this user
-        alert_copy = dict(alert_data)
-        alert_copy["delivered"] = True
-        alert_copy["extra"]["user_id"] = user_id
-        alert_copy["extra"]["delivered_at"] = datetime.now(ET).isoformat()
-
-        # Insert the user-specific alert
-        supabase.table("alerts").insert(alert_copy).execute()
-        return True
-    except Exception as e:
-        logger.error(f"[TRANSCRIPT_ALERT] Failed to send alert to user {user_id}: {e}")
+        logger.error("[TRANSCRIPT_ALERT] Watchlist lookup failed for %s: %s", ticker, e)
         return False
 
 
-def trigger_transcript_alerts():
+def requeue(alert):
     """
-    Main trigger function: find processed transcripts and send to watchlist users.
+    Clone one transcript alert into a fresh undelivered row carrying the link.
+
+    Returns True if a row was queued.
     """
-    logger.info("[TRANSCRIPT_ALERT] Starting earnings transcript alert trigger...")
+    ticker = (alert.get("ticker") or "").upper()
+    extra = dict(alert.get("extra") or {})
+    link = transcript_link(ticker, extra.get("year"), extra.get("quarter"))
 
-    transcripts = get_processed_transcripts()
-    if not transcripts:
-        logger.info("[TRANSCRIPT_ALERT] No pending transcript alerts to send.")
-        return
-
-    logger.info(f"[TRANSCRIPT_ALERT] Found {len(transcripts)} processed transcript(s)")
-
-    sent_count = 0
-    failed_count = 0
-
-    for transcript_alert in transcripts:
-        ticker = transcript_alert.get("ticker", "UNKNOWN")
-        if ticker == "UNKNOWN":
-            continue
-
-        logger.info(f"[TRANSCRIPT_ALERT] Processing {ticker}...")
-
-        # Get all users watching this ticker
-        users = get_users_for_ticker(ticker)
-        if not users:
-            logger.info(f"[TRANSCRIPT_ALERT] {ticker}: No users watching this ticker")
-            continue
-
-        logger.info(f"[TRANSCRIPT_ALERT] {ticker}: Found {len(users)} users watching")
-
-        # Send to each user
-        for user in users:
-            user_id = user.get("user_id")
-            username = user.get("username", "Unknown")
-
-            if send_alert_to_user(user_id, transcript_alert):
-                logger.info(f"[TRANSCRIPT_ALERT] {ticker} → {username} ({user_id}): SENT")
-                sent_count += 1
-            else:
-                logger.warning(f"[TRANSCRIPT_ALERT] {ticker} → {username} ({user_id}): FAILED")
-                failed_count += 1
-
-    logger.info(
-        f"[TRANSCRIPT_ALERT] Done. Sent: {sent_count}, Failed: {failed_count}"
-    )
-
-
-def format_transcript_alert_with_links(ticker, company_name, year, quarter, summary, impact):
-    """
-    Create a properly formatted alert with working JSON link.
-    """
-    # Build proper FMP link
-    fmp_link = f"https://financialmodelingprep.com/api/v4/earning-call-transcript?symbol={ticker}&year={year}&quarter={quarter}"
-
-    extra = tag_extra({
-        "ticker": ticker,
-        "company_name": company_name,
-        "year": year,
-        "quarter": quarter,
-        "fmp_link": fmp_link,
-        "created_at": datetime.now(ET).isoformat(),
-    }, SOURCE, FILING_TYPE)
-
-    return {
-        "ticker": ticker,
-        "summary": summary,
-        "impact": impact,
-        "source": SOURCE,
-        "filing_type": FILING_TYPE,
-        "filing_url": fmp_link,
-        "extra": extra,
-        "delivered": False,
-    }
-
-
-def create_alert_for_transcript(ticker, company_name, year, quarter, summary, impact):
-    """
-    Create a new alert for an earnings transcript with proper links.
-    """
-    try:
-        alert_data = format_transcript_alert_with_links(
-            ticker, company_name, year, quarter, summary, impact
-        )
-        supabase.table("alerts").insert(alert_data).execute()
-        logger.info(
-            f"[TRANSCRIPT_ALERT] Created alert for {ticker} Q{quarter} FY{year}"
-        )
-        return True
-    except Exception as e:
-        if "duplicate" not in str(e).lower():
-            logger.error(
-                f"[TRANSCRIPT_ALERT] Failed to create alert for {ticker}: {e}"
-            )
+    if not link:
+        logger.warning("[TRANSCRIPT_ALERT] %s: no year/quarter in extra, cannot "
+                       "build a source link — skipping", ticker)
         return False
+
+    if not has_watchers(ticker):
+        logger.info("[TRANSCRIPT_ALERT] %s: nobody is watching this ticker", ticker)
+        return False
+
+    extra["fmp_link"] = link
+    extra["requeued_at"] = datetime.now(timezone.utc).isoformat()
+    extra["requeued_from"] = alert.get("id")
+    payload = extra.get("structured_payload")
+    if isinstance(payload, dict):
+        payload["fmp_link"] = link
+
+    try:
+        supabase.table("alerts").insert({
+            "ticker": ticker,
+            "summary": alert.get("summary"),
+            "impact": alert.get("impact") or "MEDIUM",
+            "source": SOURCE,
+            "filing_type": FILING_TYPE,
+            "filing_url": link,
+            "extra": extra,
+            "delivered": False,
+        }).execute()
+    except Exception as e:
+        logger.error("[TRANSCRIPT_ALERT] %s: insert failed: %s", ticker, e)
+        return False
+
+    # Stamp the row we cloned so an unattended re-run cannot queue it twice.
+    try:
+        origin_extra = dict(alert.get("extra") or {})
+        origin_extra["requeued"] = True
+        (supabase.table("alerts")
+         .update({"extra": origin_extra})
+         .eq("id", alert.get("id"))
+         .execute())
+    except Exception as e:
+        logger.warning("[TRANSCRIPT_ALERT] %s: queued, but could not stamp the "
+                       "source row (re-running may duplicate): %s", ticker, e)
+    return True
+
+
+def trigger_transcript_alerts(ticker=None):
+    logger.info("[TRANSCRIPT_ALERT] Re-queueing earnings transcript alerts%s",
+                f" for {ticker.upper()}" if ticker else "")
+
+    alerts = fetch_transcript_alerts(ticker)
+    if not alerts:
+        logger.info("[TRANSCRIPT_ALERT] No transcript alerts found.")
+        return 0
+
+    # One re-send per ticker+quarter, newest row wins.
+    latest = {}
+    for a in alerts:
+        extra = a.get("extra") or {}
+        key = (a.get("ticker"), extra.get("year"), extra.get("quarter"))
+        latest.setdefault(key, a)
+
+    queued = 0
+    for alert in latest.values():
+        # An explicit ticker means "send me this one now" — otherwise only
+        # repair the rows that actually went out without a source link.
+        if not ticker:
+            if alert.get("filing_url") or alert.get("link"):
+                continue
+            if (alert.get("extra") or {}).get("requeued"):
+                continue
+        if requeue(alert):
+            logger.info("[TRANSCRIPT_ALERT] %s: queued for delivery", alert.get("ticker"))
+            queued += 1
+
+    logger.info("[TRANSCRIPT_ALERT] Done. %d alert(s) queued — delivery.py will "
+                "fan them out to watchers on its next cycle.", queued)
+    return queued
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s"
-    )
-    trigger_transcript_alerts()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    trigger_transcript_alerts(sys.argv[1] if len(sys.argv) > 1 else None)

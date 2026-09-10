@@ -103,7 +103,6 @@ from heatmap_generator import (run_sector_heatmap_midday, run_sector_heatmap_aft
                                run_sector_heatmap_weekly, run_sector_heatmap_monthly)
 # ── Feature 10: Earnings Call Transcripts ─────────────────────────────────────
 from earnings_transcript_poller import run_earnings_transcript_poller
-from trigger_earnings_transcript_alerts import trigger_transcript_alerts
 # ── Feature 11: Analyst Ratings & Price Targets ───────────────────────────────
 from analyst_ratings_poller import poll_analyst_ratings
 # ── Feature 12: Macro & Policy Digest + scheduled market reports ──────────────
@@ -296,8 +295,6 @@ def run_scheduler():
 
     # ── Feature 10 — Earnings Call Transcripts ────────────────────────────────
     schedule.every(30).minutes.do(job(run_earnings_transcript_poller))
-    # Trigger transcript alerts to watchlist users after processing completes
-    schedule.every(30).minutes.do(job(trigger_transcript_alerts))
 
     # ── Feature 11 — Analyst Ratings & Price Targets ──────────────────────────
     # FMP's consensus endpoints return current state, not an event feed, so the
