@@ -135,6 +135,9 @@ def store_transcript_for_pipeline(ticker, company_name, year, quarter, transcrip
         logger.info(f"[TRANSCRIPT] {ticker} Q{quarter} FY{year} transcript too short/empty, skipping.")
         return False
 
+    # FMP URL without API key — safe for user-facing alerts
+    fmp_link = f"https://financialmodelingprep.com/api/v4/earning-call-transcript?symbol={ticker}&year={year}&quarter={quarter}"
+
     try:
         supabase.table("raw_filings").insert({
             "source": "FMP_TRANSCRIPT",
@@ -142,24 +145,20 @@ def store_transcript_for_pipeline(ticker, company_name, year, quarter, transcrip
             "ticker": ticker,
             "company_name": company_name,
             "raw_text": content,
-            "filing_url": f"fmp_transcript_{ticker}_{year}_Q{quarter}",
+            "filing_url": fmp_link,
             "filed_at": transcript.get("date", datetime.now(timezone.utc).isoformat()) if isinstance(transcript, dict) else datetime.now(timezone.utc).isoformat(),
             "status": "PENDING",
             "extra": {
                 "year": year, "quarter": quarter,
                 "title": f"{company_name} Q{quarter} FY{year} Earnings Call Transcript",
                 "source": "FMP Earnings Call Transcript",
-                # Carries the transcript body as a rendered `earning_calls` view.
-                # Note the raw FMP URL is NOT stored: it embeds the API key as a
-                # query param, so putting it in a user-facing alert would leak
-                # the credential to every subscriber.
                 "structured_payload": gq_fmt.earnings_transcript(
                     ticker=ticker,
                     company_name=company_name,
                     quarter=f"Q{quarter}",
                     fiscal_year=str(year),
                     transcript_text=content,
-                    fmp_link="",
+                    fmp_link=fmp_link,
                     filing_date=str(transcript.get("date", "")) if isinstance(transcript, dict) else "",
                 ),
             }
