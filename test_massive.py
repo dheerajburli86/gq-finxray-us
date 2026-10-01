@@ -1,10 +1,9 @@
 """
 test_massive.py
-Replaces test_td_crypto.py / test_td_crypto_v2.py / twelvedata_crypto_test.txt.
+Smoke test for the Massive client.
 
-Quick smoke test for the Massive client (formerly Polygon.io) — covers
-stocks (snapshot, RSI, SMA) and crypto (snapshot), since Massive is now
-the crypto data source instead of TwelveData.
+Quick smoke test for the Massive client — covers
+stocks (snapshot, RSI, SMA) and crypto (snapshot).
 """
 import json
 import massive_client
@@ -33,7 +32,6 @@ def main():
     news = massive_client.get_news(ticker="AAPL", limit=3)
     check("get_news(AAPL)", news)
 
-    # Crypto — replaces the old TwelveData crypto test scripts
     btc = massive_client.get_crypto_snapshot("X:BTCUSD")
     check("get_crypto_snapshot(X:BTCUSD)", btc)
 

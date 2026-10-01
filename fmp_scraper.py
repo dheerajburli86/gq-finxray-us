@@ -1,6 +1,6 @@
 """
 FMP Main Scraper — fetches EOD history, returns, and market cap for any
-universe. Replaces eodhd_scraper.py.
+universe.
 
 Usage:
     python fmp_scraper.py --universe us_stocks
@@ -14,7 +14,7 @@ Per instrument fetches:
     1. Historical EOD (10 years OHLCV, /stable/historical-price-eod/full) -> returns_latest + price_history
     2. Profile (/stable/profile) -> market_cap_usd, sector, industry (instruments table update)
 
-FMP has no per-request "402 quota exceeded" convention like EODHD did —
+FMP has no per-request "402 quota exceeded" convention —
 rate limits come back as HTTP 429. QuotaExceededError is kept as the
 signal name for compatibility with the rest of this script, but it's now
 raised on a 429 that persists past the retry budget rather than a 402.
@@ -84,7 +84,7 @@ ISIN_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{9,10}$")
 
 
 def to_fmp_symbol(instrument):
-    """FMP takes bare US tickers (no .US suffix like EODHD needed)."""
+    """FMP takes bare US tickers."""
     return instrument["symbol"]
 
 

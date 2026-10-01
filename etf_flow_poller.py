@@ -123,11 +123,11 @@ def check_etf_momentum(etf_info):
 
     sign = "+" if change_p > 0 else ""
     summary = (
-        f"{emoji} *ETF Momentum Alert — *\n\n"
-        f"*ETF:* {name} ({category})\n"
-        f"*Price:*  ({sign}{change_p:.2f}%)\n"
-        f"*Volume:* {int(volume):,} ({volume_ratio:.1f}x prior session)\n"
-        f"*Signal:* {signal_text}\n"
+        f"{emoji} ETF Momentum Alert — {ticker}\n\n"
+        f"ETF: {name} ({category})\n"
+        f"Price:  ({sign}{change_p:.2f}%)\n"
+        f"Volume: {int(volume):,} ({volume_ratio:.1f}x prior session)\n"
+        f"Signal: {signal_text}\n"
         f"_Note: This is a momentum signal based on volume/price, not official fund flow data._\n"
         f"_Source: Massive Market Snapshot | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
     )

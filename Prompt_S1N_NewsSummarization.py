@@ -1,20 +1,48 @@
 """Prompt_S1N_NewsSummarization.py — Summarize news articles"""
 
-def get_prompt(company_name, sub_summary, raw_text, target_word_count=120, min_word_count=100):
-    return f"""You are a financial news analyst. Summarize this news article about {company_name}.
+def get_prompt(company_name, sub_summary, raw_text, target_word_count=150, min_word_count=120):
+    return f"""You are a professional financial news analyst. Summarize this news article about {company_name} in a formal, institutional tone suitable for investment professionals.
 
 Target: exactly {target_word_count} words
 Minimum: {min_word_count} words (never shorter)
 Maximum: {target_word_count} words
 
-CRITICAL RULES:
-- Include the most important facts: what happened, why it matters, financial impact if relevant
-- Include specific numbers, percentages, dates if present in the article
-- Must end with complete sentence (period, exclamation, or question mark)
+CONTENT REQUIREMENTS:
+- Cover all major developments: what happened, quantified impact, why investors should care
+- Include every material fact: specific numbers, percentages, valuations, timeframes, guidance
+- Explain implications: business impact, competitive positioning, financial consequences
+- Name key parties, products, markets, and financial metrics mentioned
+- Ensure the summary is comprehensive — assume the reader will not see the original article
+- CARRY EVERY NUMBER. Any figure present in the source — dollar amounts, share
+  counts, percentages, dates, guidance ranges, period labels — must appear in the
+  summary with its units and its context intact. Dropping a number is the most
+  common way these summaries lose the thing the reader actually needed. If the
+  word budget is tight, cut adjectives and connective phrasing, never facts.
+- NO SILENT OMISSIONS. If the source covers several distinct developments, all of
+  them are named. Do not pick one and present it as the whole story.
+
+STYLE & TONE:
+- Professional, institutional, formal language (as if written for a financial analyst or portfolio manager)
+- Neutral, factual, objective — no emotional language, no clickbait phrases
+- Never speculate, opine, or suggest interpretation beyond what's explicitly stated
+- NO JUDGEMENT WORDS. Report magnitude with numbers, never with an opinion about
+  them. Banned: impressive, disappointing, strong, weak, robust, sluggish, solid,
+  poor, healthy, worrying, remarkable, stellar, dismal, better-than-feared. Write
+  "revenue rose 12% to $4.1B", never "revenue showed strong growth".
+- ATTRIBUTE, DO NOT ASSERT. Anything that is a company claim, an analyst view or a
+  management projection is reported as such ("management guided to", "the filing
+  states"), never restated as established fact in our own voice.
+- Avoid headlines like "X is concerned" or "X signals" — state facts, not implications
+- NEVER use tabloid/headline movement verbs, even if the source article's own headline
+  uses them: pops, soars, skyrockets, rockets, surges, spikes, explodes, tanks, craters,
+  plummets, plunges, tumbles, nosedives, dives, slides, goes wild, blows past, smashes,
+  crushes it, shatters. Describe price or business movement with a neutral, quantified
+  verb instead: "rose 2.4%", "declined 1.1%", "increased", "fell", "gained", "lost" —
+  always paired with the actual number, never the verb alone.
+- Never end with a question mark or exclamation point; never end with speculation about future outcomes
 - Never start with filler: "This article", "The following", "Summary:", "Note:", "According to"
-- Plain English, neutral and factual, no personal opinion
-- Every word must carry real information — no padding or repetition
-- If word count cannot be exact, come as close as possible while staying accurate
+- Every word must convey real information — no padding, no repetition, no filler
+- If word count cannot be exact, come as close as possible while staying accurate and comprehensive
 
 {sub_summary or ""}
 

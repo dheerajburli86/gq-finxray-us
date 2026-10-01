@@ -123,8 +123,8 @@ NEWS_SOURCES = [
     {"name": "CNBC Markets",        "url": "https://www.cnbc.com/id/10001147/device/rss/rss.html", "source_key": "CNBC",        "sector": "MARKET"},
     {"name": "CNBC Earnings",       "url": "https://www.cnbc.com/id/15839069/device/rss/rss.html", "source_key": "CNBC",        "sector": "MARKET"},
     {"name": "CNBC Investing",      "url": "https://www.cnbc.com/id/20409666/device/rss/rss.html", "source_key": "CNBC",        "sector": "MARKET"},
-    {"name": "MarketWatch Top Stories", "url": "https://feeds.marketwatch.com/marketwatch/topstories", "source_key": "MARKETWATCH", "sector": "MARKET"},
-    {"name": "MarketWatch Market Pulse", "url": "https://feeds.marketwatch.com/marketwatch/marketpulse", "source_key": "MARKETWATCH", "sector": "MARKET"},
+    {"name": "MarketWatch Top Stories", "url": "https://feeds.marketwatch.com/marketwatch/topstories", "alt_urls": ["https://feeds.content.dowjones.io/public/rss/mw_topstories"], "source_key": "MARKETWATCH", "sector": "MARKET"},
+    {"name": "MarketWatch Market Pulse", "url": "https://feeds.marketwatch.com/marketwatch/marketpulse", "alt_urls": ["https://feeds.content.dowjones.io/public/rss/mw_marketpulse"], "source_key": "MARKETWATCH", "sector": "MARKET"},
     {"name": "Yahoo Finance",       "url": "https://finance.yahoo.com/news/rssindex",               "source_key": "YAHOO",       "sector": "MARKET"},
     {"name": "Nasdaq Originals",    "url": "https://www.nasdaq.com/feed/nasdaq-originals/rss.xml",  "source_key": "NASDAQ",      "sector": "MARKET"},
     {"name": "Investor's Business Daily", "url": "https://www.investors.com/feed/",                 "source_key": "IBD",         "sector": "MARKET"},
@@ -133,7 +133,7 @@ NEWS_SOURCES = [
     # ── Sector desks ──────────────────────────────────────────────────────────
     {"name": "CNBC Technology",     "url": "https://www.cnbc.com/id/19854910/device/rss/rss.html", "source_key": "CNBC", "sector": "TECHNOLOGY"},
     {"name": "CNBC Finance",        "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "source_key": "CNBC", "sector": "FINANCE"},
-    {"name": "MarketWatch Banking", "url": "https://feeds.marketwatch.com/marketwatch/financialservices", "source_key": "MARKETWATCH", "sector": "FINANCE"},
+    {"name": "MarketWatch Banking", "url": "https://feeds.marketwatch.com/marketwatch/financialservices", "alt_urls": ["https://feeds.content.dowjones.io/public/rss/mw_marketpulse"], "source_key": "MARKETWATCH", "sector": "FINANCE"},
     {"name": "CNBC Healthcare",     "url": "https://www.cnbc.com/id/10000108/device/rss/rss.html", "source_key": "CNBC", "sector": "HEALTHCARE"},
     {"name": "CNBC Energy",         "url": "https://www.cnbc.com/id/19836768/device/rss/rss.html", "source_key": "CNBC", "sector": "ENERGY"},
     {"name": "CNBC Retail",         "url": "https://www.cnbc.com/id/10000116/device/rss/rss.html", "source_key": "CNBC", "sector": "CONSUMER"},
@@ -143,7 +143,7 @@ NEWS_SOURCES = [
     {"name": "CNBC Real Estate",    "url": "https://www.cnbc.com/id/10000115/device/rss/rss.html", "source_key": "CNBC", "sector": "REAL_ESTATE"},
 
     # ── Macro ─────────────────────────────────────────────────────────────────
-    {"name": "MarketWatch Economy", "url": "https://feeds.marketwatch.com/marketwatch/economy-politics", "source_key": "MARKETWATCH", "sector": "MACRO"},
+    {"name": "MarketWatch Economy", "url": "https://feeds.marketwatch.com/marketwatch/economy-politics", "alt_urls": ["https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"], "source_key": "MARKETWATCH", "sector": "MACRO"},
 ]
 
 SECTOR_KEYWORDS = {
@@ -640,10 +640,22 @@ def _parse_entries(root):
     return items
 
 
+# After this many consecutive failures with no success in between, a feed is
+# treated as gone rather than briefly unhealthy. Publishers retire feed URLs
+# permanently; without this the poller keeps requesting a dead endpoint every
+# hour for the life of the process and logs a warning each time, which is how
+# a decommissioned feed becomes permanent log noise.
+FEED_QUARANTINE_AFTER = int(os.getenv("GQ_FEED_QUARANTINE_AFTER", "12"))
+
+
 def _source_is_paused(name):
     """True while a previously failing source is inside its backoff window."""
     state = _source_health.get(name)
-    return bool(state) and time.monotonic() < state.get("skip_until", 0.0)
+    if not state:
+        return False
+    if state.get("quarantined"):
+        return True
+    return time.monotonic() < state.get("skip_until", 0.0)
 
 
 def _note_source_failure(name, url, reason, detail=None):
@@ -658,6 +670,16 @@ def _note_source_failure(name, url, reason, detail=None):
     n = state["failures"]
     wait = min(FEED_BACKOFF_BASE_SECONDS * (2 ** (n - 1)), FEED_BACKOFF_MAX_SECONDS)
     state["skip_until"] = time.monotonic() + wait
+
+    if n >= FEED_QUARANTINE_AFTER:
+        state["quarantined"] = True
+        logger.error("[NEWS] %s %s — failure #%d, QUARANTINED (treated as "
+                     "decommissioned; restart or fix the URL to re-enable)",
+                     name, reason, n)
+        log_poller_error(POLLER_NAME, f"fetch:{name}", reason,
+                         {"url": url, "consecutive_failures": n,
+                          "quarantined": True, "detail": detail})
+        return
 
     is_tier_change = (n & (n - 1)) == 0  # 1, 2, 4, 8, 16 …
     logger.warning("[NEWS] %s %s — failure #%d, pausing this feed for %.0fs",
@@ -681,27 +703,44 @@ def _fetch_feed(source):
     GET one feed, falling back to a browser identity on a bot-filter rejection.
     Returns (response_or_None, reason_string_or_None).
     """
-    name, url = source["name"], source["url"]
-    try:
-        r = _session.get(url, headers=HEADERS, timeout=FEED_TIMEOUT)
-    except Exception as e:
-        return None, f"unreachable: {type(e).__name__}: {e}"
+    name = source["name"]
 
-    if r.status_code in (403, 406, 429):
+    # Try the configured URL, then any known replacements. Publishers migrate
+    # feeds and leave the old host answering 403/404 forever -- MarketWatch
+    # moved from feeds.marketwatch.com to Dow Jones, and the dead originals
+    # were failing on every cycle, permanently, with the browser-UA retry
+    # burning a second request each time. An alternate that works ends the
+    # failure instead of backing off into it for the life of the process.
+    candidates = [source["url"]] + list(source.get("alt_urls") or [])
+    last_reason = None
+
+    for idx, url in enumerate(candidates):
         try:
-            r2 = _session.get(url, headers=BROWSER_HEADERS, timeout=FEED_TIMEOUT)
-        except Exception:
-            r2 = None
-        if r2 is not None and r2.status_code == 200:
-            logger.info("[NEWS] %s accepted the browser User-Agent after HTTP %s",
-                        name, r.status_code)
-            return r2, None
-        if r2 is not None:
-            r = r2
+            r = _session.get(url, headers=HEADERS, timeout=FEED_TIMEOUT)
+        except Exception as e:
+            last_reason = f"unreachable: {type(e).__name__}: {e}"
+            continue
 
-    if r.status_code != 200:
-        return None, f"HTTP {r.status_code}"
-    return r, None
+        if r.status_code in (403, 406, 429):
+            try:
+                r2 = _session.get(url, headers=BROWSER_HEADERS, timeout=FEED_TIMEOUT)
+            except Exception:
+                r2 = None
+            if r2 is not None and r2.status_code == 200:
+                logger.info("[NEWS] %s accepted the browser User-Agent after HTTP %s",
+                            name, r.status_code)
+                return r2, None
+            if r2 is not None:
+                r = r2
+
+        if r.status_code == 200:
+            if idx > 0:
+                logger.info("[NEWS] %s served by alternate URL %s", name, url)
+            return r, None
+
+        last_reason = f"HTTP {r.status_code}"
+
+    return None, last_reason or "no usable URL"
 
 
 def poll_news_source(source, watched, cutoff):

@@ -18,6 +18,7 @@ Q = [
 
 import sec_financials, fmp_client
 sec_financials.get_income_statement_sync = lambda cik, limit=8: Q
+sec_financials.get_company_name = lambda cik: "Apple Inc."
 fmp_client.get_profile = lambda t: {"companyName":"Apple Inc."}
 
 import result_snapshot as rs

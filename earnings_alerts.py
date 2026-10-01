@@ -172,6 +172,20 @@ def poll_earnings_for_tickers():
                 except Exception:
                     continue
 
+                # THE NameError THIS FIXES. The 2026-08-19 bugfix above renamed
+                # `announcement_date` to `event_date_str` at the read site but
+                # left four uses of the old name in the insert below. That is an
+                # undefined local, so every insert raised NameError straight into
+                # the broad `except Exception` at the bottom of this loop, which
+                # only special-cases "duplicate"/"unique" and logged everything
+                # else as a warning. Between never being scheduled and this, the
+                # feature has produced nothing since it was written.
+                #
+                # The calendar date (not the parsed timestamp) is the dedup key:
+                # it is stable across re-polls, which is what content_hash's
+                # unique index relies on to make this idempotent.
+                announced_on = str(event_date_str)[:10]
+
                 # Only process earnings from last 24 hours (to catch fresh results)
                 if (datetime.now(timezone.utc) - event_date).total_seconds() > 86400:
                     continue
@@ -210,10 +224,10 @@ def poll_earnings_for_tickers():
                         "filing_type": filing_type,
                         "filing_url": (
                             "https://site.financialmodelingprep.com/calendar/earnings"
-                            f"?symbol={ticker}#{announcement_date}"
+                            f"?symbol={ticker}#{announced_on}"
                         ),
-                        "filed_at": announcement_date,
-                        "content_hash": f"{ticker}-{announcement_date}-{filing_type}",
+                        "filed_at": event_date.isoformat(),
+                        "content_hash": f"{ticker}-{announced_on}-{filing_type}",
                         "raw_text": (
                             f"{ticker} reported quarterly earnings per share of "
                             f"${surprise['eps_actual']} against a consensus estimate of "
@@ -226,7 +240,7 @@ def poll_earnings_for_tickers():
                                 "eps_actual": surprise['eps_actual'],
                                 "eps_estimate": surprise['eps_estimate'],
                                 "beat_amount": surprise['beat_amount'],
-                                "announcement_date": announcement_date,
+                                "announcement_date": announced_on,
                                 "source_name": "FMP Earnings Calendar",
                             },
                             "FMP",

@@ -1,8 +1,8 @@
 """
 fmp_fundamentals.py
-Replaces eodhd_fundamentals.py — CLI fundamentals viewer, now on FMP.
+CLI fundamentals viewer, on FMP.
 
-FMP splits what EODHD gave you in one giant nested payload across several
+FMP splits fundamentals across several
 flat endpoints (profile, key-metrics, income-statement, balance-sheet-
 statement, cashflow-statement) — this pulls each and prints the same
 sectioned report as before.

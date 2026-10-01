@@ -1,6 +1,6 @@
 """
 watchlist_heatmap.py
-GQ FinXray US — Feature 14, the personal watchlist heatmap.
+GQ FinXray US — Feature 13, the personal watchlist heatmap.
 
 One image per user, showing only the stocks that user actually watches, sent
 only to that user.
@@ -46,7 +46,7 @@ ET = ZoneInfo("America/New_York")
 
 SOURCE = "WATCHLIST_HEATMAP"
 
-# The two slots feature_map.py recognises for feature 14.
+# The two slots feature_map.py recognises for feature 13.
 SLOT_MIDDAY = "HEATMAP_WATCHLIST_MIDDAY"
 SLOT_EOD = "HEATMAP_WATCHLIST_EOD"
 
@@ -192,7 +192,7 @@ def _caption(rows, slot, total_watched, omitted):
         lines += ["", (f"Showing your top {TRIM_HEAD} and bottom {TRIM_TAIL} of "
                        f"{total_watched} watched tickers — {omitted} mid-range "
                        f"holdings were left out to keep the image readable.")]
-    lines += ["", "<i>GQ FinXray US · Feature 14 — Watchlist Heatmap</i>"]
+    lines += ["", "<i>GQ FinXray US · Feature 13 — Watchlist Heatmap</i>"]
     return "\n".join(lines)
 
 

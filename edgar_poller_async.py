@@ -12,8 +12,10 @@ Replaces edgar_poller.py. Two changes that matter:
    ticker nobody is watching.
 
    S-1 is the deliberate exception: pre-IPO filers cannot be on anyone's
-   watchlist, so poll_sec_s1 runs with watchlist_only=False and stores
-   rows as IPO_PENDING so the AI pipeline skips them.
+   watchlist, so poll_sec_s1 runs with watchlist_only=False. Those rows are
+   stored under source=SEC_IPO (Feature 8) rather than SEC_EDGAR, because
+   delivery.py treats SEC_EDGAR as company-scoped and an IPO registrant has
+   no ticker for a watchlist to match — see poll_sec_s1_async.
 
 2. ASYNC. Document bodies for the surviving filings are fetched
    concurrently through sec_client's rate-limited session instead of
@@ -25,6 +27,7 @@ poll_sec_s1, load_cik_map.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -37,6 +40,7 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 import sec_client
+import sec_financials
 from typing import Dict, Any
 
 load_dotenv()
@@ -51,9 +55,18 @@ EDGAR_FEED = (
       "&search_text=&output=atom"
 )
 EDGAR_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
+# Survives a restart within the same container, which is what turns a startup
+# 429 from "this process is blind for its whole life" into "one stale cycle".
+CIK_CACHE_PATH = os.getenv("GQ_CIK_CACHE_PATH", "/tmp/gq_cik_map.json")
 
 FEED_COUNT = int(os.getenv("EDGAR_FEED_COUNT", "100"))
 DOC_TEXT_LIMIT = 6000
+
+# Feature 8's EDGAR half. Deliberately NOT "SEC_EDGAR": delivery.py lists that
+# in COMPANY_ONLY_SOURCES so a filing for an unwatched company can never be
+# broadcast, which is right for 8-K/10-Q/Form 4 and fatal for an S-1 — the
+# registrant is pre-IPO and cannot be on anyone's watchlist by definition.
+IPO_SOURCE = "SEC_IPO"
 
 CIK_MAP: dict[str, str] = {}
 
@@ -79,24 +92,116 @@ def log_poller_error(job_name, error, context=None):
 
 
 # ── CIK map ───────────────────────────────────────────────────────────────────
-async def load_cik_map_async():
+def cik_map_ready() -> bool:
+    """
+    True once the CIK->ticker map is usable.
+
+    WHY THIS EXISTS. An empty CIK_MAP is not a degraded state, it is a total
+    outage of every watchlist-scoped SEC feature — ticker_from_cik() returns
+    "UNKNOWN" for every filing, so poll_edgar_generic_async's watchlist filter
+    discards ALL of them and logs the cheerful "No watchlisted 8-K filings."
+    Features 1, 3 and 10 then produce nothing, and the only clue in the logs is
+    a single line at startup. Observed in production 2026-09-09: SEC answered
+    429 to company_tickers.json three times, the loader returned, and the
+    process ran for its whole life with an empty map.
+    """
+    return bool(CIK_MAP)
+
+
+def _save_cik_cache():
+    """Keep the last good map on disk so a throttled restart is not fatal."""
+    try:
+        with open(CIK_CACHE_PATH, "w") as fh:
+            json.dump(CIK_MAP, fh)
+    except Exception as e:
+        logger.warning("[SETUP] Could not write CIK cache to %s: %s", CIK_CACHE_PATH, e)
+
+
+def _load_cik_cache() -> int:
+    try:
+        with open(CIK_CACHE_PATH) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        logger.warning("[SETUP] Could not read CIK cache: %s", e)
+        return 0
+    if isinstance(data, dict) and data:
+        CIK_MAP.update(data)
+        return len(data)
+    return 0
+
+
+async def load_cik_map_async(force: bool = False):
+    """
+    Populate CIK_MAP. Safe to call repeatedly — a no-op once loaded.
+
+    SEC rate-limits this file like any other endpoint, and it is fetched at
+    startup when nothing else has warmed the limiter, so a 429 here is both
+    likely and maximally damaging. Three fallbacks, in order: the live file, the
+    on-disk cache from a previous run, and finally a loud error plus a retry
+    scheduled by main.py — never a silent empty map.
+    """
+    if CIK_MAP and not force:
+        return len(CIK_MAP)
+
     print("[SETUP] Loading SEC CIK-to-ticker mapping...")
     data = await sec_client.get_json(EDGAR_CIK_URL)
-    if not data:
-        log_poller_error("load_cik_map", "empty response from company_tickers.json")
-        return
-    try:
-        for val in data.values():
-            cik = str(val["cik_str"]).zfill(10)
-            CIK_MAP[cik] = val["ticker"].upper()
-        print(f"[SETUP] Loaded {len(CIK_MAP):,} ticker mappings")
-    except Exception as e:
-        log_poller_error("load_cik_map", e)
+
+    if data:
+        try:
+            for val in data.values():
+                cik = str(val["cik_str"]).zfill(10)
+                CIK_MAP[cik] = val["ticker"].upper()
+            print(f"[SETUP] Loaded {len(CIK_MAP):,} ticker mappings")
+            _save_cik_cache()
+            return len(CIK_MAP)
+        except Exception as e:
+            log_poller_error("load_cik_map", e)
+
+    cached = _load_cik_cache()
+    if cached:
+        print(f"[SETUP] SEC unavailable — using cached CIK map ({cached:,} mappings). "
+              f"Will refresh on the next scheduled attempt.")
+        return cached
+
+    # Nothing live, nothing cached. Say plainly what is now broken, because the
+    # symptom downstream is silence, not an error.
+    logger.error(
+        "[SETUP] CIK MAP IS EMPTY — SEC returned nothing and no cache exists. "
+        "Every watchlist-scoped SEC feature (Features 1, 3, 10) will discard "
+        "every filing as UNKNOWN until this loads. Retrying on schedule."
+    )
+    log_poller_error("load_cik_map", "empty response from company_tickers.json "
+                                     "and no on-disk cache")
+    return 0
 
 
 def load_cik_map():
-    """Sync entry point, kept for main.py."""
-    asyncio.run(load_cik_map_async())
+    """
+    Sync entry point, kept for main.py.
+
+    Goes through the same session cleanup as every other poll. Calling
+    asyncio.run() directly here left the HTTP session this download opened
+    bound to a loop that was then closed, so it was never closed itself --
+    aiohttp reports that as an unclosed-connector warning at startup.
+    """
+    return asyncio.run(_with_session_cleanup(load_cik_map_async()))
+
+
+def ensure_cik_map():
+    """
+    Scheduled retry. No-op once the map is loaded, so this is cheap to run often.
+
+    Startup is the worst possible moment to fetch company_tickers.json — the
+    rate limiter is cold and every poller is firing at once — and giving up
+    there left the process permanently blind. This gives it repeated chances
+    without blocking boot.
+    """
+    if cik_map_ready():
+        return len(CIK_MAP)
+    logger.warning("[SETUP] CIK map still empty — retrying company_tickers.json")
+    return load_cik_map()
 
 
 def ticker_from_cik(cik: str) -> str:
@@ -379,8 +484,47 @@ def known_filing_urls(urls: list[str]) -> set[str]:
         return set(urls)
 
 
+def known_registrant_ciks(ciks: list[str], source: str) -> set[str]:
+    """
+    CIKs that already have a stored row from `source`. One batched query.
+
+    Used to suppress S-1 AMENDMENT spam. The EDGAR feed pattern deliberately
+    matches "S-1/A" as well as "S-1" (an amendment is still the filing), and a
+    live IPO files a long string of them — every one a fresh URL, so the
+    filing_url dedup above lets all of them through. The initial registration is
+    the news ("X has filed to go public"); the amendments are procedural and
+    would each become an identical broadcast alert.
+    """
+    ciks = [c for c in ciks if c]
+    if not ciks:
+        return set()
+    try:
+        rows = (supabase.table("raw_filings")
+                .select("extra")
+                .eq("source", source)
+                .in_("extra->>cik", ciks)
+                .execute().data or [])
+        return {(r.get("extra") or {}).get("cik") for r in rows
+                if (r.get("extra") or {}).get("cik")}
+    except Exception as e:
+        log_poller_error("known_registrant_ciks", e, {"count": len(ciks)})
+        # Fail closed: a lookup outage must not turn into a broadcast storm.
+        return set(ciks)
+
+
 def store_filing(filing_type, company_name, ticker, raw_text, filing_url,
-                 extra=None, status="PENDING"):
+                 extra=None, status="PENDING", source="SEC_EDGAR"):
+    """
+    Insert one raw_filings row.
+
+    `source` is a parameter and not a constant because delivery.py routes on it:
+    SEC_EDGAR is in COMPANY_ONLY_SOURCES, which is correct for 8-K/10-Q/Form 4
+    (a filing for an unwatched company must never broadcast) and wrong for S-1,
+    whose whole point is a company nobody can have watchlisted yet. S-1 is stored
+    under SEC_IPO so it routes market-wide; everything else keeps SEC_EDGAR.
+    `source_priority` stays SEC_EDGAR either way — it records which FEED the row
+    came from, which is what the pipeline's precedence rules read.
+    """
     try:
         # Payloads are attached by the caller that actually has the parsed data
         # (Form 4 here, financial results in result_snapshot). No "needs_payload"
@@ -390,7 +534,7 @@ def store_filing(filing_type, company_name, ticker, raw_text, filing_url,
         stored_extra["source_priority"] = "SEC_EDGAR"
 
         supabase.table("raw_filings").insert({
-            "source": "SEC_EDGAR",
+            "source": source,
             "filing_type": filing_type,
             "company_name": company_name,
             "ticker": ticker,
@@ -435,9 +579,76 @@ def _parse_feed(xml_text: str):
     return out
 
 
+# ── 8-K item classification ───────────────────────────────────────────────────
+# An 8-K is "a material event happened" -- the item number says WHICH, and that
+# is the whole meaning of the filing. 2.02 is the quarterly earnings release,
+# 1.01 a material agreement, 5.02 an executive departure; they are entirely
+# different alerts. alert_formatter already renders extra["item_types"], but
+# nothing ever populated it, so every 8-K reached the reader as an unlabelled
+# "material event" and the earnings releases -- the most valuable filing SEC
+# publishes, out hours before any vendor re-reports them -- were
+# indistinguishable from routine ones.
+EIGHT_K_ITEMS = {
+    "1.01": "Entry into a Material Agreement",
+    "1.02": "Termination of a Material Agreement",
+    "1.03": "Bankruptcy or Receivership",
+    "2.01": "Completion of Acquisition or Disposition",
+    "2.02": "Results of Operations and Financial Condition",
+    "2.03": "Creation of a Material Direct Financial Obligation",
+    "2.04": "Triggering Events Accelerating a Financial Obligation",
+    "2.05": "Costs Associated with Exit or Disposal Activities",
+    "2.06": "Material Impairments",
+    "3.01": "Delisting or Failure to Satisfy a Listing Rule",
+    "3.02": "Unregistered Sale of Equity Securities",
+    "3.03": "Material Modification to Rights of Security Holders",
+    "4.01": "Changes in Registrant's Certifying Accountant",
+    "4.02": "Non-Reliance on Previously Issued Financial Statements",
+    "5.01": "Changes in Control of Registrant",
+    "5.02": "Departure or Election of Directors or Officers",
+    "5.03": "Amendments to Articles or Bylaws",
+    "5.07": "Submission of Matters to a Vote of Security Holders",
+    "7.01": "Regulation FD Disclosure",
+    "8.01": "Other Events",
+    "9.01": "Financial Statements and Exhibits",
+}
+
+# "Item 2.02" / "ITEM 2.02." / "Item&nbsp;2.02"
+_ITEM_RE = re.compile(r"item\s*(\d\.\d{2})", re.IGNORECASE)
+
+# Item 9.01 is on nearly every 8-K (it just lists the exhibits) and 7.01 is a
+# disclosure wrapper, so neither identifies what the filing is ABOUT. They are
+# kept out of the headline label so the meaningful item leads.
+_LOW_SIGNAL_ITEMS = {"9.01", "7.01"}
+
+
+def extract_8k_items(text):
+    """
+    The 8-K item numbers present in the filing, most meaningful first.
+
+    Returns ["2.02: Results of Operations and Financial Condition", ...].
+    """
+    if not text:
+        return []
+    found = []
+    for code in dict.fromkeys(_ITEM_RE.findall(text[:20000])):
+        code = code.strip()
+        if code in EIGHT_K_ITEMS:
+            found.append(code)
+    if not found:
+        return []
+    found.sort(key=lambda c: (c in _LOW_SIGNAL_ITEMS, c))
+    return [f"{c}: {EIGHT_K_ITEMS[c]}" for c in found]
+
+
+def is_earnings_8k(item_codes):
+    """True when this 8-K carries the quarterly results (Item 2.02)."""
+    return any(str(i).startswith("2.02") for i in (item_codes or []))
+
+
 # ── Generic poller ────────────────────────────────────────────────────────────
 async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
-                                   status="PENDING"):
+                                   status="PENDING", source="SEC_EDGAR",
+                                   dedupe_by_cik=False):
     stamp = datetime.now().strftime("%H:%M:%S")
     print(f"\n[{stamp}] Polling SEC EDGAR for {label}"
           f"{'' if watchlist_only else ' (market-wide)'}...")
@@ -455,13 +666,35 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
             print(f"[{stamp}] No entries in {label} feed.")
             return 0
 
+        # Refuse to filter against a map we do not have. Without this the loop
+        # below resolves every CIK to "UNKNOWN", drops every filing, and prints
+        # "No watchlisted 8-K filings." — a sentence that is indistinguishable
+        # from a genuinely quiet feed and is why an empty map went unnoticed for
+        # a whole production run. Returning here also leaves the filings
+        # unstored and unmarked, so they are picked up normally once the map
+        # loads, provided they are still inside the feed window.
+        if watchlist_only and not cik_map_ready():
+            logger.error("[EDGAR] %s poll SKIPPED — CIK map is empty, so no filing "
+                         "can be matched to a watchlist. This is an outage, not a "
+                         "quiet feed.", label)
+            return 0
+
         watchlist = get_watchlist() if watchlist_only else None
-        pattern = re.compile(rf'{re.escape(form_type)}\s*-\s*(.+?)\s*\((\d+)\)')
+        # (?:/A)? handles amended filings (8-K/A, 10-Q/A, 10-K/A, S-1/A), which
+        # SEC EDGAR files constantly and which otherwise never match this
+        # pattern -- title is "8-K/A - Company (0001234567)", not "8-K - ...",
+        # so the plain form_type pattern stops right after "8-K" and fails.
+        # A fallback pattern (same shape as edgar_poller.py's) catches any
+        # other title layout SEC uses. Without either, m is None, cik is "",
+        # ticker_from_cik("") returns "UNKNOWN", and the filing is silently
+        # dropped -- even when it is for a watchlisted company.
+        pattern = re.compile(rf'{re.escape(form_type)}(?:/A)?\s*-\s*(.+?)\s*\((\d+)\)')
+        fallback_pattern = re.compile(r'[^-]+-\s*(.+?)\s*\((\d+)\)')
 
         # ---- FILTER BEFORE FETCH ----
         candidates = []
         for e in entries:
-            m = pattern.match(e["title"])
+            m = pattern.match(e["title"]) or fallback_pattern.match(e["title"])
             company = m.group(1).strip() if m else e["title"]
             cik = m.group(2) if m else ""
             ticker = ticker_from_cik(cik)
@@ -482,6 +715,27 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
             print(f"[{stamp}] No new {label} filings.")
             return 0
 
+        # One registration per company, not one per amendment. See
+        # known_registrant_ciks(). Applied AFTER the URL check so the batched
+        # CIK query only runs for filings that are genuinely new.
+        if dedupe_by_cik:
+            already = known_registrant_ciks([c["cik"] for c in candidates], source)
+            fresh, suppressed = [], 0
+            for c in candidates:
+                # Guard within this batch too: the same CIK can appear twice in
+                # one feed page (S-1 and S-1/A filed minutes apart).
+                if c["cik"] and c["cik"] in already:
+                    suppressed += 1
+                    continue
+                already.add(c["cik"])
+                fresh.append(c)
+            if suppressed:
+                print(f"[{stamp}] Suppressed {suppressed} {label} amendment(s) "
+                      f"for companies already captured.")
+            candidates = fresh
+            if not candidates:
+                return 0
+
         print(f"[{stamp}] {len(candidates)} new {label} filing(s) to fetch.")
 
         # ---- FETCH (concurrent, rate-limited) ----
@@ -497,8 +751,29 @@ async def poll_edgar_generic_async(form_type, label, watchlist_only=True,
                      "watchlist_only": watchlist_only}
             if form_type in ("10-Q", "10-K"):
                 extra["needs_result_snapshot"] = True
+            # SEC's own machine-readable endpoints for this filing/company.
+            # Carrying them means an alert can point at the structured source
+            # data itself -- companyfacts XBRL, and the filing index that
+            # lists the EX-99.1 earnings release -- with no vendor involved.
+            sec_json = sec_financials.build_sec_json_links(c["cik"], c["url"])
+            if sec_json:
+                extra["sec_json"] = sec_json
+
+            if form_type.startswith("8-K"):
+                items = extract_8k_items(text)
+                if items:
+                    extra["item_types"] = items
+                    # An earnings 8-K is the quarterly result, reported by the
+                    # company itself the moment it announces -- hours ahead of
+                    # any vendor, and typically WEEKS ahead of the 10-Q that
+                    # currently triggers the Result Snapshot. Flagging it lets
+                    # downstream treat it as earnings rather than as a generic
+                    # material event.
+                    if is_earnings_8k(items):
+                        extra["is_earnings_release"] = True
+                        print(f"[8-K] {c['ticker']}: Item 2.02 earnings release")
             store_filing(form_type, c["company"], c["ticker"], text, c["url"],
-                         extra=extra, status=status)
+                         extra=extra, status=status, source=source)
             stored += 1
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Stored {stored} {label} filings.")
@@ -526,8 +801,13 @@ async def poll_sec_form4_async():
                 grouped.setdefault(m.group(1), []).append(e)
 
         watchlist = get_watchlist()
-        issuer_re = re.compile(r'4\s*-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)')
-        reporter_re = re.compile(r'4\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)')
+        # (?:/A)? for amended Form 4/A filings -- same gap as the generic
+        # poller above: "4/A - Issuer (0001234567) (Issuer)" doesn't match
+        # a pattern anchored on a bare "4", so cik stays "" and the filing
+        # is dropped as UNKNOWN regardless of whether it's watchlisted.
+        issuer_re = re.compile(r'4(?:/A)?\s*-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)')
+        reporter_re = re.compile(r'4(?:/A)?\s*-\s*(.+?)\s*\(\d+\)\s*\(Reporting\)')
+        fallback_issuer_re = re.compile(r'[^-]+-\s*(.+?)\s*\((\d+)\)\s*\(Issuer\)')
 
         candidates = []
         for entries in grouped.values():
@@ -536,7 +816,7 @@ async def poll_sec_form4_async():
             if not issuer:
                 continue
 
-            m = issuer_re.match(issuer["title"])
+            m = issuer_re.match(issuer["title"]) or fallback_issuer_re.match(issuer["title"])
             company = m.group(1).strip() if m else issuer["title"]
             cik = m.group(2) if m else ""
             ticker = ticker_from_cik(cik)
@@ -624,31 +904,12 @@ def build_form4_structured_payload(
     )
 
 
-def build_s1_structured_payload(
-    company_name: str,
-    ticker: str,
-    price_range: str,
-    shares: str,
-    deal_size: str,
-    listing_date: str,
-    cik: str
-) -> Dict[str, Any]:
-    """
-    Convert S-1 IPO data to GQuants `ipo` format.
-
-    NOT WIRED YET, deliberately. S-1 rows are stored status="IPO_PENDING" and
-    the AI pipeline skips them, so nothing downstream would render this. It
-    also needs the Feature 8 merge (FMP calendar supplies price range, share
-    count and deal size; an initial S-1 usually carries none of them). Wire
-    this from ipo_poller once that merge exists -- the builder is correct and
-    tested, it just has no caller.
-    """
-    from gquants_format_converter import s1_to_ipo
-    form_link = f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-    return s1_to_ipo(
-        company_name, ticker, price_range, shares, deal_size,
-        listing_date, form_link, cik
-    )
+# build_s1_structured_payload() lived here: a caller-less wrapper that guessed
+# form_link as a bare CIK directory URL. The Feature 8 merge it was waiting for
+# now exists, and ipo_poller.process_ipo calls s1_to_ipo directly with the real
+# filing URL and filing date from our own S-1 capture — strictly better inputs
+# than this could produce, so the wrapper is gone rather than left as a second,
+# worse path to the same payload.
 
 
 async def poll_sec_8k_async():
@@ -664,20 +925,55 @@ async def poll_sec_10k_async():
 
 
 async def poll_sec_s1_async():
-    # Market-wide by design: S-1 filers are pre-IPO and on nobody's watchlist.
-    # IPO_PENDING keeps these rows out of the AI pipeline until Feature 8
-    # enriches them.
+    """
+    S-1 registrations — Feature 8's early-warning half.
+
+    Market-wide by design: an S-1 filer is pre-IPO, so it is on nobody's
+    watchlist and its CIK is not in the ticker map (these rows carry
+    ticker="UNKNOWN", which is correct, not a failure).
+
+    WHAT CHANGED. These rows were stored status="IPO_PENDING", source="SEC_EDGAR"
+    and then read by nothing at all — ai_pipeline selects status="PENDING", and
+    ipo_poller resolves its S-1 link live from FMP rather than from the table.
+    The poll fetched document bodies market-wide, wrote them, and no alert was
+    ever downstream of any of it.
+
+    Now:
+      status="PENDING"  -> the AI pipeline summarises the S-1 body with the same
+                           S.1.A machinery every other filing uses
+      source="SEC_IPO"  -> delivery routes it market-wide. It CANNOT be
+                           SEC_EDGAR: that is in COMPANY_ONLY_SOURCES, so the
+                           alert would resolve to an empty audience and be
+                           marked delivered without being sent.
+      dedupe_by_cik     -> the initial registration alerts, its amendments do not
+    """
     return await poll_edgar_generic_async(
-        "S-1", "S-1 (IPO Filing)", watchlist_only=False, status="IPO_PENDING"
+        "S-1", "S-1 (IPO Filing)", watchlist_only=False,
+        status="PENDING", source=IPO_SOURCE, dedupe_by_cik=True,
     )
 
 
 # ── Sync shims so main.py / schedule keep working unchanged ───────────────────
+async def _with_session_cleanup(coro):
+    """
+    Run one poll, then close the HTTP session that poll opened.
+
+    sec_client keeps one keep-alive session per event loop so the requests
+    within a poll reuse connections instead of paying a TLS handshake each.
+    Every poll gets a fresh loop from asyncio.run() below, so the session has
+    to be closed before that loop goes away or its connector outlives it.
+    """
+    try:
+        return await coro
+    finally:
+        await sec_client.close_session()
+
+
 def _run(coro):
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(_with_session_cleanup(coro))
     raise RuntimeError(
         "Sync shim called from inside an event loop — use the *_async variant."
     )

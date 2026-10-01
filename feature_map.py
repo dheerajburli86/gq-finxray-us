@@ -22,9 +22,14 @@ watchlisted.
 FEATURES = {
     1: {
         "name": "SEC EDGAR Filings",
-        "detail": "8-K, 10-Q, 10-K, S-1, Form 4 — real-time SEC EDGAR RSS polling.",
+        "detail": "8-K, 10-Q, 10-K, Form 4 — real-time SEC EDGAR RSS polling.",
         "sources": {"SEC_EDGAR"},
-        "filing_types": {"8-K", "10-Q", "10-K", "S-1", "4"},
+        # S-1 moved to Feature 8. It is an IPO event, not routine company news,
+        # and it is the one EDGAR form whose registrant cannot be watchlisted —
+        # so it is emitted under SEC_IPO and routed market-wide. A legacy
+        # SEC_EDGAR/S-1 row still resolves here via resolve_feature's
+        # single-candidate second pass rather than landing Unmapped.
+        "filing_types": {"8-K", "10-Q", "10-K", "4"},
         "market_wide": False,
     },
     2: {
@@ -38,7 +43,12 @@ FEATURES = {
     3: {
         "name": "Result Snapshot",
         "detail": "Structured quarterly/annual financials triggered off 10-Q/10-K filings.",
-        "sources": {"FMP", "FMP_FUNDAMENTALS"},
+        # SEC_XBRL is the PREFERRED source: result_snapshot.py tries SEC XBRL
+        # companyfacts first and only falls back to FMP. It was missing here, so
+        # every snapshot built from the primary path resolved to feature 0 --
+        # footer read "Unmapped" and, because muting is keyed on feature id, the
+        # feature could not be muted by a user at all.
+        "sources": {"FMP", "FMP_FUNDAMENTALS", "SEC_XBRL"},
         "filing_types": {"RESULT_SNAPSHOT"},
         "market_wide": False,
     },
@@ -79,10 +89,21 @@ FEATURES = {
     },
     8: {
         "name": "IPO Deep Dive",
-        "detail": "Upcoming US IPO alerts — pricing, share count, deal size, listing date.",
-        "sources": {"FMP_IPO"},
-        "filing_types": {"IPO_UPCOMING"},
-        "market_wide": False,
+        "detail": ("US IPOs from both ends: an S-1 registration the moment it "
+                   "reaches EDGAR, then pricing, share count and listing date "
+                   "from FMP's calendar once the deal is scheduled."),
+        # TWO SOURCES, TWO STAGES, BY NECESSITY. EDGAR publishes the documents
+        # but no IPO calendar — an initial S-1 carries no listing date, price
+        # range or final share count (those appear later, as prose, in S-1/A
+        # amendments and the 424B4 pricing prospectus). FMP's ipos-calendar
+        # carries exactly those as structured fields but only once a deal is
+        # scheduled, which is weeks to months after the S-1 is filed. Neither
+        # source alone covers the event.
+        "sources": {"FMP_IPO", "SEC_IPO"},
+        "filing_types": {"IPO_UPCOMING", "S-1"},
+        # An IPO registrant is pre-listing: no ticker exists to match against a
+        # watchlist, so watchlist-scoping this feature delivers it to nobody.
+        "market_wide": True,
     },
     9: {
         "name": "Sector Heatmap",
@@ -93,13 +114,6 @@ FEATURES = {
         "market_wide": False,
     },
     10: {
-        "name": "ETF Xray",
-        "detail": "Structured ETF fundamentals snapshot — expense ratio, AUM, holdings.",
-        "sources": {"ETF_XRAY"},
-        "filing_types": {"ETF_XRAY"},
-        "market_wide": False,
-    },
-    11: {
         "name": "Earnings Call Transcripts",
         "detail": "Full transcript pulled via FMP when EDGAR flags a 10-Q/10-K, "
                   "AI-summarized through the same S.1/S.3/V.1 pipeline as news & filings.",
@@ -107,26 +121,30 @@ FEATURES = {
         "filing_types": {"EARNINGS_TRANSCRIPT"},
         "market_wide": False,
     },
-    12: {
+    11: {
         "name": "Analyst Ratings & Price Targets",
         "detail": "Consensus rating changes and price-target revisions from FMP.",
         "sources": {"FMP_ANALYST"},
         "filing_types": {"ANALYST_RATING", "PRICE_TARGET"},
         "market_wide": False,
     },
-    13: {
+    12: {
         "name": "Macro & Policy Digest",
         "detail": "Fed decisions, Treasury yields, jobs/inflation prints, commodities, USD.",
-        "sources": {"MACRO_ROUNDUP"},
-        "filing_types": {"MACRO_BRIEFING"},
-        "market_wide": False,
+        # MARKET_REPORT covers the five scheduled index/mover digests (pre-market,
+        # open, midday, close, after-hours). They now queue as alert rows and fan
+        # out per user like everything else, so they need a feature id to carry a
+        # footer and to be mutable via muted_features.
+        "sources": {"MACRO_ROUNDUP", "MARKET_REPORT"},
+        "filing_types": {"MACRO_BRIEFING", "MARKET_REPORT"},
+        "market_wide": True,
     },
 }
 
 # The personal watchlist heatmap is generated per user and delivered directly by
 # watchlist_heatmap.py, so it never goes through the shared alerts fan-out. It is
 # listed here only so the footer can name it.
-WATCHLIST_HEATMAP_FEATURE = 14
+WATCHLIST_HEATMAP_FEATURE = 13
 FEATURES[WATCHLIST_HEATMAP_FEATURE] = {
     "name": "Watchlist Heatmap",
     "detail": "Per-user performance heatmap of the stocks on that user's watchlist.",

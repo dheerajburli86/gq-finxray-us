@@ -1,6 +1,6 @@
 """
 earnings_transcript_poller.py
-GQ FinXray US — Feature 11 (NEW). Earnings call transcripts.
+GQ FinXray US — Feature 10. Earnings call transcripts.
 
 Earnings call transcripts come from FMP (confirmed available at
 any tier — see AAPL_Finnhub_Complete_Report*.pdf in the project) and the
@@ -26,7 +26,7 @@ result_snapshot.py since it rides the same 10-Q/10-K trigger.
 import os
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -52,9 +52,29 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 # available transcript" instead of the exact quarter.
 FILING_LAG_DAYS = 40
 
+# How far back a 10-Q/10-K can be and still be worth checking for a transcript.
+TRIGGER_LOOKBACK_DAYS = int(os.getenv("GQ_TRANSCRIPT_LOOKBACK_DAYS", "21"))
+
+
+def transcript_json_link(ticker, year, quarter):
+    """
+    The source link that rides on every transcript alert.
+
+    Points at our own `transcript` edge function, which serves the stored
+    transcript as raw JSON, rather than at FMP. Three things ruled FMP out as
+    the user-facing link: /api/ answers 401 without a key, embedding the key
+    would publish a paid Ultimate-tier credential to every subscriber, and
+    FMP's public transcript pages 404. The text is already in raw_filings, so
+    the alert links to the copy we hold.
+    """
+    base = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    if not base:
+        return None
+    return (f"{base}/functions/v1/transcript"
+            f"?ticker={ticker}&year={year}&quarter={quarter}")
+
 
 def _guess_period(filed_dt):
-    from datetime import timedelta
     period_end_estimate = filed_dt - timedelta(days=FILING_LAG_DAYS)
     quarter = max(1, min(4, ((period_end_estimate.month - 1) // 3) + 1))
     return period_end_estimate.year, quarter
@@ -133,6 +153,8 @@ def store_transcript_for_pipeline(ticker, company_name, year, quarter, transcrip
         logger.info(f"[TRANSCRIPT] {ticker} Q{quarter} FY{year} transcript too short/empty, skipping.")
         return False
 
+    fmp_link = transcript_json_link(ticker, year, quarter)
+
     try:
         supabase.table("raw_filings").insert({
             "source": "FMP_TRANSCRIPT",
@@ -140,24 +162,20 @@ def store_transcript_for_pipeline(ticker, company_name, year, quarter, transcrip
             "ticker": ticker,
             "company_name": company_name,
             "raw_text": content,
-            "filing_url": f"fmp_transcript_{ticker}_{year}_Q{quarter}",
+            "filing_url": fmp_link,
             "filed_at": transcript.get("date", datetime.now(timezone.utc).isoformat()) if isinstance(transcript, dict) else datetime.now(timezone.utc).isoformat(),
             "status": "PENDING",
             "extra": {
                 "year": year, "quarter": quarter,
                 "title": f"{company_name} Q{quarter} FY{year} Earnings Call Transcript",
                 "source": "FMP Earnings Call Transcript",
-                # Carries the transcript body as a rendered `earning_calls` view.
-                # Note the raw FMP URL is NOT stored: it embeds the API key as a
-                # query param, so putting it in a user-facing alert would leak
-                # the credential to every subscriber.
                 "structured_payload": gq_fmt.earnings_transcript(
                     ticker=ticker,
                     company_name=company_name,
                     quarter=f"Q{quarter}",
                     fiscal_year=str(year),
                     transcript_text=content,
-                    fmp_link="",
+                    fmp_link=fmp_link,
                     filing_date=str(transcript.get("date", "")) if isinstance(transcript, dict) else "",
                 ),
             }
@@ -194,16 +212,25 @@ def find_recent_10q_10k(watchlist_set):
     filtering to the watchlist here avoids spending that specifically
     expensive quota on companies nobody is actually following.
     """
+    if not watchlist_set:
+        return []
+    # BOUNDED WINDOW. This had no time filter at all: it took the 100 most recent
+    # 10-Q/10-K rows ever recorded and re-checked the same ~25 watchlisted ones
+    # every 30 minutes, forever. transcript_already_fetched() stopped duplicate
+    # STORES, but only after get_best_transcript() had already spent a
+    # transcripts-dates lookup per ticker against FMP's Ultimate tier — the most
+    # expensive quota in the stack — to learn nothing. A transcript that has not
+    # appeared within a few weeks of the filing is not going to.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=TRIGGER_LOOKBACK_DAYS)).isoformat()
     try:
         result = supabase.table("raw_filings") \
             .select("ticker, company_name, filing_type, filed_at") \
             .in_("filing_type", ["10-Q", "10-K"]) \
+            .gte("filed_at", cutoff) \
             .order("filed_at", desc=True) \
             .limit(100) \
             .execute()
         rows = result.data or []
-        if not watchlist_set:
-            return []
         return [r for r in rows if r.get("ticker") in watchlist_set][:25]
     except Exception as e:
         logger.error(f"[TRANSCRIPT] Failed to query recent 10-Q/10-K filings: {e}")
@@ -232,7 +259,17 @@ def run_earnings_transcript_poller():
 
         transcript = fmp_client.get_earnings_transcript(ticker, year, quarter)
         if not transcript:
-            logger.info(f"[TRANSCRIPT] No transcript available yet for {ticker} Q{quarter} FY{year}")
+            logger.debug(f"[TRANSCRIPT] No transcript available yet for {ticker} Q{quarter} FY{year}")
+            continue
+
+        # Validate transcript has content
+        if isinstance(transcript, dict):
+            content = transcript.get("content", "")
+            if not content:
+                logger.warning(f"[TRANSCRIPT] Transcript for {ticker} Q{quarter} FY{year} has no content field")
+                continue
+        else:
+            logger.warning(f"[TRANSCRIPT] Unexpected transcript format for {ticker}: {type(transcript)}")
             continue
 
         company_name = filing.get("company_name", ticker)

@@ -164,7 +164,7 @@ def get_income_statement_sync(cik, limit: int = 8) -> list:
 
     rows = []
     for end_date in sorted(all_dates, reverse=True)[:limit]:
-        row = {"date": end_date, "_source": "SEC XBRL"}
+        row = {"date": end_date, "_source": "SEC_XBRL"}
 
         for field in ("revenue", "grossProfit", "operatingIncome",
                       "netIncome", "epsDiluted"):
@@ -210,3 +210,57 @@ def get_income_statement_sync(cik, limit: int = 8) -> list:
 
 # Convenience alias — some call sites use the async-free name directly.
 get_income_statement = get_income_statement_sync
+
+
+def build_sec_json_links(cik, filing_url: str | None = None) -> dict:
+    """
+    The SEC's own machine-readable endpoints for this company/filing.
+
+    SEC does not publish earnings CALL transcripts -- the spoken Q&A is not a
+    filed document and never appears on EDGAR. But everything the call is
+    about is here, structured and free, hours before a vendor re-publishes it:
+
+      companyfacts  every XBRL fact the company has ever reported
+      submissions   the full filing history
+      filing_index  every document in this specific filing, including the
+                    EX-99.1 earnings press release attached to an 8-K 2.02
+
+    So an "earnings" alert can be served from SEC directly by carrying these
+    links, rather than waiting on a transcript vendor for the same numbers.
+
+    Returns {} when there is no CIK, so callers can attach unconditionally.
+    """
+    if not cik:
+        return {}
+    padded = str(cik).strip().lstrip("CIK").zfill(10)
+
+    links = {
+        "companyfacts": f"https://data.sec.gov/api/xbrl/companyfacts/CIK{padded}.json",
+        "submissions": f"https://data.sec.gov/submissions/CIK{padded}.json",
+    }
+
+    # A filing URL looks like
+    #   .../Archives/edgar/data/320193/000032019326000073/0000320193-26-000073-index.htm
+    # and index.json in that same directory lists every document in the
+    # filing, which is how a consumer finds the EX-99.1 press release.
+    if filing_url and "/Archives/edgar/data/" in filing_url:
+        base = filing_url.rsplit("/", 1)[0]
+        links["filing_index"] = f"{base}/index.json"
+
+    return links
+
+
+def get_company_name(cik) -> str | None:
+    """
+    Company name straight off the same companyfacts payload the quarters came
+    from (SEC's "entityName" field) -- reuses _fetch_companyfacts's cache, so
+    this costs nothing extra once get_income_statement_sync() has already run
+    for this CIK. Lets callers skip an FMP profile call purely to get a name
+    when SEC XBRL already supplied everything else.
+    """
+    if not cik:
+        return None
+    facts = _fetch_companyfacts(cik)
+    if not facts:
+        return None
+    return facts.get("entityName") or None

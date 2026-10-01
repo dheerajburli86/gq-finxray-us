@@ -2,7 +2,7 @@
 fmp_client.py
 GQ FinXray US — Financial Modeling Prep (FMP) shared client.
 
-Replaces EODHD across the codebase. All endpoints below are the current
+The single FMP HTTP wrapper. All endpoints below are the current
 "stable" FMP API (https://financialmodelingprep.com/stable/*), confirmed
 against FMP's own developer docs on 2026-07-27:
 
@@ -27,7 +27,7 @@ against FMP's own developer docs on 2026-07-27:
 NOTE ON LICENSING (see claude/us-market-data-licensing-risk.md in the
 project): FMP's personal-tier ToS prohibits redistribution to third
 parties / multi-user products. This client does not change that — it's
-a pure mechanical swap from EODHD. Get the commercial Data Display and
+a personal-tier integration. Get the commercial Data Display and
 Licensing Agreement sorted with FMP sales before this goes further into
 production with a growing subscriber base.
 """
@@ -41,6 +41,11 @@ load_dotenv()
 
 FMP_API_KEY = os.getenv("FMP_API_KEY")
 BASE_URL = "https://financialmodelingprep.com/stable"
+
+# Validate API key on module load
+if not FMP_API_KEY:
+    import logging
+    logging.warning("[FMP] FMP_API_KEY not set in environment — all requests will fail")
 
 
 class FMPError(Exception):
@@ -81,7 +86,16 @@ def _get(path, params=None, timeout=20, retries=2):
                 wait *= 2
                 continue
             last_was_429 = False
-            print(f"[FMP] {path} returned {r.status_code}: {r.text[:200]}")
+            # Log response error with context
+            error_snippet = r.text[:300]
+            if r.status_code == 401:
+                print(f"[FMP] AUTHENTICATION ERROR (401) on {path}: Invalid or missing API key")
+                print(f"[FMP] Response: {error_snippet}")
+            elif r.status_code == 403:
+                print(f"[FMP] AUTHORIZATION ERROR (403) on {path}: API key lacks permission (may need Ultimate tier)")
+                print(f"[FMP] Response: {error_snippet}")
+            else:
+                print(f"[FMP] {path} returned {r.status_code}: {error_snippet}")
             return None
         except Exception as e:
             last_was_429 = False
@@ -137,7 +151,7 @@ def get_general_news(limit=25, page=0):
     return data if isinstance(data, list) else []
 
 
-# ── Screener (market-wide, replaces EODHD screener) ──────────────────────────
+# ── Screener (market-wide) ───────────────────────────────────────────────────
 def screener(params):
     """
     params example: {"marketCapMoreThan": 1e9, "volumeMoreThan": 50000,
@@ -155,6 +169,33 @@ def get_earnings_calendar(from_date, to_date):
 
 def get_ipo_calendar(from_date, to_date):
     data = _get("ipos-calendar", {"from": from_date, "to": to_date})
+    return data if isinstance(data, list) else []
+
+
+# ── Macro (Feature 12) ────────────────────────────────────────────────────────
+# Both were missing while macro_policy_roundup called them on every run. Each
+# call site catches the exception and returns an empty section, so the digest
+# rendered without its yields line and without its calendar and looked merely
+# quiet rather than broken.
+def get_treasury_rates(from_date, to_date):
+    """
+    Daily Treasury yield curve. Returns a list (possibly empty).
+
+    macro_policy_roundup reads `date` and `year10` off each row and sorts by
+    date itself rather than trusting the endpoint's ordering.
+    """
+    data = _get("treasury-rates", {"from": from_date, "to": to_date})
+    return data if isinstance(data, list) else []
+
+
+def get_economic_calendar(from_date, to_date):
+    """
+    Scheduled macro releases for a date range. Returns a list (possibly empty).
+
+    macro_policy_roundup filters these down to US, high-impact events before
+    they reach the digest.
+    """
+    data = _get("economic-calendar", {"from": from_date, "to": to_date})
     return data if isinstance(data, list) else []
 
 
@@ -182,9 +223,15 @@ def get_insider_trading(ticker, page=0, limit=50):
     return data if isinstance(data, list) else []
 
 
-# ── Earnings call transcripts (Feature 11 — new) ─────────────────────────────
+# ── Earnings call transcripts (Feature 10) ─────────────────────────────────
 def get_earnings_transcript(ticker, year, quarter):
-    """Returns full transcript text (list of dicts w/ 'content') or None."""
+    """Returns full transcript text (dict w/ 'content' field) or None.
+
+    Requires FMP Ultimate tier — personal tier does not include transcripts.
+    Returns None if not found or API error. Invalid API key results in an
+    "Invalid API KEY" error from FMP (check that your FMP_API_KEY is valid
+    and has Ultimate tier access).
+    """
     data = _get("earning-call-transcript", {"symbol": ticker, "year": year, "quarter": quarter})
     if data and isinstance(data, list) and data:
         return data[0]
@@ -192,12 +239,18 @@ def get_earnings_transcript(ticker, year, quarter):
 
 
 def get_latest_transcripts(limit=50):
+    """Returns list of most recent transcripts. Requires FMP Ultimate tier."""
     data = _get("latest-transcripts", {"limit": limit})
     return data if isinstance(data, list) else []
 
 
 def get_transcript_dates(ticker):
-    """List of (year, quarter, date) tuples available for a ticker."""
+    """List of available transcript dates for a ticker (year, quarter, date tuples).
+
+    Returns empty list if ticker has no transcripts or API error occurs.
+    This is a cheaper call than get_earnings_transcript() — use this first
+    to check availability before fetching.
+    """
     data = _get("transcripts-dates-by-symbol", {"symbol": ticker})
     return data if isinstance(data, list) else []
 
@@ -231,7 +284,7 @@ def get_key_metrics(ticker, period="quarter", limit=8):
 
 
 def get_historical_prices(ticker, from_date, to_date):
-    """Daily OHLCV, matches EODHD's /eod/ shape closely enough for calc_returns()."""
+    """Daily OHLCV rows, shaped for calc_returns()."""
     data = _get("historical-price-eod/full", {"symbol": ticker, "from": from_date, "to": to_date})
     return data if isinstance(data, list) else []
 
@@ -242,6 +295,48 @@ def get_etf_info(ticker):
     every caller treats a None/empty result as "not available" and degrades
     gracefully rather than crashing, same as the rest of this client."""
     data = _get("etf/info", {"symbol": ticker})
+    if data and isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+# ── Analyst coverage (Feature 11) ─────────────────────────────────────────────
+# THE MISSING METHODS THIS ADDS. analyst_ratings_poller called both of these on
+# every watched ticker, and neither existed on this module. _fetch_snapshot
+# guards each call with its own try/except and logs the failure as a warning, so
+# production printed two "module 'fmp_client' has no attribute ..." lines per
+# ticker per run and reported "no-coverage=25, alerts=0" — indistinguishable in
+# the summary line from a watchlist nobody covers. Feature 11 has never emitted
+# an alert.
+#
+# Both endpoints are single-symbol and return a ONE-ELEMENT LIST, so both unwrap
+# it. Returning the bare list would leave every .get() in _fetch_snapshot reading
+# from a list and silently yielding None, which fails the same quiet way.
+def get_grades_consensus(ticker):
+    """
+    Analyst rating breakdown for one symbol. Returns dict or None.
+
+    Fields consumed by analyst_ratings_poller: strongBuy, buy, hold, sell,
+    strongSell (counts) and consensus (a label such as "Buy" / "Hold").
+    """
+    data = _get("grades-consensus", {"symbol": ticker})
+    if data and isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+def get_price_target_consensus(ticker):
+    """
+    Analyst price-target consensus for one symbol. Returns dict or None.
+
+    Fields consumed by analyst_ratings_poller: targetConsensus, targetMedian,
+    targetHigh, targetLow.
+    """
+    data = _get("price-target-consensus", {"symbol": ticker})
     if data and isinstance(data, list) and data:
         return data[0]
     if isinstance(data, dict):

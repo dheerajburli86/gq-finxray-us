@@ -1,6 +1,6 @@
 """
 Shared utilities for all heatmap/universe scrapers.
-TwelveData (td_time_series/td_quote) removed — replaced with FMP equivalents
+Time-series and quote helpers are FMP-backed.
 via fmp_client.py. calc_returns/apply_glocom/upsert_* are vendor-agnostic
 and unchanged.
 """

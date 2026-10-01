@@ -28,17 +28,48 @@ Quality decisions made here, and why:
 """
 
 import html
+import os
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import fmp_client
 from feature_map import feature_footer, resolve_feature
+from gquants_format_converter import make_frontend_link
 
 ET = ZoneInfo("America/New_York")
 
 DISCLAIMER_URL = "https://gquants.com/disclaimer"
 MANAGE_URL = "https://gquants.com/build"
+
+# Features whose alert IS the artefact — an image or a whole-market digest with
+# no per-row detail worth opening. Everything else gets a JSON link.
+NO_DATA_LINK_TYPES = {
+    "SECTOR_HEATMAP", "HEATMAP_DAILY_MIDDAY", "HEATMAP_DAILY_AFTERNOON",
+    "HEATMAP_WEEKLY", "HEATMAP_MONTHLY",
+    "HEATMAP_WATCHLIST_MIDDAY", "HEATMAP_WATCHLIST_EOD",
+    "MARKET_REPORT", "MACRO_BRIEFING",
+}
+
+
+def _data_link(alert):
+    """
+    Per-alert JSON, served by our own `alert` edge function.
+
+    Several features have no upstream document to link to: a large block print,
+    an aggregated insider summary and an upcoming earnings date are events we
+    computed rather than fetched, so there is no vendor URL that describes them
+    and they shipped with no link at all. The numbers behind them are on the
+    alert row, so this points there — which also gives every feature the same
+    shape of link instead of a source link on some and nothing on others.
+    """
+    alert_id = str(alert.get("id") or "")
+    base = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    if not (alert_id and base):
+        return None
+    if (alert.get("filing_type") or "") in NO_DATA_LINK_TYPES:
+        return None
+    return f"{base}/functions/v1/alert?id={alert_id}"
 
 IMPACT_EMOJI = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
 
@@ -209,6 +240,34 @@ def _source_link(alert_or_extra):
     return None
 
 
+def _clean_headline(text):
+    """
+    Keep headlines neutral and factual, same standard the summary is held to.
+
+    The summarization pipeline (S.1/S.3 prompts + the deterministic
+    ends_with_question_or_exclamation gate + V.1 validation) guarantees the
+    SUMMARY never asks a question or editorializes. The headline bypassed all
+    of it: Prompt_H1 is not wired into ai_pipeline, so `extra.headline` is
+    normally absent and this falls through to `extra.title` -- the raw article
+    title straight from the news source. Publisher titles are frequently
+    clickbait questions ("Is Apple Stock A Buy After Earnings?", "Should You
+    Sell NVDA Now?"), and this is rendered in bold as the FIRST line of the
+    alert, so the loudest line in a message whose body is scrupulously neutral
+    was a third party's leading question.
+
+    A question is dropped outright rather than rewritten: rewriting means an
+    LLM call per alert (cost + latency), and the alert reads fine without it --
+    the ticker/company header and the summary carry the substance. An
+    exclamation just loses the "!".
+    """
+    if not text:
+        return ""
+    cleaned = str(text).strip()
+    if cleaned.endswith("?"):
+        return ""
+    return cleaned.rstrip("!").rstrip()
+
+
 def build_message(alert, reason=None):
     """
     Render one alert row into Telegram HTML.
@@ -225,7 +284,7 @@ def build_message(alert, reason=None):
     extra       = alert.get("extra") or {}
 
     company  = extra.get("company_name") or extra.get("company") or ""
-    headline = extra.get("headline") or extra.get("title") or ""
+    headline = _clean_headline(extra.get("headline") or extra.get("title") or "")
 
     emoji        = IMPACT_EMOJI.get(impact, "🟢")
     source_name  = SOURCE_LABELS.get(source, source.replace("_", " ").title())
@@ -270,6 +329,39 @@ def build_message(alert, reason=None):
     url = _source_link(alert)
     if url:
         lines.append(f'🔗 <a href="{esc_attr(url)}">View source</a>')
+
+    data_url = _data_link(alert)
+    if data_url:
+        lines.append(f'🧾 <a href="{esc_attr(data_url)}">Alert data (JSON)</a>')
+
+    # ── GQuants deep link ────────────────────────────────────────────────────
+    # The structured payload (fr / it / ipo / earning_calls / tradingview) rides
+    # alerts.extra from the poller through ai_pipeline. THIS is the only render
+    # path delivery.py uses, so the link must be spliced here — main.format_alert
+    # carried an identical block but nothing calls it, which is why the payload
+    # feature shipped nothing to users despite its tests passing.
+    # make_frontend_link() returns "" while GQUANTS_ALERT_BASE_URL is unset, so
+    # this is a no-op until the frontend route is known.
+    # SEC's own structured data for this filing. SEC does not publish earnings
+    # CALL transcripts -- the spoken Q&A is never filed -- but everything the
+    # call discusses is here as XBRL, and for an 8-K 2.02 the filing index
+    # points at the EX-99.1 earnings release itself. Linking it lets the
+    # reader go straight to the primary source with no vendor in between.
+    sec_json = extra.get("sec_json") or {}
+    sec_link = sec_json.get("filing_index") or sec_json.get("companyfacts")
+    if sec_link:
+        label = ("SEC filing data (JSON)" if sec_json.get("filing_index")
+                 else "SEC XBRL facts (JSON)")
+        lines.append(f'🗂 <a href="{esc_attr(sec_link)}">{esc(label)}</a>')
+
+    payload = extra.get("structured_payload")
+    if payload:
+        try:
+            deep = make_frontend_link(payload, str(alert.get("id") or ""))
+        except Exception:
+            deep = ""
+        if deep:
+            lines.append(f'📈 <a href="{esc_attr(deep)}">View full report on GQuants</a>')
 
     # ── Footer ───────────────────────────────────────────────────────────────
     lines.append("")

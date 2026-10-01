@@ -12,21 +12,21 @@ touch Telegram and does not know who the users are.
 
 DESIGN RULES THIS FILE OBEYS
 ----------------------------
-1. **Every external call is individually guarded.** A macro digest is eight or
+1. *Every external call is individually guarded.* A macro digest is eight or
    nine independent lookups. If the commodities endpoint is down, the reader
    should still get rates, indices, the calendar and the headlines — losing one
    section is a much better outcome than losing the digest.
 
-2. **Never publish an empty or all-zero digest.** If nothing at all came back,
+2. *Never publish an empty or all-zero digest.* If nothing at all came back,
    the run logs and returns without writing a row. A digest reading "S&P 500:
    $0.00 (0.00%)" is worse than no digest: it looks authoritative and is wrong.
 
-3. **The headline is derived, never invented.** It is composed from the
+3. *The headline is derived, never invented.* It is composed from the
    direction of the 10-year yield and the S&P, and only from whichever of those
    was actually retrieved. If neither was, the alert ships with no headline
    rather than a fabricated one.
 
-4. **`summary` is plain text.** alert_formatter escapes it for Telegram's HTML
+4. *`summary` is plain text.* alert_formatter escapes it for Telegram's HTML
    parse mode, so a literal "<b>" here would render as visible tag characters,
    and a stray "&" in an event name would be double-escaped. No markup.
 """

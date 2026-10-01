@@ -226,14 +226,15 @@ def save_alert(ticker, block):
     fills_note = f" · {block['fills']} fills" if block.get("fills", 1) > 1 else ""
     summary = (
         f"🐋 *Large Trade — ${ticker}*\n\n"
-        f"*Size:* {int(block['size']):,} shares\n"
-        f"*Price:* ${block['price']:.2f}\n"
-        f"*Notional:* {_fmt_notional(block['notional'])}\n"
-        f"*Time:* {et}{fills_note}\n\n"
-        f"_A block of this size crossing the tape often signals institutional "
-        f"repositioning. US markets do not disclose counterparties — for the "
-        f"'who', watch for a 13F or SC 13D/G filing._\n"
-        f"_Source: Massive tick tape_"
+        f"Size: {int(block['size']):,} shares\n"
+        f"Price: ${block['price']:.2f}\n"
+        f"Notional: {_fmt_notional(block['notional'])}\n"
+        f"Time: {et}{fills_note}\n\n"
+        f"A block of this size typically indicates institutional repositioning. "
+        f"US equity markets don't disclose trade counterparties in real time. "
+        f"For ownership details, monitor Form 13F (quarterly, 45-day lag) and "
+        f"Schedule 13D/G filings (5%+ stakes, filed within 4 business days).\n\n"
+        f"_Data: Massive tick tape_"
     )
 
     impact = "HIGH" if block["notional"] >= 10_000_000 else "MEDIUM"
@@ -255,7 +256,15 @@ def save_alert(ticker, block):
                 "fills": block.get("fills", 1),
                 "traded_at": dt.isoformat(),
             }, "LARGE_TRADE", "LARGE_TRADE"),
-            "filing_url": None,
+            # A block print has no filing behind it — the tape reports the
+            # trade, not who made it. The summary above tells the reader to
+            # watch 13D/G for the ownership answer, so link them there rather
+            # than sending the one alert type with nothing to tap. EDGAR's
+            # browse-edgar resolves a ticker in the CIK parameter, so this
+            # needs no CIK lookup.
+            "filing_url": ("https://www.sec.gov/cgi-bin/browse-edgar"
+                           f"?action=getcompany&CIK={ticker}&type=SC+13"
+                           "&dateb=&owner=include&count=40"),
         }).execute()
         logger.info(f"[LARGE_TRADES] {ticker}: {int(block['size']):,} sh @ "
                     f"${block['price']:.2f} = {_fmt_notional(block['notional'])}")

@@ -1,501 +1,170 @@
-import asyncio
+"""
+main.py
+GQ FinXray US — process entry point: scheduler, AI pipeline, delivery loop.
+
+THREE THREADS
+-------------
+  scheduler  — every poller, on its own cadence, across two worker pools
+  pipeline   — drains PENDING raw_filings through ai_pipeline.py
+  delivery   — fans finished alerts out per user (runs on the main thread)
+
+TIMEZONE
+--------
+The process runs on US/Eastern. `schedule`'s .at() matches LOCAL time, and every
+market time in this file is an ET wall-clock time, so the two have to agree. The
+old version scheduled in UTC with a comment saying so, which silently drifted by
+an hour at every DST transition and put the "midday" heatmap at 9:30am half the
+year. Setting TZ here makes .at("12:30") mean 12:30 ET all year round.
+"""
+
 import os
 import time
+
+# Must run before `schedule` (or anything else) reads the clock.
+os.environ.setdefault("TZ", "America/New_York")
+if hasattr(time, "tzset"):
+    time.tzset()
+
+import asyncio
+import logging
 import threading
 import traceback
-import schedule
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
-from supabase import create_client
-from telegram import Bot
 from datetime import datetime
-import gquants_format_converter as gq_fmt
+
+import schedule
+from dotenv import load_dotenv
 
 load_dotenv()
 
-supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+# ── Logging ───────────────────────────────────────────────────────────────────
+# THE BUG THIS FIXES. There was no basicConfig anywhere in the runtime path —
+# every call in the repo sits inside an `if __name__ == "__main__"` block, which
+# never executes under `python main.py`. So the root logger had no handler and
+# Python's last-resort handler only emitted WARNING and above. Every logger.info
+# in the codebase was silent, including delivery.py's per-cycle
+# "sent=/failed=/no_audience=" line — the single number that would have shown
+# that market-wide alerts were being built and then dropped. The only output
+# anyone ever saw was raw print() from the SEC pollers, which is why the logs
+# looked like SEC polling was the only thing running.
+logging.basicConfig(
+    level=os.getenv("GQ_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Third-party libraries are chatty at INFO and drown out our own lines.
+for noisy in ("httpx", "httpcore", "hpack", "telegram", "asyncio", "urllib3", "PIL"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
-import fmp_client
-from feature_map import feature_footer
+logger = logging.getLogger("main")
 
-from edgar_poller_async import poll_sec_8k, poll_sec_form4, poll_sec_10q, poll_sec_10k, poll_sec_s1, load_cik_map
+# ── Latency budget ────────────────────────────────────────────────────────────
+# End-to-end delay is the sum of three queue drains: SEC poll -> AI pipeline ->
+# delivery fan-out. Each drain is a single indexed Supabase query when its queue
+# is empty, so tightening the idle gaps costs queries, not tokens or API quota.
+#
+# Both loops now only sleep when their queue came back EMPTY (see run_pipeline
+# and delivery_loop below), so these are idle-poll intervals, not per-batch
+# pauses. An idle tick is one indexed query returning zero rows; the bulk
+# expiry UPDATEs both loops run are separately throttled to once a minute, so
+# dropping 3s -> 1s triples a cheap read and adds no writes.
+PIPELINE_IDLE_SECONDS = int(os.getenv("GQ_PIPELINE_IDLE_SECONDS", "1"))
+DELIVERY_IDLE_SECONDS = int(os.getenv("GQ_DELIVERY_IDLE_SECONDS", "1"))
+# 8-K and Form 4 are the time-critical ones (material events, insider trades).
+SEC_FAST_POLL_SECONDS = int(os.getenv("GQ_SEC_POLL_SECONDS", "15"))
+# S-1 is Feature 8's early-warning half and now DOES produce alerts, so this is
+# a real detection delay. Off the fast lane only because it is market-wide.
+SEC_S1_POLL_MINUTES = int(os.getenv("GQ_SEC_S1_POLL_MINUTES", "5"))
+
+from delivery import deliver_pending_alerts as delivery_deliver
+from ai_pipeline import run_pipeline as process_with_ai
+
+# ── Feature 1 / 5 / 8-trigger: SEC EDGAR ──────────────────────────────────────
+from edgar_poller_async import (poll_sec_8k, poll_sec_form4, poll_sec_10q,
+                                poll_sec_10k, poll_sec_s1, load_cik_map,
+                                ensure_cik_map)
+# ── Feature 2: Company & Sector News ──────────────────────────────────────────
 from news_poller import poll_all_news
-from fmp_poller import poll_fmp_news, poll_fmp_events
+from fmp_poller import poll_fmp_news, poll_fmp_events      # Features 2, 4, 5
+# ── Feature 4: EPS surprise (the other half of the earnings feature) ──────────
+from earnings_alerts import poll_earnings_for_tickers
+# ── Feature 3: Result Snapshot ────────────────────────────────────────────────
 from result_snapshot import process_pending_snapshots
+# ── Feature 5: Large block/bulk trades ────────────────────────────────────────
+from large_trades_poller import run_large_trades_poller
+# ── Feature 6: Technical Alerts ───────────────────────────────────────────────
 from technical_poller import run_technical_poller
-from ipo_poller import run_ipo_poller
-from earnings_transcript_poller import run_earnings_transcript_poller
-from news_roundup import run_etf_xray
+# ── Feature 7: ETF Flow ───────────────────────────────────────────────────────
 from etf_flow_poller import run_etf_flow_poller
+# ── Feature 8: IPO Deep Dive ──────────────────────────────────────────────────
+from ipo_poller import run_ipo_poller
+# ── Feature 9: Sector Heatmap ─────────────────────────────────────────────────
 from heatmap_generator import (run_sector_heatmap_midday, run_sector_heatmap_afternoon,
                                run_sector_heatmap_weekly, run_sector_heatmap_monthly)
+# ── Feature 10: Earnings Call Transcripts ─────────────────────────────────────
+from earnings_transcript_poller import run_earnings_transcript_poller
+# ── Feature 11: Analyst Ratings & Price Targets ───────────────────────────────
+from analyst_ratings_poller import poll_analyst_ratings
+# ── Feature 12: Macro & Policy Digest + scheduled market reports ──────────────
+from macro_policy_roundup import run_macro_policy_roundup
+from market_reports import (send_premarket_report, send_market_open_report,
+                            send_midday_report, send_market_close_report,
+                            send_afterhours_report)
+# ── Feature 13: Watchlist Heatmap ─────────────────────────────────────────────
+from watchlist_heatmap import (run_watchlist_heatmap_midday,
+                               run_watchlist_heatmap_eod)
 
 
-# ── FMP price fetch ───────────────────────────────────────────────────────────
-
-def format_alert(alert):
-    """
-    Render the alert, then splice in the GQuants deep link when there is one.
-
-    Wraps _format_alert_body() instead of editing its ten return branches:
-    every branch ends with the feature footer, so the link goes immediately
-    before it. If GQUANTS_ALERT_BASE_URL is unset make_frontend_link() returns
-    "" and the message is byte-identical to the pre-payload output.
-    """
-    body = _format_alert_body(alert)
-    extra = alert.get("extra") or {}
-    payload = extra.get("structured_payload")
-    if not payload:
-        return body
-
-    link = gq_fmt.make_frontend_link(payload, alert.get("id", ""))
-    if not link:
-        return body
-
-    link_line = f"\n🔗 [View full report on GQuants]({link})\n"
-    marker = "\n\n🏷 Feature"
-    if marker in body:
-        head, _, tail = body.rpartition(marker)
-        return f"{head}{link_line}{marker}{tail}"
-    return f"{body}{link_line}"
-
-
-def get_stock_price(ticker: str):
-    """Fetch live price and % change for a ticker from FMP."""
-    try:
-        q = fmp_client.get_quote(ticker)
-        if not q or q.get("price") is None:
-            return None
-        price = float(q.get("price", 0))
-        change_pct = float(q.get("changePercentage", 0) or 0)
-        arrow = "🟢" if change_pct >= 0 else "🔴"
-        sign = "+" if change_pct >= 0 else ""
-        return {
-            "price": f"${price:,.2f}",
-            "change": f"{sign}{change_pct:.2f}%",
-            "arrow": arrow
-        }
-    except Exception as e:
-        print(f"[FMP] Price fetch failed for {ticker}: {e}")
-        return None
-
-
-# ── Alert formatter ───────────────────────────────────────────────────────────
-def _format_alert_body(alert):
-    impact = alert.get("impact", "LOW")
-    ticker = alert.get("ticker", "UNKNOWN")
-    summary = alert.get("summary", "")
-    source = alert.get("source", "SEC_EDGAR")
-    filing_type = alert.get("filing_type", "")
-    extra = alert.get("extra") or {}
-
-    impact_emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}
-    source_labels = {
-        "SEC_EDGAR": "SEC EDGAR",
-        "CNBC": "CNBC",
-        "REUTERS": "Reuters",
-        "MARKETWATCH": "MarketWatch",
-        "FMP_NEWS": "FMP",
-        "SEC_XBRL": "SEC XBRL",
-        "FMP_RATINGS": "FMP Analyst Ratings",
-        "MARKET_WIDE": "Market-Wide",
-        "TECHNICAL": "Technical (Massive/FMP)",
-        "FMP_IPO": "FMP IPO Calendar",
-        "FMP_TRANSCRIPT": "FMP Earnings Call Transcript",
-        "ETF_FLOW": "ETF Flow (Massive)",
-        "SECTOR_HEATMAP": "Sector Heatmap",
-        "ETF_XRAY": "ETF Xray",
-    }
-
-    emoji = impact_emoji.get(impact, "🟢")
-    source_name = source_labels.get(source, source)
-    time_str = datetime.now().strftime("%I:%M %p EST")
-    footer = f"\n\n{feature_footer(source, filing_type)}"
-
-    # Fetch live price from FMP (skip MARKET ticker)
-    price_line = ""
-    if ticker and ticker != "MARKET":
-        price_data = get_stock_price(ticker)
-        if price_data:
-            price_line = f"\n📈 *Stock:* {ticker} {price_data['arrow']} {price_data['price']} ({price_data['change']})\n"
-
-    if filing_type == "EARNINGS_CALENDAR":
-        report_date = extra.get("report_date", "")
-        timing_str = extra.get("timing", "")
-        eps = extra.get("eps_estimate")
-        eps_line = f"Analyst EPS Estimate: {eps}" if eps else "No EPS estimate available"
-        return (
-            f"📅 *Earnings Tomorrow — *\n"
-            f"{price_line}\n"
-            f"🕐 *When:* {timing_str} on {report_date}\n"
-            f"📊 {eps_line}\n\n"
-            f"Watch for potential volatility.\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    if filing_type == "EARNINGS_TRANSCRIPT":
-        year = extra.get("year", "")
-        quarter = extra.get("quarter", "")
-        return (
-            f"📞 *Earnings Call Transcript — ${ticker}*"
-            f"{price_line}\n"
-            f"🗓 *Quarter:* Q{quarter} FY{year}\n\n"
-            f"{summary}\n\n"
-            f"📋 FMP Earnings Call Transcript · {time_str}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    if filing_type == "RESULT_SNAPSHOT":
-        period = extra.get("period", "") if extra else ""
-        form = extra.get("form_type", "") if extra else ""
-        form_label = "Quarterly Results" if form == "10-Q" else "Annual Results"
-        return (
-            f"📊 *{form_label} — ${ticker}*"
-            f"{price_line}\n"
-            f"📅 *Period:* {period}\n\n"
-            f"{summary}\n\n"
-            f"📋 SEC {form} · {time_str}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock\\'s news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    if filing_type == "BULK_DEAL":
-        insider = extra.get("insider_name", "Large investor") if extra else "Large investor"
-        action = extra.get("transaction_type", "TRADE") if extra else "TRADE"
-        value = extra.get("value", "N/A") if extra else "N/A"
-        shares = extra.get("shares", "N/A") if extra else "N/A"
-        trans_emoji = "🟢" if action == "BUY" else "🔴"
-        return (
-            f"{trans_emoji} *LARGE TRANSACTION — ${ticker}*"
-            f"{price_line}\n"
-            f"{summary}\n\n"
-            f"💰 Value: {value} · Shares: {shares}\n"
-            f"👤 {insider}\n"
-            f"📋 FMP Insider Data · {time_str}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock\\'s news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    if filing_type == "4":
-        insider = extra.get("insider_name", "An insider")
-        transaction = extra.get("transaction_type", "")
-        trans_emoji = "🟢" if transaction == "BUY" else "🔴" if transaction == "SELL" else "📋"
-        return (
-            f"{trans_emoji} *INSIDER {transaction or 'TRADE'} — ${ticker}*"
-            f"{price_line}\n"
-            f"{summary}\n\n"
-            f"👤 {insider}\n"
-            f"📋 SEC Form 4 · {time_str}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    if filing_type == "S-1":
-        return (
-            f"🚀 *IPO FILING — ${ticker}*"
-            f"{price_line}\n"
-            f"{summary}\n\n"
-            f"📋 SEC S-1 · {time_str}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    if filing_type == "NEWS":
-        return (
-            f"{emoji} *{source_name} — ${ticker}*"
-            f"{price_line}\n"
-            f"🔍 *Xray Intel:* {summary}\n\n"
-            f"📰 {source_name} · {time_str}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    if source == "TECHNICAL":
-        return (
-            f"{summary}\n\n"
-            f"{price_line}"
-            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    if source == "FMP_IPO":
-        return (
-            f"{summary}\n\n"
-            f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
-            f"_Disclaimer: gquants.com/disclaimer_\n\n"
-            f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-            f"{footer}"
-        )
-
-    item_types = extra.get("item_types", [])
-    items_str = ""
-    if item_types:
-        first_item = item_types[0].split(":")[0].strip()
-        items_str = f" · {first_item}"
-
-    return (
-        f"{emoji} *{impact} — ${ticker}*"
-        f"{price_line}\n"
-        f"🔍 *Xray Intel:* {summary}\n\n"
-        f"📋 {source_name}{items_str} · {time_str}\n\n"
-        f"_You are receiving this notification based on your request to monitor this stock's news, updates and transactions._\n"
-        f"_Disclaimer: gquants.com/disclaimer_\n\n"
-        f"📊 Manage your AI-powered watchlist: https://gquants.com/build"
-        f"{footer}"
-    )
-
-
-# ── Error alerting ────────────────────────────────────────────────────────────
-async def send_error_alert(message: str):
-    try:
-        bot = get_bot()
-        await bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            text=f"⚠️ *GQ FinXray US — System Alert*\n\n{message}\n\n🕐 {datetime.now().strftime('%I:%M %p IST')}",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
-
-
-# ── Run log: one row per alert actually sent to Telegram ─────────────────────
-def log_alert_run(alert, telegram_success, telegram_error=None):
-    """
-    Writes to alert_run_log -- the review/audit trail for every alert this
-    system sends, regardless of whether it went through the AI summarizer
-    (news/filings/transcripts, where summarization_attempts and the token
-    counts are real numbers pulled out of the alert's `extra`) or was a
-    templated alert with no LLM involved at all (technical/IPO/ETF flow/
-    result snapshot/heatmap, where those fields are simply absent from
-    `extra` and land here as None/null -- that's expected, not a bug).
-    Logged for every alert, success or failure, so a failed Telegram send
-    is visible here too rather than just vanishing.
-    """
-    try:
-        extra = alert.get("extra") or {}
-        supabase.table("alert_run_log").insert({
-            "alert_id": alert.get("id"),
-            "ticker": alert.get("ticker", "UNKNOWN"),
-            "source": alert.get("source"),
-            "filing_type": alert.get("filing_type"),
-            "feature_id": extra.get("feature_id"),
-            "feature_name": extra.get("feature_name"),
-            "impact": alert.get("impact"),
-            "summarization_attempts": extra.get("summarization_attempts"),
-            "input_tokens": extra.get("input_tokens"),
-            "output_tokens": extra.get("output_tokens"),
-            "total_tokens": extra.get("total_tokens"),
-            "llm_calls": extra.get("llm_calls"),
-            "telegram_success": telegram_success,
-            "telegram_error": (str(telegram_error)[:500] if telegram_error else None)
-        }).execute()
-    except Exception as e:
-        # A logging failure must never take down real alert delivery.
-        print(f"[ERROR] Failed to write alert_run_log for {alert.get('ticker', 'UNKNOWN')}: {e}")
-
-
-# ── Deliver pending alerts ────────────────────────────────────────────────────
-_BOTS = {}
-
-
-def get_bot():
-    """
-    One Bot (and one HTTP connection pool) per event loop.
-
-    The old code built a fresh Bot on every delivery tick, which opened a
-    new pool every 30 seconds. Caching is keyed on the running loop
-    because the market-report and error-alert paths call asyncio.run()
-    from worker threads, and a Bot's transport is bound to the loop that
-    created it — a single process-wide instance would raise
-    "Event loop is closed" the moment it crossed loops.
-    """
-    try:
-        key = id(asyncio.get_running_loop())
-    except RuntimeError:
-        key = 0
-    bot = _BOTS.get(key)
-    if bot is None:
-        bot = Bot(token=TELEGRAM_TOKEN)
-        _BOTS[key] = bot
-    return bot
-
-
+# ── Delivery ──────────────────────────────────────────────────────────────────
 async def deliver_pending_alerts():
+    """Dispatch to delivery.py, which owns per-user routing, watchlist filtering,
+    message rendering, alert_run_log and payload_log.
+
+    Returns how many alerts left the queue, so delivery_loop can drain a backlog
+    back-to-back instead of sleeping between batches.
+    """
     try:
-        result = supabase.table("alerts") \
-            .select("*") \
-            .eq("delivered", False) \
-            .order("created_at") \
-            .limit(20) \
-            .execute()
-
-        alerts = result.data
-        if not alerts:
-            return
-
-        bot = get_bot()
-
-        # Alerts are now routed per-user via delivery.py:deliver_pending_alerts()
-        # which respects watchlists and min_impact thresholds for each user.
-        # Do NOT mark delivered here — delivery.py handles the full fan-out
-        # and marks delivered=True only after all users have been contacted.
-        pass
-
+        return await delivery_deliver() or 0
     except Exception as e:
-        print(f"[ERROR] Delivery failed: {e}")
+        logger.error("Delivery failed: %s", e)
+        return 0
 
 
-# ── Market report helpers (FMP) ──────────────────────────────────────────────
-def fetch_index_data():
-    """Fetch S&P 500, NASDAQ, Dow from FMP."""
-    indices = {"SPY": "S&P 500", "QQQ": "NASDAQ", "DIA": "Dow Jones"}
-    lines = []
-    for symbol, name in indices.items():
-        try:
-            q = fmp_client.get_quote(symbol)
-            if q and q.get("price"):
-                price = float(q["price"])
-                chg = float(q.get("changePercentage", 0) or 0)
-                arrow = "🟢" if chg >= 0 else "🔴"
-                sign = "+" if chg >= 0 else ""
-                lines.append(f"{arrow} *{name}:* ${price:,.2f} ({sign}{chg:.2f}%)")
-        except Exception:
-            pass
-    return "\n".join(lines) if lines else "Index data unavailable"
-
-
-def fetch_macro_data():
-    """Fetch Gold, Crude Oil, Natural Gas from FMP commodities quotes."""
-    instruments = {"GCUSD": "Gold", "CLUSD": "Crude Oil", "NGUSD": "Natural Gas"}
-    lines = []
-    for symbol, name in instruments.items():
-        try:
-            q = fmp_client.get_commodity_quote(symbol)
-            if q and q.get("price"):
-                price = float(q["price"])
-                chg = float(q.get("changePercentage", 0) or 0)
-                arrow = "🟢" if chg >= 0 else "🔴"
-                sign = "+" if chg >= 0 else ""
-                lines.append(f"{arrow} *{name}:* ${price:,.2f} ({sign}{chg:.2f}%)")
-        except Exception:
-            pass
-    return "\n".join(lines) if lines else "Macro data unavailable"
-
-
-def fetch_top_movers():
-    """Fetch top 3 gainers and losers from a default watchlist via FMP."""
-    tickers = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "AMD", "JPM", "BAC"]
-    results = []
-    for ticker in tickers:
-        try:
-            q = fmp_client.get_quote(ticker)
-            if q and q.get("price"):
-                results.append({
-                    "ticker": ticker,
-                    "change": float(q.get("changePercentage", 0) or 0),
-                    "price": float(q["price"])
-                })
-        except Exception:
-            pass
-    if not results:
-        return "Movers data unavailable", "Movers data unavailable"
-    results.sort(key=lambda x: x["change"], reverse=True)
-    gainers = "\n".join([f"🟢 *{r['ticker']}:* +{r['change']:.2f}%" for r in results[:3]])
-    losers = "\n".join([f"🔴 *{r['ticker']}:* {r['change']:.2f}%" for r in results[-3:]])
-    return gainers, losers
-
-
-async def send_market_report(title: str, body: str):
-    if not TELEGRAM_CHANNEL_ID:
-        return
-    try:
-        bot = get_bot()
-        time_str = datetime.now().strftime("%I:%M %p EST")
-        msg = f"📊 *{title}*\n_{time_str}_\n\n{body}\n\n_GQ FinXray US · gquants.com_"
-        await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=msg, parse_mode="Markdown")
-        print(f"[REPORT] Sent: {title}")
-    except Exception as e:
-        print(f"[ERROR] Failed to send market report: {e}")
-
-
-def send_premarket_report():
-    indices = fetch_index_data()
-    macro = fetch_macro_data()
-    body = f"*US Futures & Pre-Market Snapshot*\n\n{indices}\n\n*Macro*\n{macro}"
-    asyncio.run(send_market_report("🌅 Pre-Market Report", body))
-
-
-def send_market_open_report():
-    indices = fetch_index_data()
-    gainers, losers = fetch_top_movers()
-    body = f"*Markets are now open.*\n\n*Indices at Open*\n{indices}\n\n*Early Gainers*\n{gainers}\n\n*Early Losers*\n{losers}"
-    asyncio.run(send_market_report("🔔 Market Open", body))
-
-
-def send_midday_report():
-    indices = fetch_index_data()
-    gainers, losers = fetch_top_movers()
-    body = f"*Midday Market Check*\n\n*Indices*\n{indices}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}"
-    asyncio.run(send_market_report("⏱ Midday Pulse", body))
-
-
-def send_market_close_report():
-    indices = fetch_index_data()
-    gainers, losers = fetch_top_movers()
-    macro = fetch_macro_data()
-    body = f"*Markets have closed.*\n\n*Final Index Levels*\n{indices}\n\n*Top Gainers*\n{gainers}\n\n*Top Losers*\n{losers}\n\n*Macro*\n{macro}"
-    asyncio.run(send_market_report("📉 Market Close Report", body))
-
-
-def send_afterhours_report():
-    gainers, losers = fetch_top_movers()
-    body = f"*After-Hours Notable Movers*\n\n*Gainers*\n{gainers}\n\n*Losers*\n{losers}"
-    asyncio.run(send_market_report("🌙 After-Hours Movers", body))
-
-
-# ── Scheduler thread ──────────────────────────────────────────────────────────
-_JOB_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="job")
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+# Sized for the worst alignment, not the average one. Fifteen non-SEC jobs run
+# on this pool and their intervals (60s, 15m, 30m, 45m, 60m) all divide an hour,
+# so at the top of every hour six or more fire in the same tick — at 6 workers
+# the rest queued behind whichever slow FMP job took a worker first. FMP has no
+# global rate limiter (only per-call 429 backoff), so this is deliberately 8 and
+# not higher: enough to clear the hourly pile-up, not enough to turn a burst
+# into a quota problem.
+_JOB_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="job")
+# SEC EDGAR gets its own lane. Sharing one pool meant the latency-critical 8-K
+# and Form 4 polls queued behind whatever slow FMP/Massive/news/technical job
+# happened to hold the workers — the heatmap and transcript jobs are minutes
+# long, and six of them at once stalled SEC polling completely. A separate
+# executor means an SEC tick never waits on a non-SEC job.
+_SEC_POOL = ThreadPoolExecutor(max_workers=5, thread_name_prefix="sec")
 _JOB_RUNNING = {}
 _JOB_LOCK = threading.Lock()
 
 
-def job(fn):
+def job(fn, pool=None):
     """
-    Hand a scheduled job to the pool instead of running it inline.
+    Hand a scheduled job to a pool instead of running it inline.
 
-    schedule.run_pending() executes jobs on the calling thread, so before
-    this a 90-second technical_poller would hold up the 30-second SEC
-    poll behind it. Wrapping every job means one slow feature can no
-    longer add latency to any other. The running-set guard drops a tick
-    if the previous run of that same job hasn't finished, which stops
-    fast schedules from stacking up work faster than it drains.
+    schedule.run_pending() executes jobs on the calling thread, so without this
+    a 90-second technical_poller would hold up the 15-second SEC poll behind it.
+    The running-set guard drops a tick if the previous run of that same job has
+    not finished, which stops fast schedules from stacking work faster than it
+    drains.
     """
     name = getattr(fn, "__name__", str(fn))
 
     def _submit():
         with _JOB_LOCK:
             if _JOB_RUNNING.get(name):
-                print(f"[SCHEDULER] Skipping {name} — previous run still active")
+                logger.debug("Skipping %s — previous run still active", name)
                 return
             _JOB_RUNNING[name] = True
 
@@ -504,68 +173,176 @@ def job(fn):
             try:
                 fn()
             except Exception as e:
-                print(f"[SCHEDULER ERROR] {name}: {e}")
+                logger.error("[SCHEDULER] %s failed: %s", name, e)
                 traceback.print_exc()
             finally:
                 took = time.monotonic() - started
                 if took > 30:
-                    print(f"[SCHEDULER] {name} took {took:.1f}s")
+                    logger.info("[SCHEDULER] %s took %.1fs", name, took)
                 with _JOB_LOCK:
                     _JOB_RUNNING[name] = False
 
-        _JOB_POOL.submit(_run)
+        (pool or _JOB_POOL).submit(_run)
 
     _submit.__name__ = f"job_{name}"
     return _submit
 
 
+def sec_job(fn):
+    """Schedule on the dedicated SEC lane so filings never queue behind FMP."""
+    return job(fn, pool=_SEC_POOL)
+
+
 def run_scheduler():
-    print("[SCHEDULER] Starting...")
+    logger.info("[SCHEDULER] Starting (timezone=%s)", time.tzname[0])
     load_cik_map()
-    # Warm start in parallel — the old serial block delayed the first
-    # scheduled tick by however long the slowest poller took.
-    for warm in (poll_sec_8k, poll_sec_form4, poll_sec_10q, poll_sec_10k,
-                 poll_sec_s1, poll_all_news, poll_fmp_news, poll_fmp_events,
-                 run_technical_poller, run_ipo_poller, run_etf_flow_poller):
+
+    # Warm start in parallel — a serial block delayed the first scheduled tick
+    # by however long the slowest poller took.
+    for warm in (poll_sec_8k, poll_sec_form4, poll_sec_10q, poll_sec_10k):
+        sec_job(warm)()
+    for warm in (poll_all_news, poll_fmp_news, run_technical_poller,
+                 run_etf_flow_poller, poll_analyst_ratings):
         job(warm)()
-    schedule.every(30).seconds.do(job(poll_sec_8k))
-    schedule.every(30).seconds.do(job(poll_sec_form4))
-    schedule.every(5).minutes.do(job(poll_sec_10q))
-    schedule.every(5).minutes.do(job(poll_sec_10k))
-    schedule.every(10).minutes.do(job(poll_sec_s1))
-    # 5 min, not 30: the 10-Q/10-K pollers run every 5 min, so a 30-min drain
-    # here added up to 30 min of latency on top of a filing SEC published in
-    # seconds -- the single largest delay in the financial-alert path. The job
-    # is a no-op when no rows are PENDING, so the extra ticks cost one indexed
-    # Supabase query each.
-    schedule.every(5).minutes.do(job(process_pending_snapshots))
-    schedule.every(30).minutes.do(job(run_earnings_transcript_poller))
+
+    # ── Features 1 & 5 — SEC EDGAR, the fast lane ─────────────────────────────
+    # Every SEC form polls at the same fast interval. SEC EDGAR is where these
+    # filings originate — FMP/Massive are downstream resellers reading this same
+    # feed and republishing minutes later — so any gap here is latency we choose
+    # to add to the one source that has the news first.
+    #
+    # Cost: SEC's fair-access policy allows 10 req/s. Four feeds at 15s is 16
+    # requests/MINUTE, ~3% of the allowance, and each tick is one conditional
+    # feed read that returns nothing when nothing has been filed.
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_8k))
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_form4))
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_10q))
+    schedule.every(SEC_FAST_POLL_SECONDS).seconds.do(sec_job(poll_sec_10k))
+
+    # ── S-1 — Feature 8's early-warning half ──────────────────────────────────
+    # A company filing an S-1 is the first public signal it intends to go
+    # public, and it lands here weeks to months before the deal appears on any
+    # IPO calendar. EDGAR is the ONLY source for that leading edge: FMP's
+    # ipos-calendar lists a deal once it is scheduled and priced, which is a
+    # different (later) event. So this interval is a real detection delay.
+    #
+    # These rows used to be stored status="IPO_PENDING" and read by nothing —
+    # the pipeline selects "PENDING", and ipo_poller resolved its S-1 link live
+    # from FMP rather than from the table. They now enter the pipeline like any
+    # other filing and route market-wide under source=SEC_IPO.
+    #
+    # Off the fast lane, not because it is unimportant but because it is the one
+    # market-wide SEC poll: it cannot filter by watchlist (a pre-IPO registrant
+    # is on nobody's), so a cold start fetches ~100 bodies (EDGAR_FEED_COUNT) at
+    # sec_client's 8 req/s ceiling — about 13 seconds, which overran a 15s tick
+    # and logged "Skipping poll_sec_s1 — previous run still active".
+    #
+    # 5 minutes is affordable because the expensive part is now bounded: the CIK
+    # dedup in poll_edgar_generic_async drops amendments BEFORE any body is
+    # fetched, so a steady-state tick costs one feed read plus a body only for
+    # genuinely new registrants — a handful a day, not per tick.
+    schedule.every(SEC_S1_POLL_MINUTES).minutes.do(sec_job(poll_sec_s1))
+
+    # The CIK map is fetched once, at boot, from a rate-limited endpoint, at the
+    # exact moment every other poller is also starting. When SEC answered 429 to
+    # it three times on 2026-09-09 the loader gave up and the process ran its
+    # whole life with an empty map — which silently disables every
+    # watchlist-scoped SEC feature, because a filing whose CIK will not resolve
+    # is indistinguishable from a filing for a company nobody watches. This is a
+    # no-op once loaded, so it costs one boolean check per tick.
+    schedule.every(10).minutes.do(sec_job(ensure_cik_map))
+
+    # ── Feature 3 — Result Snapshot ───────────────────────────────────────────
+    # The 10-Q/10-K poll only files the filing; this turns it into an alert, so
+    # its interval adds directly on top of the poll's. It now also picks up 8-K
+    # Item 2.02 earnings releases, which land weeks earlier than the 10-Q.
+    # Moved off the SEC pool: it is a Supabase + XBRL/FMP job, not an EDGAR feed
+    # read, and it was occupying an SEC worker every 30 seconds.
+    schedule.every(30).seconds.do(job(process_pending_snapshots))
+
+    # ── Feature 2 — News ──────────────────────────────────────────────────────
     schedule.every(60).seconds.do(job(poll_all_news))
+    schedule.every(15).minutes.do(job(poll_fmp_news))
 
-    # FMP news + events pollers (Features 2, 4, 5)
-    schedule.every(10).minutes.do(job(poll_fmp_news))
-    schedule.every(60).minutes.do(job(poll_fmp_events))
+    # ── Features 4 & 5 — FMP events + large trades ────────────────────────────
+    # De-prioritized relative to SEC: FMP re-surfaces the same material events
+    # EDGAR already caught, and caught faster. These cover what EDGAR structurally
+    # cannot — forward earnings calendars and off-exchange block prints.
+    schedule.every(30).minutes.do(job(poll_fmp_events))
+    # PAUSED: Feature 5 (Large Trades) — uncomment to re-enable
+    # schedule.every(30).minutes.do(job(run_large_trades_poller))
 
-    # Technical + IPO pollers (Features 6, 8)
-    schedule.every(60).minutes.do(job(run_technical_poller))
-    schedule.every().day.at("08:00").do(job(run_ipo_poller))
+    # Feature 4's OTHER half: the EPS surprise itself, not just the heads-up
+    # that earnings are due. feature_map already listed EARNINGS_MISS and
+    # EARNINGS_BEAT as Feature 4 filing types "emitted by earnings_alerts.py" —
+    # but nothing ever called that module, and it carried an undefined-variable
+    # bug that would have failed every insert if anything had. Both fixed.
+    #
+    # Hourly is affordable at any watchlist size: /stable/earnings-calendar has
+    # no per-symbol filter, so this is ONE market-wide call per poll that is then
+    # indexed by ticker locally — not one call per name. Actual EPS lands within
+    # hours of the close, and the poller looks back 24h, so nothing is missed
+    # between ticks; the interval only decides how quickly a surprise surfaces.
+    schedule.every(60).minutes.do(job(poll_earnings_for_tickers))
 
-    # ETF Xray + ETF Flow (Features 7, 10)
-    schedule.every().day.at("09:00").do(job(run_etf_xray))
+    # ── Feature 6 — Technical Alerts ──────────────────────────────────────────
+    schedule.every(45).minutes.do(job(run_technical_poller))
+
+    # ── Feature 7 — ETF Flow ──────────────────────────────────────────────────
     schedule.every(60).minutes.do(job(run_etf_flow_poller))
 
-    # Market reports + Sector Heatmap (Feature 9)
-    schedule.every().day.at("09:25").do(job(send_premarket_report))
-    schedule.every().day.at("09:30").do(job(send_market_open_report))
-    schedule.every().day.at("09:30").do(job(run_sector_heatmap_midday))
-    schedule.every().day.at("13:00").do(job(run_sector_heatmap_afternoon))
-    schedule.every().day.at("16:00").do(job(run_sector_heatmap_weekly))
-    schedule.every().day.at("16:30").do(job(run_sector_heatmap_monthly))
-    schedule.every().day.at("13:00").do(job(send_midday_report))
-    schedule.every().day.at("16:00").do(job(send_market_close_report))
-    schedule.every().day.at("16:30").do(job(send_afterhours_report))
+    # ── Feature 8 — IPO Deep Dive ─────────────────────────────────────────────
+    schedule.every().day.at("08:00").do(job(run_ipo_poller))
 
-    print("[SCHEDULER] All pollers and market reports scheduled.")
+    # ── Feature 10 — Earnings Call Transcripts ────────────────────────────────
+    schedule.every(30).minutes.do(job(run_earnings_transcript_poller))
+
+    # ── Feature 11 — Analyst Ratings & Price Targets ──────────────────────────
+    # FMP's consensus endpoints return current state, not an event feed, so the
+    # poll interval IS the detection delay: a downgrade published one minute
+    # after a tick waited the rest of the interval. Two-hourly made that up to
+    # 119 minutes on a HIGH-impact alert.
+    #
+    # POLLING FASTER CANNOT DUPLICATE. _evaluate() compares the live snapshot
+    # against _latest_prior_alert() — the last alert STORED for that ticker, not
+    # the last poll — so an unchanged consensus is silently "nochange" however
+    # often it is read. Four times the polls is four times the reads, not four
+    # times the alerts.
+    #
+    # Cost is one FMP call plus one indexed Supabase lookup per watched ticker,
+    # paced 0.1s apart inside the poller, and the _JOB_RUNNING guard drops a
+    # tick if the previous pass is still running — so a watchlist too large to
+    # finish in 30 minutes degrades to "as often as it can" instead of stacking.
+    schedule.every(30).minutes.do(job(poll_analyst_ratings))
+
+    # ── Feature 12 — Macro & Policy Digest + market reports ───────────────────
+    # All ET wall-clock. Market hours are 09:30–16:00 ET.
+    schedule.every().day.at("08:15").do(job(run_macro_policy_roundup))
+    schedule.every().day.at("09:15").do(job(send_premarket_report))
+    schedule.every().day.at("09:35").do(job(send_market_open_report))
+    schedule.every().day.at("13:00").do(job(send_midday_report))
+    schedule.every().day.at("16:05").do(job(send_market_close_report))
+    schedule.every().day.at("16:45").do(job(send_afterhours_report))
+
+    # ── Feature 9 — Sector Heatmap ────────────────────────────────────────────
+    # Cadence mirrors the India FinXray spec in
+    # DATA_COLLECTION_SOURCES_AND_PROCESSING_SUMMARY.md §6.1 (daily midday +
+    # just-after-close, weekly ~70min after close, monthly ~2h after close),
+    # translated from IST market hours to ET ones. The weekly and monthly jobs
+    # self-gate on the NYSE calendar and no-op unless the run date really is the
+    # last trading day of its week / month.
+    schedule.every().day.at("12:30").do(job(run_sector_heatmap_midday))
+    schedule.every().day.at("16:01").do(job(run_sector_heatmap_afternoon))
+    schedule.every().day.at("17:10").do(job(run_sector_heatmap_weekly))
+    schedule.every().day.at("18:00").do(job(run_sector_heatmap_monthly))
+
+    # ── Feature 13 — Watchlist Heatmap ────────────────────────────────────────
+    # Same two daily slots, offset from the sector heatmap so a user does not
+    # receive two images in the same minute.
+    schedule.every().day.at("12:45").do(job(run_watchlist_heatmap_midday))
+    schedule.every().day.at("16:20").do(job(run_watchlist_heatmap_eod))
+
+    logger.info("[SCHEDULER] %d jobs registered across 13 features", len(schedule.jobs))
     while True:
         schedule.run_pending()
         time.sleep(1)
@@ -573,37 +350,56 @@ def run_scheduler():
 
 # ── AI pipeline thread ────────────────────────────────────────────────────────
 def run_pipeline():
-    print("[PIPELINE] Starting...")
+    """
+    Drain PENDING raw_filings continuously.
+
+    process_with_ai() returns the number of filings it handled, so a backlog
+    drains back-to-back instead of one batch per idle gap; it only sleeps when
+    the queue came back empty, and an empty check is a single indexed query.
+    """
+    logger.info("[PIPELINE] Starting")
     while True:
+        worked = False
         try:
-            from ai_pipeline import run_pipeline as process
-            process()
+            worked = bool(process_with_ai())
         except Exception as e:
-            print(f"[PIPELINE ERROR] {e}")
-            asyncio.run(send_error_alert(f"Pipeline error: {str(e)}"))
-        time.sleep(60)
+            logger.error("[PIPELINE] %s", e)
+        if not worked:
+            time.sleep(PIPELINE_IDLE_SECONDS)
 
 
 # ── Delivery loop ─────────────────────────────────────────────────────────────
 async def delivery_loop():
-    print("[DELIVERY] Starting...")
+    """
+    Last hop before the user's phone. An empty cycle is one indexed query.
+
+    THE BACKLOG BUG THIS FIXES. This slept DELIVERY_IDLE_SECONDS after every
+    cycle, including cycles that did work. delivery.py settles at most
+    BATCH_LIMIT (100) alerts per call, so a backlog drained at 100 alerts per
+    (cycle + idle gap) with the gap added for no reason — the queue was known
+    to be non-empty at that exact moment. The pipeline loop below already only
+    sleeps when its queue comes back empty; this now matches it.
+
+    The return value counts alerts that LEFT the queue, not alerts examined, so
+    a cycle that only defers in-flight retries reports 0 and idles rather than
+    spinning on rows it cannot settle yet.
+    """
+    logger.info("[DELIVERY] Starting")
     while True:
-        await deliver_pending_alerts()
-        await asyncio.sleep(30)
+        settled = 0
+        try:
+            settled = await deliver_pending_alerts()
+        except Exception as e:
+            logger.error("[DELIVERY] %s", e)
+        if not settled:
+            await asyncio.sleep(DELIVERY_IDLE_SECONDS)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    print("""
-╔══════════════════════════════════════════════════════╗
-║            GQ FinXray US — Starting Up               ║
-║  SEC EDGAR + FMP + Massive + News + AI + Telegram    ║
-╚══════════════════════════════════════════════════════╝
-    """)
-    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
-    scheduler_thread.start()
-    pipeline_thread = threading.Thread(target=run_pipeline, daemon=True)
-    pipeline_thread.start()
+    logger.info("GQ FinXray US starting — SEC EDGAR + FMP + Massive + RSS + AI + Telegram")
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    threading.Thread(target=run_pipeline, daemon=True).start()
     await delivery_loop()
 
 

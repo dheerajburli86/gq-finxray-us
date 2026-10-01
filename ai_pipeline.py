@@ -795,6 +795,7 @@ def rank_dedup_candidates(summary, recent_summaries,
     return [old for _, old in scored[:max_candidates]]
 
 
+<<<<<<< HEAD
 # ── Exact-duplicate guard ─────────────────────────────────────────────────────
 # WHY THIS EXISTS. One story reached users 4+ times in the same minute. FMP
 # returns syndicated copies of a story (same title, same body, different URLs),
@@ -873,6 +874,8 @@ def _alert_exists(field, value):
         return False
 
 
+=======
+>>>>>>> ef39d99bbeb6ccd55d181c61870ee03e78b091db
 def store_summary(filing_id, ticker, summary, impact, event_type):
     try:
         result = supabase.table("ai_summaries").insert({

@@ -692,9 +692,12 @@ async def deliver_pending_alerts():
     alerts = _fetch_undelivered()
     if not alerts:
         return 0
+<<<<<<< HEAD
     alerts, suppressed = _drop_duplicate_alerts(alerts)
     if not alerts:
         return suppressed
+=======
+>>>>>>> ef39d99bbeb6ccd55d181c61870ee03e78b091db
 
     users = _fetch_active_users()
     if not users:
