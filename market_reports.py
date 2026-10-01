@@ -326,6 +326,14 @@ def _guard(report_type):
             # spent FMP quota and LLM tokens building a message that delivery
             # discarded. Stop before doing the work; flip GQ_ENABLE_MARKET_WIDE
             # to bring them back.
+            # NYSE closed (weekend or holiday): there is no session to report
+            # on. The stale-quote check in each report only catches an all-zero
+            # tape, but on a weekend FMP still returns Friday's real changes, so
+            # without this gate a "Midday Pulse" went out on Sunday.
+            from heatmap_generator import is_trading_day
+            if not is_trading_day(datetime.now(ET).date()):
+                logger.info("[REPORTS] %s skipped — market closed today", report_type)
+                return False
             from delivery import broadcast_enabled
             if not broadcast_enabled():
                 logger.info("[REPORTS] %s skipped — market-wide delivery is disabled", report_type)
