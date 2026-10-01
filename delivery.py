@@ -31,6 +31,7 @@ issue thousands of round-trips per cycle at 6,300 tickers.
 import os
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -42,6 +43,7 @@ from telegram.error import RetryAfter, Forbidden, BadRequest
 
 from alert_formatter import build_message, delivery_reason
 from feature_map import resolve_feature
+from gquants_format_converter import make_frontend_link
 
 load_dotenv()
 
@@ -75,6 +77,14 @@ ET = ZoneInfo("America/New_York")
 #      marked delivered. That is why heatmaps stopped arriving.
 #
 # The allowlist below re-enables (2) without touching (1).
+#
+# Defaults ON. With it off, every ticker="MARKET" row fell through _is_market_wide()
+# into the watchlist branch, where _fetch_watchers() had already excluded "MARKET" --
+# so the audience was empty, the alert was recorded no_audience and marked
+# delivered=True, and Features 8, 9, 12 and the five scheduled market reports were
+# silently discarded after being fully built. Set GQ_ENABLE_MARKET_WIDE=false only
+# if you deliberately want those features off; it does NOT gate company news about
+# unwatched tickers, which stays closed by the ticker match below regardless.
 BROADCAST_ENABLED = (os.getenv("GQ_ENABLE_MARKET_WIDE", "true").strip().lower()
                      in ("1", "true", "yes"))
 
@@ -90,12 +100,43 @@ def broadcast_enabled():
 MARKET_WIDE_FILING_TYPES = {
     "SECTOR_HEATMAP", "HEATMAP_DAILY_MIDDAY", "HEATMAP_DAILY_AFTERNOON",
     "HEATMAP_WEEKLY", "HEATMAP_MONTHLY",
-    "MARKET_REPORT", "MACRO_BRIEFING", "ETF_XRAY",
-    "IPO_UPCOMING", "INFLOW", "OUTFLOW",
+    "MARKET_REPORT", "MACRO_BRIEFING",
+    "IPO_UPCOMING",
+    # etf_flow_poller emits these two, not INFLOW/OUTFLOW. The old names were
+    # left here after the poller was rewritten, so the source-level match below
+    # was the only thing still routing Feature 7.
+    "BULLISH_MOMENTUM", "BEARISH_MOMENTUM", "INFLOW", "OUTFLOW",
 }
 MARKET_WIDE_SOURCES = {
     "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "ETF_FLOW", "FMP_IPO",
+    # Feature 8's EDGAR half: an S-1 registration, captured by
+    # edgar_poller_async.poll_sec_s1_async under its own source rather than
+    # SEC_EDGAR. It has to route market-wide — the registrant is pre-IPO, so no
+    # ticker exists for a watchlist to match and the alert would otherwise
+    # resolve to an empty audience and be settled as delivered without being
+    # sent. Routing on the SOURCE and not on filing_type "S-1" is deliberate: a
+    # legacy SEC_EDGAR/S-1 row stays company-scoped, so this cannot retroactively
+    # start broadcasting rows written by the old sync poller.
+    "SEC_IPO",
 }
+
+# Personal-by-construction: rendered per user and delivered directly by
+# watchlist_heatmap.py with an explicit user_id. These must never be treated as
+# market-wide, or a restart could fan one user's holdings out to everybody.
+PERSONAL_FILING_TYPES = {"HEATMAP_WATCHLIST_MIDDAY", "HEATMAP_WATCHLIST_EOD"}
+
+# Content that is ALWAYS about one company, so it is only ever watchlist-routed.
+# Listed explicitly rather than inferred, because the ticker catch-all in
+# _is_market_wide() would otherwise broadcast any row whose symbol failed to
+# resolve — an 8-K with an unmapped CIK reaching every subscriber is a far worse
+# failure than that same 8-K reaching nobody.
+COMPANY_ONLY_SOURCES = {
+    "SEC_EDGAR", "SEC_XBRL", "FMP_NEWS", "FMP", "FMP_FUNDAMENTALS",
+    "FMP_TRANSCRIPT", "FMP_ANALYST", "TECHNICAL", "LARGE_TRADE",
+    "CNBC", "REUTERS", "MARKETWATCH", "NASDAQ", "IBD", "FORTUNE",
+    "CNN", "BLOOMBERG", "YAHOO", "SEEKINGALPHA",
+}
+COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 
 
 def _is_market_wide(alert):
@@ -108,10 +149,23 @@ def _is_market_wide(alert):
     if not BROADCAST_ENABLED:
         return False
 
+    if (alert.get("filing_type") or "").upper() in PERSONAL_FILING_TYPES:
+        return False
+
     if (alert.get("filing_type") or "").upper() in MARKET_WIDE_FILING_TYPES:
         return True
     if (alert.get("source") or "").upper() in MARKET_WIDE_SOURCES:
         return True
+
+    # Company-specific content is NEVER market-wide, whatever ticker it carries.
+    # A general news article filed under ticker="MARKET", or a filing whose CIK
+    # failed to resolve and landed as "UNKNOWN", would otherwise fall into the
+    # ticker catch-all below and broadcast to every subscriber — the exact
+    # firehose this module exists to prevent. It finds no audience instead.
+    if (alert.get("source") or "").upper() in COMPANY_ONLY_SOURCES:
+        return False
+    if (alert.get("filing_type") or "").upper() in COMPANY_ONLY_FILING_TYPES:
+        return False
 
     # A row with no company ticker cannot be watchlist-routed by definition.
     ticker = (alert.get("ticker") or "").upper()
@@ -138,12 +192,62 @@ MAX_RETRY_AGE_HOURS = float(os.getenv("MAX_CONTENT_AGE_HOURS", "24"))
 
 
 # ── Loading ───────────────────────────────────────────────────────────────────
+# Past this, an alert is no longer news to the reader -- they have seen it
+# elsewhere, and delivering it makes the product look slow rather than
+# thorough. Matches the pipeline's own content window.
+MAX_ALERT_AGE_MINUTES = float(os.getenv("GQ_MAX_ALERT_AGE_MINUTES", "90"))
+
+
+_last_expiry_at = [0.0]
+EXPIRY_INTERVAL_SECONDS = float(os.getenv("GQ_EXPIRY_INTERVAL_SECONDS", "60"))
+
+
+def _expire_stale_alerts(force=False):
+    """
+    Settle alerts too old to be worth sending, in one bulk UPDATE.
+
+    Without this the undelivered queue is append-only whenever delivery falls
+    behind: it never drains, and every cycle re-reads the same stale head.
+    Marking them delivered retires them without sending -- the alert row and
+    its summary stay in the table for review, they just stop being queued.
+    """
+    # Throttled: the delivery loop cycles every few seconds, and re-running a
+    # bulk UPDATE that enforces a 90-minute window on every cycle is ~20
+    # pointless writes a minute.
+    now = time.monotonic()
+    if not force and (now - _last_expiry_at[0]) < EXPIRY_INTERVAL_SECONDS:
+        return 0
+    _last_expiry_at[0] = now
+
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(minutes=MAX_ALERT_AGE_MINUTES)).isoformat()
+    try:
+        stale = (supabase.table("alerts")
+                 .update({"delivered": True})
+                 .eq("delivered", False)
+                 .lt("created_at", cutoff)
+                 .execute()).data or []
+        if stale:
+            logger.info("[DELIVERY] Retired %d alert(s) older than %.0f minutes "
+                        "without sending", len(stale), MAX_ALERT_AGE_MINUTES)
+        return len(stale)
+    except Exception as e:
+        logger.error("[DELIVERY] Failed to expire stale alerts: %s", e)
+        return 0
+
+
 def _fetch_undelivered(limit=BATCH_LIMIT):
     try:
+        # NEWEST FIRST. This was .order("created_at") -- strict FIFO -- so
+        # whenever a backlog built up, fresh alerts queued BEHIND stale ones
+        # and, because a cycle takes only BATCH_LIMIT, could not be reached
+        # until the whole backlog drained. That is how an alert generated 12
+        # hours ago went out ahead of news that broke seconds ago. The stale
+        # tail is expired above rather than being allowed to block the head.
         res = (supabase.table("alerts")
                .select("*")
                .eq("delivered", False)
-               .order("created_at")
+               .order("created_at", desc=True)
                .limit(limit)
                .execute())
         return res.data or []
@@ -406,8 +510,102 @@ def _past_retry_window(alert):
             created = created.replace(tzinfo=timezone.utc)
     except Exception:
         return True
-    age_hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600.0
-    return age_hours >= MAX_RETRY_AGE_HOURS
+    age_minutes = (datetime.now(timezone.utc) - created).total_seconds() / 60.0
+    # Bounded by the staleness sweep, not just by MAX_RETRY_AGE_HOURS. Once
+    # _expire_stale_alerts() retires undelivered alerts at MAX_ALERT_AGE_MINUTES
+    # (90m), nothing can survive in the queue to reach the 24h retry ceiling --
+    # so reading MAX_RETRY_AGE_HOURS alone would tell you transient failures get
+    # a day of retries when they actually get 90 minutes. Take whichever is
+    # tighter so the two windows agree by construction.
+    limit_minutes = min(MAX_RETRY_AGE_HOURS * 60.0, MAX_ALERT_AGE_MINUTES)
+    return age_minutes >= limit_minutes
+
+
+def _log_payload(alert):
+    """
+    Write the alert's structured XBRL/JSON payload to payload_log the moment it
+    is about to reach Telegram — independent of whether GQUANTS_ALERT_BASE_URL
+    is set, since the frontend link is no longer a prerequisite for logging.
+
+    Upserts on alert_id so a retried delivery cycle (deferred alert, restarted
+    process) never writes a duplicate row. Missing table or any DB error is
+    swallowed to a warning: this is an audit trail, not part of the send path,
+    and must never be the reason an alert fails to reach a user.
+    """
+    extra = alert.get("extra") if isinstance(alert.get("extra"), dict) else {}
+    payload = extra.get("structured_payload")
+    sec_json = extra.get("sec_json") or {}
+
+    # Log anything carrying machine-readable data, not just a built payload:
+    # an SEC filing alert's value here is the XBRL/JSON endpoints themselves,
+    # which is exactly the "json/xbrl link based alert" this table is for.
+    if not payload and not sec_json:
+        return
+
+    try:
+        link = make_frontend_link(payload, str(alert.get("id") or "")) if payload else None
+    except Exception:
+        link = None
+    # With no frontend link, the SEC endpoint IS the link worth keeping.
+    link = link or sec_json.get("filing_index") or sec_json.get("companyfacts")
+
+    record = dict(payload) if payload else {}
+    if sec_json:
+        record["sec_json"] = sec_json
+
+    try:
+        supabase.table("payload_log").upsert({
+            "alert_id": alert.get("id"),
+            "ticker": (alert.get("ticker") or "").upper(),
+            "payload_type": (payload or {}).get("type") or "sec_json",
+            "filing_type": alert.get("filing_type"),
+            "source": alert.get("source"),
+            "payload": record,
+            "frontend_link": link,
+        }, on_conflict="alert_id", ignore_duplicates=True).execute()
+    except Exception as e:
+        logger.warning("[DELIVERY] payload_log insert failed (run migrations/"
+                       "2026-09-08_payload_log.sql?): %s", e)
+
+
+def _log_alert_run(alert, recipients, sent, failed, first_error):
+    """
+    LOG 1 OF 2 — `alert_run_log`, one row per alert that reached the fan-out.
+
+    This is the audit trail for every alert the system produces, whether it went
+    through the AI summarizer (news / filings / transcripts, where the attempt
+    and token counts on `extra` are real numbers) or was a templated alert with
+    no LLM involved (technical, IPO, ETF flow, result snapshot, heatmap, macro —
+    those fields are simply absent and land here as NULL, which is expected).
+
+    main.py used to define this and never call it, so the table was never
+    written. It lives here now because delivery is the only place that knows
+    whether Telegram actually accepted the message.
+
+    Never raises: a logging failure must not take down real delivery.
+    """
+    try:
+        extra = alert.get("extra") if isinstance(alert.get("extra"), dict) else {}
+        fid, fname = resolve_feature(alert.get("source"), alert.get("filing_type"))
+        supabase.table("alert_run_log").insert({
+            "alert_id": alert.get("id"),
+            "ticker": (alert.get("ticker") or "UNKNOWN").upper(),
+            "source": alert.get("source"),
+            "filing_type": alert.get("filing_type"),
+            "feature_id": extra.get("feature_id", fid),
+            "feature_name": extra.get("feature_name", fname),
+            "impact": alert.get("impact"),
+            "summarization_attempts": extra.get("summarization_attempts"),
+            "input_tokens": extra.get("input_tokens"),
+            "output_tokens": extra.get("output_tokens"),
+            "total_tokens": extra.get("total_tokens"),
+            "llm_calls": extra.get("llm_calls"),
+            "telegram_success": sent > 0,
+            "telegram_error": (str(first_error)[:500] if first_error else None),
+        }).execute()
+    except Exception as e:
+        logger.warning("[DELIVERY] alert_run_log insert failed for %s: %s",
+                       alert.get("id"), e)
 
 
 def _mark_fanned_out(alert_ids):
@@ -419,18 +617,90 @@ def _mark_fanned_out(alert_ids):
         logger.error(f"[DELIVERY] Failed to mark alerts delivered: {e}")
 
 
+DUP_WINDOW_HOURS = int(os.getenv("GQ_DELIVERY_DUP_WINDOW_HOURS", "24"))
+
+
+def _drop_duplicate_alerts(alerts):
+    """
+    Final safety net: never fan out two alerts carrying the same summary_hash.
+
+    ai_pipeline stamps extra.summary_hash (ticker + normalised summary) on every
+    pipeline alert. If several rows with the same hash are waiting, only the
+    oldest is sent; if one was already delivered inside the window, none are.
+    The duplicates are settled (marked delivered) without sending anything.
+    Alerts with no hash (heatmaps, reports, personal alerts) are untouched, and
+    a lookup failure lets everything through rather than dropping real alerts.
+    Returns (alerts_to_send, number_settled_as_duplicates).
+    """
+    keep, dup_ids, first_for = [], [], {}
+    for a in sorted(alerts, key=lambda r: r.get("created_at") or ""):
+        h = (a.get("extra") or {}).get("summary_hash")
+        if not h:
+            keep.append(a)
+        elif h in first_for:
+            dup_ids.append(a["id"])
+        else:
+            first_for[h] = a
+            keep.append(a)
+
+    if first_for:
+        try:
+            since = (datetime.now(timezone.utc) - timedelta(hours=DUP_WINDOW_HOURS)).isoformat()
+            rows = (supabase.table("alerts").select("extra")
+                    .in_("extra->>summary_hash", list(first_for))
+                    .eq("delivered", True)
+                    .gte("created_at", since).execute().data or [])
+            seen = {(r.get("extra") or {}).get("summary_hash") for r in rows}
+            for h in seen & set(first_for):
+                dup_ids.append(first_for[h]["id"])
+                keep = [k for k in keep if k["id"] != first_for[h]["id"]]
+        except Exception as e:
+            logger.warning("[DELIVERY] duplicate lookup failed, sending anyway: %s", e)
+
+    if dup_ids:
+        logger.info("[DELIVERY] suppressed %d duplicate alert(s)", len(dup_ids))
+        _mark_fanned_out(dup_ids)
+    return keep, len(dup_ids)
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 async def deliver_pending_alerts():
-    """One fan-out cycle. Safe to call on a loop; safe to interrupt."""
+    """
+    One fan-out cycle. Safe to call on a loop; safe to interrupt.
+
+    Sends are parallel ACROSS users. The previous version had one single loop
+    that sent every recipient of every alert strictly one after another, so a
+    cycle with 50 alerts x 10 recipients each did 500 sequential sends at
+    ~1.05s apart (PER_CHAT_GAP_SECONDS) — over 8 minutes for a batch that
+    should land within a couple of seconds. The 1-second-per-chat pacing is a
+    real Telegram constraint, but it only applies to repeat sends to the SAME
+    chat_id — it does not require serializing different chats behind each
+    other. Every user's own queue is still sent to in order (so a user with
+    three alerts this cycle gets them spaced out safely); different users'
+    queues run concurrently via asyncio.gather, so N users drop their alerts
+    at roughly the same moment instead of one after another.
+
+    Returns the number of alerts SETTLED this cycle — rows that left the
+    undelivered queue, whether they were sent, found no audience or were
+    abandoned as unsendable. main.delivery_loop uses it to drain a backlog
+    back-to-back instead of pausing between batches; deferred rows (still in
+    flight, to be retried) deliberately do not count, so a cycle that settles
+    nothing reports 0 and lets the loop idle instead of spinning.
+    """
+    _expire_stale_alerts()
+
     alerts = _fetch_undelivered()
     if not alerts:
-        return
+        return 0
+    alerts, suppressed = _drop_duplicate_alerts(alerts)
+    if not alerts:
+        return suppressed
 
     users = _fetch_active_users()
     if not users:
         logger.warning("[DELIVERY] %d alerts pending but no active users with a chat_id. "
                        "Leaving them undelivered.", len(alerts))
-        return
+        return 0
 
     tickers = {
         (a.get("ticker") or "").upper()
@@ -445,9 +715,17 @@ async def deliver_pending_alerts():
 
     bot = Bot(token=TELEGRAM_TOKEN)
     ledger = []
-    fanned = []
     stats = {"sent": 0, "failed": 0, "skipped": 0, "no_audience": 0, "deferred": 0, "errored": 0}
 
+    # aid -> {"alert": row, "retry_needed": bool, "fanned": bool}
+    alert_state = {}
+    # user_id -> [(aid, user, text, reason), ...], sent in order, one task/user
+    per_user_queue = {}
+
+    # ── Phase 1: resolve audience + build message text for every alert ────────
+    # Cheap, synchronous, no network — safe to do inline before fanning out the
+    # actual sends. Also the single choke point where every structured XBRL/JSON
+    # payload gets logged, once per alert, regardless of which poller built it.
     for alert in alerts:
         aid = alert["id"]
 
@@ -468,14 +746,14 @@ async def deliver_pending_alerts():
 
             if not audience:
                 stats["no_audience"] += 1
-                fanned.append(aid)
+                alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": True}
                 continue
 
             text = build_message(alert, reason=delivery_reason(alert))
+            _log_payload(alert)
 
-            # True while at least one recipient failed for a reason that a later
-            # attempt could plausibly fix. Such an alert must NOT be settled.
-            retry_needed = False
+            alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": False,
+                                "sent": 0, "failed": 0, "recipients": 0, "error": None}
 
             for user, reason in audience:
                 uid = user["user_id"]
@@ -488,48 +766,74 @@ async def deliver_pending_alerts():
                     stats["skipped"] += 1
                     continue
 
-                ok, err, permanent = await _send_one(bot, user["chat_id"], text)
-                if ok:
-                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                                   "status": "SENT", "reason": reason})
-                    sent_today[uid] = sent_today.get(uid, 0) + 1
-                    stats["sent"] += 1
-                elif permanent:
-                    # Nothing will ever make this send succeed. Record it as
-                    # terminal so it is not retried forever.
-                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                                   "status": "UNDELIVERABLE", "reason": reason, "error": err})
-                    stats["failed"] += 1
-                else:
-                    ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
-                                   "status": "FAILED", "reason": reason, "error": err})
-                    stats["failed"] += 1
-                    retry_needed = True
+                per_user_queue.setdefault(uid, []).append((aid, user, text, reason))
+                alert_state[aid]["recipients"] += 1
+                # Reserve the slot now so two alerts to the same user in this
+                # cycle both see the incremented count before either sends.
+                sent_today[uid] = sent_today.get(uid, 0) + 1
 
-                # Telegram allows roughly one message per second per chat. The
-                # global 50ms gap alone triggers 429s when several alerts land
-                # for the same user in one cycle, and every 429 burns a retry.
-                await asyncio.sleep(max(SEND_GAP_SECONDS, PER_CHAT_GAP_SECONDS))
-
-            # Optional admin mirror, off unless explicitly configured.
+            # Optional admin mirror, off unless explicitly configured. Fired
+            # once per alert here rather than per recipient.
             if ADMIN_CHANNEL_ID:
                 await _send_one(bot, ADMIN_CHANNEL_ID, text)
-
-            if retry_needed and not _past_retry_window(alert):
-                stats["deferred"] += 1
-            else:
-                fanned.append(aid)
         except Exception as e:
             # Mark it fanned out anyway: it is structurally broken, and retrying
             # it forever would block the queue behind a row that can never send.
             logger.exception("[DELIVERY] Alert %s failed to process, skipping: %s", aid, e)
             stats["errored"] += 1
+            alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": True}
+
+    # ── Phase 2: fan out concurrently, one task per user ───────────────────────
+    async def _drain_user_queue(uid, items):
+        for aid, user, text, reason in items:
+            ok, err, permanent = await _send_one(bot, user["chat_id"], text)
+            if ok:
+                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                               "status": "SENT", "reason": reason})
+                stats["sent"] += 1
+                alert_state[aid]["sent"] += 1
+            elif permanent:
+                # Nothing will ever make this send succeed. Record it as
+                # terminal so it is not retried forever.
+                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                               "status": "UNDELIVERABLE", "reason": reason, "error": err})
+                stats["failed"] += 1
+                alert_state[aid]["failed"] += 1
+                alert_state[aid]["error"] = alert_state[aid]["error"] or err
+            else:
+                ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                               "status": "FAILED", "reason": reason, "error": err})
+                stats["failed"] += 1
+                alert_state[aid]["failed"] += 1
+                alert_state[aid]["error"] = alert_state[aid]["error"] or err
+                alert_state[aid]["retry_needed"] = True
+
+            # Telegram allows roughly one message per second per chat. This gap
+            # only serializes repeat sends to THIS chat_id — it no longer holds
+            # up any other user's queue, which is what made fan-out slow.
+            await asyncio.sleep(max(SEND_GAP_SECONDS, PER_CHAT_GAP_SECONDS))
+
+    if per_user_queue:
+        await asyncio.gather(*(
+            _drain_user_queue(uid, items) for uid, items in per_user_queue.items()
+        ))
+
+    fanned = []
+    for aid, state in alert_state.items():
+        if state["fanned"]:
+            fanned.append(aid)
+        elif state["retry_needed"] and not _past_retry_window(state["alert"]):
+            stats["deferred"] += 1
+            continue          # still in flight — do not close the audit row yet
+        else:
             fanned.append(aid)
 
-        # Flush periodically so a crash loses at most a few ledger rows.
-        if len(ledger) >= 50:
-            _record(ledger)
-            ledger = []
+        # LOG 1: written once per alert, at the moment it is settled. Includes
+        # alerts that found no audience (sent=0), so "built but nobody wanted it"
+        # is visible in the table rather than invisible.
+        _log_alert_run(state["alert"], state.get("recipients", 0),
+                       state.get("sent", 0), state.get("failed", 0),
+                       state.get("error"))
 
     _record(ledger)
     _mark_fanned_out(fanned)
@@ -539,6 +843,8 @@ async def deliver_pending_alerts():
                     "no_audience=%d deferred=%d errored=%d",
                     len(fanned), stats["sent"], stats["failed"], stats["skipped"],
                     stats["no_audience"], stats["deferred"], stats["errored"])
+
+    return len(fanned)
 
 
 async def deliver_photo(image_path, caption, source, filing_type,
