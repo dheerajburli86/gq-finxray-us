@@ -1,6 +1,6 @@
-"""
+﻿"""
 delivery.py
-GQ FinXray US — per-user alert fan-out.
+GQ FinXray US â€” per-user alert fan-out.
 
 THE RULE THIS MODULE ENFORCES
 -----------------------------
@@ -8,15 +8,15 @@ A user receives an alert about a company if, and only if, that company is on
 their watchlist. Nothing else. There is no firehose channel, no "everyone gets
 everything" path, no default subscription to the whole market, and no exceptions.
 
-All features — including IPO alerts, sector heatmaps, macro digests, and ETF
-flows — are routed strictly by watchlist ticker. Alerts about unwatchlisted
+All features â€” including IPO alerts, sector heatmaps, macro digests, and ETF
+flows â€” are routed strictly by watchlist ticker. Alerts about unwatchlisted
 symbols are silently skipped at delivery time.
 
 WHY alerts.delivered IS NOT ENOUGH ANY MORE
 -------------------------------------------
 One alert now has many recipients, so a single boolean on the alert row cannot
 express "sent to Dheeraj, failed for Priya, skipped for Raj (below their impact
-floor)". `alert_deliveries` is the real ledger — one row per (alert, user) with
+floor)". `alert_deliveries` is the real ledger â€” one row per (alert, user) with
 a UNIQUE constraint that doubles as the idempotency key, so a crash mid-fan-out
 cannot double-send on restart. `alerts.delivered` now means only "this alert has
 been fanned out", i.e. do not consider it again.
@@ -24,7 +24,7 @@ been fanned out", i.e. do not consider it again.
 QUERY SHAPE
 -----------
 Everything is batched. For a cycle of N alerts touching M tickers the cost is a
-fixed handful of queries, not N×M. The naive per-alert-per-user version would
+fixed handful of queries, not NÃ—M. The naive per-alert-per-user version would
 issue thousands of round-trips per cycle at 6,300 tickers.
 """
 
@@ -52,26 +52,26 @@ logger = logging.getLogger(__name__)
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Optional admin firehose. Left UNSET by default — the whole point of this module
+# Optional admin firehose. Left UNSET by default â€” the whole point of this module
 # is that nobody receives more than their watchlist asks for. Set it only if you
 # want a private debug channel mirroring everything.
 ADMIN_CHANNEL_ID = os.getenv("TELEGRAM_ADMIN_CHANNEL_ID") or None
 
 ET = ZoneInfo("America/New_York")
 
-# ── Market-wide routing ───────────────────────────────────────────────────────
+# â”€â”€ Market-wide routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # There are two different things that were both being called "market-wide", and
 # collapsing them into one switch is what broke half the product.
 #
 #   1. COMPANY news about a company nobody follows. This must never be sent.
 #      That was the actual complaint ("every alert should only be from my
-#      watchlist"), and it stays absolutely closed — enforced by the watchlist
+#      watchlist"), and it stays absolutely closed â€” enforced by the watchlist
 #      gate in ai_pipeline Stage 0 and by ticker matching below.
 #
 #   2. WHOLE-MARKET products the user explicitly subscribed to as features:
 #      sector heatmaps, the ETF X-ray, the macro digest, the market reports,
-#      ETF flow, upcoming IPOs. These have no company ticker by construction —
-#      they are filed as ticker='MARKET' — so a watchlist match is impossible
+#      ETF flow, upcoming IPOs. These have no company ticker by construction â€”
+#      they are filed as ticker='MARKET' â€” so a watchlist match is impossible
 #      and blanket-blocking them silently disabled ten of the thirteen daily
 #      scheduled jobs. They ran, wrote their rows, matched nobody, and were
 #      marked delivered. That is why heatmaps stopped arriving.
@@ -111,7 +111,7 @@ MARKET_WIDE_SOURCES = {
     "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "ETF_FLOW", "FMP_IPO",
     # Feature 8's EDGAR half: an S-1 registration, captured by
     # edgar_poller_async.poll_sec_s1_async under its own source rather than
-    # SEC_EDGAR. It has to route market-wide — the registrant is pre-IPO, so no
+    # SEC_EDGAR. It has to route market-wide â€” the registrant is pre-IPO, so no
     # ticker exists for a watchlist to match and the alert would otherwise
     # resolve to an empty audience and be settled as delivered without being
     # sent. Routing on the SOURCE and not on filing_type "S-1" is deliberate: a
@@ -128,7 +128,7 @@ PERSONAL_FILING_TYPES = {"HEATMAP_WATCHLIST_MIDDAY", "HEATMAP_WATCHLIST_EOD"}
 # Content that is ALWAYS about one company, so it is only ever watchlist-routed.
 # Listed explicitly rather than inferred, because the ticker catch-all in
 # _is_market_wide() would otherwise broadcast any row whose symbol failed to
-# resolve — an 8-K with an unmapped CIK reaching every subscriber is a far worse
+# resolve â€” an 8-K with an unmapped CIK reaching every subscriber is a far worse
 # failure than that same 8-K reaching nobody.
 COMPANY_ONLY_SOURCES = {
     "SEC_EDGAR", "SEC_XBRL", "FMP_NEWS", "FMP", "FMP_FUNDAMENTALS",
@@ -144,7 +144,7 @@ def _is_market_wide(alert):
     True when this alert is a whole-market product rather than company news.
 
     Company news for an unwatched ticker is NOT market-wide and never becomes
-    market-wide by falling through this function — it simply finds no audience.
+    market-wide by falling through this function â€” it simply finds no audience.
     """
     if not BROADCAST_ENABLED:
         return False
@@ -160,7 +160,7 @@ def _is_market_wide(alert):
     # Company-specific content is NEVER market-wide, whatever ticker it carries.
     # A general news article filed under ticker="MARKET", or a filing whose CIK
     # failed to resolve and landed as "UNKNOWN", would otherwise fall into the
-    # ticker catch-all below and broadcast to every subscriber — the exact
+    # ticker catch-all below and broadcast to every subscriber â€” the exact
     # firehose this module exists to prevent. It finds no audience instead.
     if (alert.get("source") or "").upper() in COMPANY_ONLY_SOURCES:
         return False
@@ -191,7 +191,7 @@ BATCH_LIMIT = 100
 MAX_RETRY_AGE_HOURS = float(os.getenv("MAX_CONTENT_AGE_HOURS", "24"))
 
 
-# ── Loading ───────────────────────────────────────────────────────────────────
+# â”€â”€ Loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Past this, an alert is no longer news to the reader -- they have seen it
 # elsewhere, and delivering it makes the product look slow rather than
 # thorough. Matches the pipeline's own content window.
@@ -259,7 +259,7 @@ def _fetch_undelivered(limit=BATCH_LIMIT):
 def _fetch_active_users():
     """
     All active users with a chat_id, joined to their preferences.
-    Returns {user_id: {...}}. Small table — one query per cycle is fine.
+    Returns {user_id: {...}}. Small table â€” one query per cycle is fine.
     """
     try:
         users = (supabase.table("users")
@@ -279,7 +279,7 @@ def _fetch_active_users():
     for u in users:
         chat_id = u.get("telegram_chat_id")
         if not chat_id:
-            # Registered but never opened a chat with the bot — nothing to send to.
+            # Registered but never opened a chat with the bot â€” nothing to send to.
             continue
         p = pref_by_user.get(u["id"], {})
         out[u["id"]] = {
@@ -343,13 +343,13 @@ def _fetch_watchers(tickers):
 
 def _fetch_existing_deliveries(alert_ids):
     """
-    {(alert_id, user_id)} already SETTLED — the idempotency guard.
+    {(alert_id, user_id)} already SETTLED â€” the idempotency guard.
 
     BUGFIX 2026-08-19: this returned every ledger row regardless of status, so a
     row written with status='FAILED' counted as "already delivered" and the
     retry path could never reach that user. Combined with the alert being marked
     delivered=True on the same pass, one transient Telegram error meant the user
-    never received that alert — permanently, with no way to notice.
+    never received that alert â€” permanently, with no way to notice.
 
     Only terminal outcomes suppress a resend. FAILED rows are deliberately
     excluded so the next cycle tries again.
@@ -390,7 +390,7 @@ def _fetch_todays_counts(user_ids):
     return counts
 
 
-# ── Routing ───────────────────────────────────────────────────────────────────
+# â”€â”€ Routing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def resolve_audience(alert, users, watchers):
     """
     Who should receive this alert, and why.
@@ -422,7 +422,7 @@ def resolve_audience(alert, users, watchers):
             return []
         candidates = [u for u in users.values() if u.get("receive_market_wide", True)]
         if ticker and ticker not in ("MARKET", "UNKNOWN"):
-            # e.g. an IPO — name the company, it reads better than "market-wide".
+            # e.g. an IPO â€” name the company, it reads better than "market-wide".
             reason = (f"You're receiving this because {ticker} is a market-wide "
                       f"update. Turn these off any time with /settings.")
         else:
@@ -443,7 +443,7 @@ def resolve_audience(alert, users, watchers):
     return audience
 
 
-# ── Sending ───────────────────────────────────────────────────────────────────
+# â”€â”€ Sending â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async def _send_one(bot, chat_id, text):
     """
     Send with Telegram's own rate-limit signal honoured.
@@ -469,7 +469,7 @@ async def _send_one(bot, chat_id, text):
             # User blocked the bot or deleted the chat. Not retryable.
             return False, f"forbidden: {e}", True
         except BadRequest as e:
-            # Malformed HTML or chat not found. Not retryable — retrying just
+            # Malformed HTML or chat not found. Not retryable â€” retrying just
             # burns quota on a message that can never send.
             return False, f"bad_request: {e}", True
         except Exception as e:
@@ -524,7 +524,7 @@ def _past_retry_window(alert):
 def _log_payload(alert):
     """
     Write the alert's structured XBRL/JSON payload to payload_log the moment it
-    is about to reach Telegram — independent of whether GQUANTS_ALERT_BASE_URL
+    is about to reach Telegram â€” independent of whether GQUANTS_ALERT_BASE_URL
     is set, since the frontend link is no longer a prerequisite for logging.
 
     Upserts on alert_id so a retried delivery cycle (deferred alert, restarted
@@ -570,12 +570,12 @@ def _log_payload(alert):
 
 def _log_alert_run(alert, recipients, sent, failed, first_error):
     """
-    LOG 1 OF 2 — `alert_run_log`, one row per alert that reached the fan-out.
+    LOG 1 OF 2 â€” `alert_run_log`, one row per alert that reached the fan-out.
 
     This is the audit trail for every alert the system produces, whether it went
     through the AI summarizer (news / filings / transcripts, where the attempt
     and token counts on `extra` are real numbers) or was a templated alert with
-    no LLM involved (technical, IPO, ETF flow, result snapshot, heatmap, macro —
+    no LLM involved (technical, IPO, ETF flow, result snapshot, heatmap, macro â€”
     those fields are simply absent and land here as NULL, which is expected).
 
     main.py used to define this and never call it, so the table was never
@@ -663,7 +663,7 @@ def _drop_duplicate_alerts(alerts):
     return keep, len(dup_ids)
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# â”€â”€ Main entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async def deliver_pending_alerts():
     """
     One fan-out cycle. Safe to call on a loop; safe to interrupt.
@@ -671,16 +671,16 @@ async def deliver_pending_alerts():
     Sends are parallel ACROSS users. The previous version had one single loop
     that sent every recipient of every alert strictly one after another, so a
     cycle with 50 alerts x 10 recipients each did 500 sequential sends at
-    ~1.05s apart (PER_CHAT_GAP_SECONDS) — over 8 minutes for a batch that
+    ~1.05s apart (PER_CHAT_GAP_SECONDS) â€” over 8 minutes for a batch that
     should land within a couple of seconds. The 1-second-per-chat pacing is a
     real Telegram constraint, but it only applies to repeat sends to the SAME
-    chat_id — it does not require serializing different chats behind each
+    chat_id â€” it does not require serializing different chats behind each
     other. Every user's own queue is still sent to in order (so a user with
     three alerts this cycle gets them spaced out safely); different users'
     queues run concurrently via asyncio.gather, so N users drop their alerts
     at roughly the same moment instead of one after another.
 
-    Returns the number of alerts SETTLED this cycle — rows that left the
+    Returns the number of alerts SETTLED this cycle â€” rows that left the
     undelivered queue, whether they were sent, found no audience or were
     abandoned as unsendable. main.delivery_loop uses it to drain a backlog
     back-to-back instead of pausing between batches; deferred rows (still in
@@ -692,12 +692,9 @@ async def deliver_pending_alerts():
     alerts = _fetch_undelivered()
     if not alerts:
         return 0
-<<<<<<< HEAD
     alerts, suppressed = _drop_duplicate_alerts(alerts)
     if not alerts:
         return suppressed
-=======
->>>>>>> ef39d99bbeb6ccd55d181c61870ee03e78b091db
 
     users = _fetch_active_users()
     if not users:
@@ -725,8 +722,8 @@ async def deliver_pending_alerts():
     # user_id -> [(aid, user, text, reason), ...], sent in order, one task/user
     per_user_queue = {}
 
-    # ── Phase 1: resolve audience + build message text for every alert ────────
-    # Cheap, synchronous, no network — safe to do inline before fanning out the
+    # â”€â”€ Phase 1: resolve audience + build message text for every alert â”€â”€â”€â”€â”€â”€â”€â”€
+    # Cheap, synchronous, no network â€” safe to do inline before fanning out the
     # actual sends. Also the single choke point where every structured XBRL/JSON
     # payload gets logged, once per alert, regardless of which poller built it.
     for alert in alerts:
@@ -742,7 +739,7 @@ async def deliver_pending_alerts():
         # One malformed alert must not take down the cycle. Without this, a bad
         # `extra` payload raised out of build_message() before _record() and
         # _mark_fanned_out() ever ran, so every already-sent message in the batch
-        # was re-sent from scratch on the next 30-second pass — a duplicate storm
+        # was re-sent from scratch on the next 30-second pass â€” a duplicate storm
         # that repeated until the offending row was manually removed.
         try:
             audience = resolve_audience(alert, users, watchers)
@@ -786,7 +783,7 @@ async def deliver_pending_alerts():
             stats["errored"] += 1
             alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": True}
 
-    # ── Phase 2: fan out concurrently, one task per user ───────────────────────
+    # â”€â”€ Phase 2: fan out concurrently, one task per user â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     async def _drain_user_queue(uid, items):
         for aid, user, text, reason in items:
             ok, err, permanent = await _send_one(bot, user["chat_id"], text)
@@ -812,7 +809,7 @@ async def deliver_pending_alerts():
                 alert_state[aid]["retry_needed"] = True
 
             # Telegram allows roughly one message per second per chat. This gap
-            # only serializes repeat sends to THIS chat_id — it no longer holds
+            # only serializes repeat sends to THIS chat_id â€” it no longer holds
             # up any other user's queue, which is what made fan-out slow.
             await asyncio.sleep(max(SEND_GAP_SECONDS, PER_CHAT_GAP_SECONDS))
 
@@ -827,7 +824,7 @@ async def deliver_pending_alerts():
             fanned.append(aid)
         elif state["retry_needed"] and not _past_retry_window(state["alert"]):
             stats["deferred"] += 1
-            continue          # still in flight — do not close the audit row yet
+            continue          # still in flight â€” do not close the audit row yet
         else:
             fanned.append(aid)
 
@@ -842,7 +839,7 @@ async def deliver_pending_alerts():
     _mark_fanned_out(fanned)
 
     if any(stats.values()):
-        logger.info("[DELIVERY] %d alerts fanned out — sent=%d failed=%d skipped=%d "
+        logger.info("[DELIVERY] %d alerts fanned out â€” sent=%d failed=%d skipped=%d "
                     "no_audience=%d deferred=%d errored=%d",
                     len(fanned), stats["sent"], stats["failed"], stats["skipped"],
                     stats["no_audience"], stats["deferred"], stats["errored"])
@@ -856,14 +853,14 @@ async def deliver_photo(image_path, caption, source, filing_type,
     Send an image (heatmap) to the correct audience.
 
     The text fan-out above cannot carry an image, so heatmap modules call this
-    directly — but they still go through the same audience rules:
+    directly â€” but they still go through the same audience rules:
 
       user_id given  -> personal heatmap (watchlist heatmap), that one user only
       user_id None   -> market-wide heatmap (sector heatmap), every user who has
                         not opted out of market-wide alerts
 
     The `user_id is None` branch used to be a hardcoded `targets = []`, which is
-    why sector heatmaps stopped being delivered on 2026-08-11 — the image was
+    why sector heatmaps stopped being delivered on 2026-08-11 â€” the image was
     rendered every day and then thrown away.
 
     Returns (sent_count, failed_count).

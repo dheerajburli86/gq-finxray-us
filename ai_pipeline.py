@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import hashlib
 import re
@@ -37,17 +37,17 @@ from Prompt_S1F_Form4Insider import get_prompt as s1f_prompt
 from feature_map import resolve_feature, TOTAL_FEATURES
 
 
-# ── Word-count escalation ladder ──────────────────────────────────────────────
+# â”€â”€ Word-count escalation ladder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Attempt 1 uses the real S.1.N / S.1.A / S.1.T prompt, asking for EXACTLY 75
-# words (floor 70) — not "under 75", which let short summaries through too
+# words (floor 70) â€” not "under 75", which let short summaries through too
 # easily. Every retry after that goes through S.3 (resummarize) asking for
 # exactly {target} words, with the ceiling raised by 5 each time (80, 85, 90,
 # 95, 100), so the model gets more room to *finish its thought* instead of
-# truncating awkwardly — but the floor stays fixed at MIN_WORDS the whole
+# truncating awkwardly â€” but the floor stays fixed at MIN_WORDS the whole
 # time, so a summary can never pass by being short. All three prompt files
 # explicitly forbid padding with filler just to hit the count, so a summary
 # that's still short after 6 honest attempts means the source content
-# genuinely can't support 70+ real words — at that point it stops (no
+# genuinely can't support 70+ real words â€” at that point it stops (no
 # infinite loop burning tokens) and gets flagged for manual review instead
 # of silently discarded or sent out as a low-quality alert.
 MIN_WORDS = 70
@@ -57,14 +57,14 @@ MAX_TARGET = 250       # Increased from 100 to support detailed summaries of com
 
 # Summary class selection: News uses S.1.N, Announcements/filings use S.1.A,
 # Earnings call transcripts (Feature 11) use S.1.T. Transcripts run several
-# times longer than a filing excerpt, so they get a bigger raw-text slice —
+# times longer than a filing excerpt, so they get a bigger raw-text slice â€”
 # still capped, just a higher cap, so the model sees more of the call.
 TRANSCRIPT_CHAR_LIMIT = 12000
 FILING_CHAR_LIMIT = 8000
 NEWS_CHAR_LIMIT = 6000
 
 
-# ── Token usage tracking (per filing currently being processed) ──────────────
+# â”€â”€ Token usage tracking (per filing currently being processed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Reset at the start of each filing, read back once at the end to get the TOTAL
 # tokens spent across every DeepInfra call that filing needed (gibberish check,
 # relevance check, every S.1/S.3 summarization attempt, V.1 validation, impact
@@ -104,14 +104,14 @@ def get_token_usage():
     return dict(_usage_bucket())
 
 
-# ── DeepInfra concurrency + rate limiting ────────────────────────────────────
+# â”€â”€ DeepInfra concurrency + rate limiting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Two different limits, enforced by two different mechanisms. Conflating them
 # is what left the old fixed 2-second gap unable to prevent 429s:
 #
 #   1. CONCURRENCY (the semaphore). Filings are now summarized in parallel, and
 #      the scheduler's own worker pool can start an AI-backed job at any time,
 #      so N threads can reach this function at once. The semaphore caps how
-#      many DeepInfra requests are ever in flight together — the ceiling the
+#      many DeepInfra requests are ever in flight together â€” the ceiling the
 #      old single-threaded design got for free and then lost.
 #
 #   2. THROUGHPUT (the sliding window). Gemini's quota is requests-per-minute,
@@ -130,8 +130,8 @@ def get_token_usage():
 #
 # BE HONEST ABOUT THE CEILING: this is not the binding constraint at typical
 # Gemini Flash latency. Eight workers at a ~3s round trip want ~160 calls/min,
-# and LLM_RPM below caps issuance at 100, so the sliding window — not this
-# number — decides throughput once the queue is deep. What the extra slots
+# and LLM_RPM below caps issuance at 100, so the sliding window â€” not this
+# number â€” decides throughput once the queue is deep. What the extra slots
 # actually buy is headroom when calls run slow (a retry ladder, a 429 cooldown,
 # a long transcript), where 4 workers left RPM budget unspent. If the pipeline
 # still lags with this at 8, GQ_LLM_RPM is the knob to turn, not this one.
@@ -313,7 +313,7 @@ def _call_deepinfra_locked(prompt, retries, max_tokens):
         time.sleep(2 ** normal_attempt)
 
 
-# ── Summary quality helpers ───────────────────────────────────────────────────
+# â”€â”€ Summary quality helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 BAD_START_KEYWORDS = [
     "this content", "the following", "this document", "this filing",
     "this report", "this article", "this press release", "this announcement",
@@ -509,7 +509,7 @@ def classify_failure(summary, max_words, min_words=None):
     return None
 
 
-# ── S.1 — Primary summarisation (real S.1.N / S.1.A / S.1.T / S.1.F prompts) ───
+# â”€â”€ S.1 â€” Primary summarisation (real S.1.N / S.1.A / S.1.T / S.1.F prompts) â”€â”€â”€
 def generate_s1(company_name, raw_text, filing_type="", sub_summary="",
                 min_words=None, target=None):
     min_words = MIN_WORDS if min_words is None else min_words
@@ -546,7 +546,7 @@ def generate_s1(company_name, raw_text, filing_type="", sub_summary="",
     return call_deepinfra(prompt, max_tokens=600)
 
 
-# ── S.3 — Resummarize at an escalated word target ─────────────────────────────
+# â”€â”€ S.3 â€” Resummarize at an escalated word target â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def generate_s3(company_name, raw_text, target_words, filing_type="", min_words=None):
     min_words = MIN_WORDS if min_words is None else min_words
     if filing_type == "EARNINGS_TRANSCRIPT":
@@ -571,7 +571,7 @@ CONTENT REQUIREMENTS:
 
 STYLE & TONE:
 - Professional, institutional tone suitable for investment professionals
-- Neutral, objective, factual — no editorializing, speculation, or emotional language
+- Neutral, objective, factual â€” no editorializing, speculation, or emotional language
 - Precise: name parties, specific products, markets, financial metrics
 - NEVER use tabloid/headline movement verbs, even if the source material itself uses
   them: pops, soars, skyrockets, rockets, surges, spikes, explodes, tanks, craters,
@@ -582,7 +582,7 @@ STYLE & TONE:
 
 WRITING RULES:
 - Write exactly {target_words} words. If exact {target_words} is impossible while staying strictly accurate, come as close as possible, but never fewer than {min_words} and never more than {target_words}.
-- Do not pad with filler phrases, restated facts, or generic commentary — every word must carry real information.
+- Do not pad with filler phrases, restated facts, or generic commentary â€” every word must carry real information.
 - Must end with a complete factual sentence ending in a period. Never end with a question mark or exclamation point.
 - Never end with a rhetorical question, speculation, or a sentence asking what happens next.
 - Do not start with "This", "The following", "Summary:", "Note:" or similar
@@ -597,7 +597,7 @@ Return only the summary. Nothing else."""
     return call_deepinfra(prompt, max_tokens=700)
 
 
-# ── Flagged-for-review sink (replaces "best available" fallback) ─────────────
+# â”€â”€ Flagged-for-review sink (replaces "best available" fallback) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def store_flagged_summary(filing_id, ticker, company_name, final_summary, failure_reason, attempts,
                            source="SEC_EDGAR", filing_type="", max_target_reached=None):
     try:
@@ -618,12 +618,12 @@ def store_flagged_summary(filing_id, ticker, company_name, final_summary, failur
             "source": source,
             "filing_type": filing_type
         }).execute()
-        print(f"[FLAGGED] {ticker} sent to review queue after exhausting retries ({failure_reason}) — Feature {fid}/{TOTAL_FEATURES} {fname}")
+        print(f"[FLAGGED] {ticker} sent to review queue after exhausting retries ({failure_reason}) â€” Feature {fid}/{TOTAL_FEATURES} {fname}")
     except Exception as e:
         print(f"[ERROR] Failed to store flagged summary: {e}")
 
 
-# ── Master summarise — retry-until-valid, escalating word budget ─────────────
+# â”€â”€ Master summarise â€” retry-until-valid, escalating word budget â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=None, ticker=None, source="SEC_EDGAR"):
     """
     Attempt 1: S.1.N / S.1.A / S.1.T / S.1.F prompt, target varies by type.
@@ -631,7 +631,7 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
     For Form 4 (insider trading): target 30 words, escalate by 5 up to 60.
 
     Each failure retries via S.3 with the ceiling raised, floor fixed at min_words.
-    If still failing at MAX_TARGET, stop and flag for manual review —
+    If still failing at MAX_TARGET, stop and flag for manual review â€”
     never discard silently, never send a summary that failed validation.
     """
     attempts_log = []
@@ -671,17 +671,17 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
     summary, failure = _evaluate(raw)
     attempts_log.append({"attempt": 1, "target": target, "words": count_words(summary), "failure": failure})
 
-    # "api_unavailable" (call_deepinfra returned None — DeepInfra/Gemini gave up
+    # "api_unavailable" (call_deepinfra returned None â€” DeepInfra/Gemini gave up
     # after its own rate-limit backoff) is an infra failure, not a content
     # failure. Escalating the word-target ladder and calling generate_s3 again
     # immediately just re-hits the same exhausted quota one more time per rung,
     # each paying that same backoff again, for a summary the content is not at
-    # fault for. Stop the ladder on the first "api_unavailable" and flag it —
+    # fault for. Stop the ladder on the first "api_unavailable" and flag it â€”
     # classify_failure's real length/quality checks still get their full ladder
     # for actual content problems.
     while failure and failure != "api_unavailable" and target < max_target:
         target += target_step
-        print(f"[SUMMARY] Retry — previous failure: {failure}, new target: {target} words")
+        print(f"[SUMMARY] Retry â€” previous failure: {failure}, new target: {target} words")
         raw = generate_s3(company_name, raw_text, target, filing_type,
                           min_words=min_words)
         summary, failure = _evaluate(raw)
@@ -691,7 +691,7 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
         print(f"[SUMMARY] Passed at target={target} ({count_words(summary)} words, {len(attempts_log)} attempt(s))")
         return summary, len(attempts_log)
 
-    print(f"[SUMMARY] Exhausted ladder at {target} words, still failing ({failure}) — flagging for review, not sending")
+    print(f"[SUMMARY] Exhausted ladder at {target} words, still failing ({failure}) â€” flagging for review, not sending")
     store_flagged_summary(
         filing_id=filing_id,
         ticker=ticker,
@@ -706,7 +706,7 @@ def summarise(company_name, raw_text, filing_type="", sub_summary="", filing_id=
     return None, len(attempts_log)
 
 
-# ── Other pipeline helpers ────────────────────────────────────────────────────
+# â”€â”€ Other pipeline helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def parse_json_response(text):
     if not text:
         return {}
@@ -736,7 +736,7 @@ def get_recent_summaries(ticker, limit=10):
     except Exception:
         return []
 
-# Words carried by almost every financial summary — they signal nothing about
+# Words carried by almost every financial summary â€” they signal nothing about
 # whether two summaries describe the same event, so they are excluded from the
 # overlap score that decides which pairs are worth an LLM call.
 _DEDUP_STOPWORDS = {
@@ -795,8 +795,7 @@ def rank_dedup_candidates(summary, recent_summaries,
     return [old for _, old in scored[:max_candidates]]
 
 
-<<<<<<< HEAD
-# ── Exact-duplicate guard ─────────────────────────────────────────────────────
+# â”€â”€ Exact-duplicate guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # WHY THIS EXISTS. One story reached users 4+ times in the same minute. FMP
 # returns syndicated copies of a story (same title, same body, different URLs),
 # so each copy becomes its own raw_filings row. The pipeline runs
@@ -874,8 +873,6 @@ def _alert_exists(field, value):
         return False
 
 
-=======
->>>>>>> ef39d99bbeb6ccd55d181c61870ee03e78b091db
 def store_summary(filing_id, ticker, summary, impact, event_type):
     try:
         result = supabase.table("ai_summaries").insert({
@@ -943,7 +940,7 @@ def update_filing_status(filing_id, status):
         print(f"[ERROR] Failed to update status: {e}")
 
 
-# ── AI MODE processor ─────────────────────────────────────────────────────────
+# â”€â”€ AI MODE processor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def process_filing(filing):
     """Duplicate gate in front of the real pipeline (see "Exact-duplicate guard")."""
     extra = dict(filing.get("extra") or {})
@@ -1007,7 +1004,7 @@ def _process_filing(filing):
         return
     print(f"[PASS] Relevance check")
 
-    # Step 3: Summarisation — retry-until-valid, escalating word budget.
+    # Step 3: Summarisation â€” retry-until-valid, escalating word budget.
     # Returns None only if it exhausted the ladder up to MAX_TARGET; in that
     # case it has already been written to flagged_summaries for review.
     summary, summarization_attempts = summarise(company_name, raw_text, filing_type, sub_summary,
@@ -1018,7 +1015,7 @@ def _process_filing(filing):
         return
     print(f"[SUMMARY] {summary[:100]}... ({count_words(summary)} words)")
 
-    # Step 4: Summary validation (V.1) — a corrected summary must still pass
+    # Step 4: Summary validation (V.1) â€” a corrected summary must still pass
     # the same word-count/quality checks; if it doesn't, flag it too rather
     # than blindly trusting the correction.
     validation_result = parse_json_response(call_deepinfra(validation_prompt(summary)))
@@ -1122,7 +1119,7 @@ def _process_filing(filing):
           f"{usage['input']}+{usage['output']} tokens in+out)")
 
 
-# ── Freshness ─────────────────────────────────────────────────────────────────
+# â”€â”€ Freshness â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # An alert is only worth sending while it is still news. Past this window the
 # reader has seen it elsewhere, and delivering it makes the product look slow
 # rather than thorough. Filings are given a longer life than news because a
@@ -1179,12 +1176,12 @@ def expire_stale_filings(force=False):
         total += len(filings)
 
         # Orphans. S-1 rows used to be written status="IPO_PENDING", which no
-        # reader ever selected — not this function either, since both updates
+        # reader ever selected â€” not this function either, since both updates
         # above filter on "PENDING". They therefore accumulated forever, one per
         # S-1 filed market-wide, each carrying a full document body. poll_sec_s1
         # writes "PENDING" now, so nothing new lands here; this retires the
         # backlog the old behaviour left behind. The rows and their raw_text are
-        # kept — only the status changes, so nothing is lost if this data is ever
+        # kept â€” only the status changes, so nothing is lost if this data is ever
         # wanted again.
         orphans = (supabase.table("raw_filings")
                    .update({"status": "EXPIRED"})
@@ -1205,7 +1202,7 @@ def expire_stale_filings(force=False):
     return total
 
 
-# ── Queue priority ────────────────────────────────────────────────────────────
+# â”€â”€ Queue priority â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # THE LATENCY BUG THIS FIXES. main.py gives SEC EDGAR a dedicated thread pool and
 # a 15-second cadence so a filing is captured seconds after publication -- and
 # then the pipeline threw that away, because it read the queue ordered ONLY by
@@ -1219,12 +1216,12 @@ def expire_stale_filings(force=False):
 # no longer sits in front of a material event the company filed itself.
 # SEC_IPO is Feature 8's EDGAR half (S-1 registrations). It belongs here for the
 # same reason SEC_EDGAR does: it is a primary-source filing whose entire value is
-# arriving before the vendor calendars do, and it is low volume — the CIK dedup
+# arriving before the vendor calendars do, and it is low volume â€” the CIK dedup
 # in poll_edgar_generic_async means a handful of new registrants a day, not one
-# row per amendment — so it cannot crowd out the news tier.
+# row per amendment â€” so it cannot crowd out the news tier.
 PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT", "SEC_IPO"]
 # EARNINGS_MISS/BEAT arrive under source="FMP", which is shared with ordinary
-# vendor content, so they need the filing_type axis to be prioritised at all —
+# vendor content, so they need the filing_type axis to be prioritised at all â€”
 # exactly the gap that left INSIDER_FMP stuck behind the news backlog. An EPS
 # surprise is material and rare (one per ticker per quarter), so it cannot crowd
 # the tier.
@@ -1255,7 +1252,7 @@ def _fetch_prioritised_batch(limit):
     without a computed column.
 
     THE DEAD-CONSTANT BUG THIS FIXES. PRIORITY_FILING_TYPES was defined and then
-    never referenced — the query filtered on source alone. Every type in it that
+    never referenced â€” the query filtered on source alone. Every type in it that
     does not arrive under a priority SOURCE was therefore never prioritised at
     all, which in practice meant INSIDER_FMP: FMP insider trades queued behind
     the news backlog they were listed specifically to jump.
@@ -1284,7 +1281,7 @@ def _fetch_prioritised_batch(limit):
     # expire_stale_filings() above rather than being allowed to block the head.
     #
     # Deliberately NOT the complement filter. `not.in` on a nullable column is
-    # NULL, not true, for a NULL filing_type — such a row would be excluded from
+    # NULL, not true, for a NULL filing_type â€” such a row would be excluded from
     # this query AND from the priority query above, and would never be processed
     # by anything. Over-fetching a full page and de-duplicating on id in Python
     # cannot drop a row that way, and costs one page of rows we already index.
@@ -1297,7 +1294,7 @@ def _fetch_prioritised_batch(limit):
     return (priority + [r for r in rest if r["id"] not in seen])[:limit]
 
 
-# ── Main pipeline runner ──────────────────────────────────────────────────────
+# â”€â”€ Main pipeline runner â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def run_pipeline():
     mode = f"AI (DeepInfra - {DEEPINFRA_MODEL})"
     # Only announce a cycle that has work. The loop ticks every few seconds, so
