@@ -160,24 +160,56 @@ def get_or_create_user(chat_id, username=None, display_name=None):
 
 
 # ── stocks & watchlists ───────────────────────────────────────────────────────
+def get_etf_by_ticker(ticker):
+    """etf_master row shaped like a stocks row, so /add can treat both alike."""
+    try:
+        r = (supabase.table("etf_master").select("ticker, name, category")
+             .eq("ticker", ticker.upper()).limit(1).execute())
+    except Exception as e:
+        log.error("[DB] etf lookup %s failed: %s", ticker, e)
+        return None
+    if not r.data:
+        return None
+    row = r.data[0]
+    return {"ticker": row["ticker"], "name": row.get("name"),
+            "sector": f"ETF · {row.get('category') or 'Fund'}", "is_etf": True}
+
+
 def get_stock_by_ticker(ticker):
+    """A stock from `stocks`, else an ETF from `etf_master`.
+
+    ETFs are not in `stocks` (it is built from the stock screener), so before
+    this fallback `/add MCHI` answered "isn't a ticker I cover" and no ETF
+    could ever reach a watchlist through the bot.
+    """
     try:
         r = (supabase.table("stocks").select("*")
              .eq("ticker", ticker.upper()).limit(1).execute())
-        return r.data[0] if r.data else None
+        if r.data:
+            return r.data[0]
     except Exception as e:
         log.error("[DB] stock lookup %s failed: %s", ticker, e)
-        return None
+    return get_etf_by_ticker(ticker)
 
 
 def search_stocks_by_prefix(prefix, limit=8):
+    out = []
     try:
         r = (supabase.table("stocks").select("ticker, sector, exchange")
              .ilike("ticker", f"{prefix.upper()}%").limit(limit).execute())
-        return r.data or []
+        out = r.data or []
     except Exception as e:
         log.error("[DB] stock search %s failed: %s", prefix, e)
-        return []
+    if len(out) < limit:
+        try:
+            r = (supabase.table("etf_master").select("ticker, category, exchange")
+                 .ilike("ticker", f"{prefix.upper()}%").limit(limit - len(out)).execute())
+            have = {s.get("ticker") for s in out}
+            out += [{"ticker": e["ticker"], "sector": f"ETF · {e.get('category') or 'Fund'}",
+                     "exchange": e.get("exchange")} for e in (r.data or []) if e["ticker"] not in have]
+        except Exception as e:
+            log.error("[DB] etf search %s failed: %s", prefix, e)
+    return out
 
 
 def get_user_watchlist(user_id):

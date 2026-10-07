@@ -95,6 +95,10 @@ SOURCE_LABELS = {
     "SECTOR_HEATMAP": "Sector Heatmap",
     "MACRO_ROUNDUP": "Macro & Policy",
     "LARGE_TRADE": "Large Trade",
+    "ETF_PORTFOLIO": "ETF Holdings (FMP)",
+    "ETF_EXPENSE": "ETF Expense Ratio (FMP)",
+    "FUND_MANAGER": "SEC EDGAR Fund Filing",
+    "SEC_FUND": "SEC EDGAR Fund Filing",
 }
 
 FILING_TYPE_LABELS = {
@@ -122,6 +126,18 @@ FILING_TYPE_LABELS = {
     "SMA200_CROSSOVER_DOWN": "200-SMA Crossover Down",
     "INFLOW": "ETF Inflow",
     "OUTFLOW": "ETF Outflow",
+    "ETF_HOLDINGS_ADDED": "ETF Holdings Added",
+    "ETF_HOLDINGS_REMOVED": "ETF Holdings Removed",
+    "ETF_HOLDINGS_CHANGE": "ETF Holdings Change",
+    "ETF_EXPENSE_INCREASE": "Expense Ratio Increase",
+    "ETF_EXPENSE_DECREASE": "Expense Ratio Decrease",
+    "PM_ADDED": "Portfolio Manager Added",
+    "PM_REMOVED": "Portfolio Manager Departure",
+    "PM_CHANGE": "Portfolio Manager Change",
+    "ETF_LIQUIDATION": "Fund Liquidation",
+    "ETF_MERGER": "Fund Merger / Reorganization",
+    "ETF_STRATEGY_CHANGE": "Index / Strategy Change",
+    "ETF_FEE_CHANGE": "Fund Fee Change",
 }
 
 

@@ -36,7 +36,7 @@ def check(label, cond, detail=""):
         failures.append(label)
 
 
-print("=== 1. ALL 13 FEATURES ARE SCHEDULED IN main.py ===")
+print(f"=== 1. ALL {len(feature_map.FEATURES)} FEATURES ARE SCHEDULED IN main.py ===")
 main_src = open(os.path.join(os.path.dirname(__file__), "..", "main.py")).read()
 # entry point -> the feature it serves
 REQUIRED = {
@@ -59,6 +59,12 @@ REQUIRED = {
     "run_macro_policy_roundup": 12, "send_premarket_report": 12,
     "send_market_close_report": 12,
     "run_watchlist_heatmap_midday": 13, "run_watchlist_heatmap_eod": 13,
+    # ETF features. Feature 14 has a pre-market full pass and an evening light
+    # pass; Feature 15 has four SEC jobs; Feature 16 one hourly SEC job.
+    "run_etf_data_poller_full": 14, "run_etf_data_poller_light": 14,
+    "run_fund_universe_refresh": 15, "run_fund_manager_events": 15,
+    "run_fund_manager_rosters": 15, "run_fund_manager_backfill": 15,
+    "run_etf_fund_events_poller": 16,
 }
 covered = set()
 for fn, fid in REQUIRED.items():
@@ -66,7 +72,7 @@ for fn, fid in REQUIRED.items():
     check(f"Feature {fid:>2} · {fn} scheduled", scheduled, "not wired into run_scheduler()")
     if scheduled:
         covered.add(fid)
-check("every one of the 13 features has a scheduled entry point",
+check(f"every one of the {len(feature_map.FEATURES)} features has a scheduled entry point",
       covered == set(feature_map.FEATURES),
       f"missing {sorted(set(feature_map.FEATURES) - covered)}")
 
@@ -91,7 +97,13 @@ check("SEC_IPO/S-1 (ticker='UNKNOWN') routes to an audience",
 print("\n=== 3. COMPANY CONTENT NEVER BROADCASTS ===")
 for src, ft, tk in [("FMP_NEWS", "NEWS", "MARKET"), ("SEC_EDGAR", "8-K", "UNKNOWN"),
                     ("SEC_EDGAR", "4", ""), ("TECHNICAL", "52W_HIGH", "UNKNOWN"),
-                    ("WATCHLIST_HEATMAP", "HEATMAP_WATCHLIST_EOD", "WATCHLIST")]:
+                    ("WATCHLIST_HEATMAP", "HEATMAP_WATCHLIST_EOD", "WATCHLIST"),
+                    # ETF features: a fund alert whose ticker failed to resolve
+                    # must reach nobody, never everybody.
+                    ("ETF_PORTFOLIO", "ETF_HOLDINGS_ADDED", "UNKNOWN"),
+                    ("ETF_EXPENSE", "ETF_EXPENSE_INCREASE", ""),
+                    ("FUND_MANAGER", "PM_REMOVED", "UNKNOWN"),
+                    ("SEC_FUND", "ETF_LIQUIDATION", "MARKET")]:
     leaked = delivery._is_market_wide({"source": src, "filing_type": ft, "ticker": tk})
     check(f"{src}/{ft} (ticker={tk!r}) stays watchlist-scoped", not leaked,
           "would be broadcast to every subscriber")
@@ -119,13 +131,20 @@ EMISSIONS = [
     ("FMP_TRANSCRIPT", "EARNINGS_TRANSCRIPT"), ("FMP_ANALYST", "ANALYST_RATING"),
     ("MACRO_ROUNDUP", "MACRO_BRIEFING"), ("MARKET_REPORT", "MARKET_REPORT"),
     ("WATCHLIST_HEATMAP", "HEATMAP_WATCHLIST_MIDDAY"), ("WATCHLIST_HEATMAP", "HEATMAP_WATCHLIST_EOD"),
+    # Feature 14 (etf_data_poller), 15 (fund_manager_poller), 16 (etf_fund_events_poller)
+    ("ETF_PORTFOLIO", "ETF_HOLDINGS_ADDED"), ("ETF_PORTFOLIO", "ETF_HOLDINGS_REMOVED"),
+    ("ETF_PORTFOLIO", "ETF_HOLDINGS_CHANGE"), ("ETF_EXPENSE", "ETF_EXPENSE_INCREASE"),
+    ("ETF_EXPENSE", "ETF_EXPENSE_DECREASE"),
+    ("FUND_MANAGER", "PM_ADDED"), ("FUND_MANAGER", "PM_REMOVED"), ("FUND_MANAGER", "PM_CHANGE"),
+    ("SEC_FUND", "ETF_LIQUIDATION"), ("SEC_FUND", "ETF_MERGER"),
+    ("SEC_FUND", "ETF_STRATEGY_CHANGE"), ("SEC_FUND", "ETF_FEE_CHANGE"),
 ]
 tagged = set()
 for src, ft in EMISSIONS:
     fid, name = feature_map.resolve_feature(src, ft)
     check(f"{src}/{ft} -> Feature {fid}", fid != 0, "resolves to Unmapped, cannot be muted or monitored")
     tagged.add(fid)
-check("all 13 features receive at least one emission",
+check(f"all {len(feature_map.FEATURES)} features receive at least one emission",
       tagged == set(feature_map.FEATURES),
       f"no emission maps to {sorted(set(feature_map.FEATURES) - tagged)}")
 

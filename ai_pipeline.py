@@ -899,36 +899,60 @@ def is_real_url(value):
     return isinstance(value, str) and value.startswith(("http://", "https://"))
 
 
+def _alert_row(ticker, summary, impact, source, filing_type="", extra=None, summary_id=None, link=None):
+    """The alerts row for one ticker, or None if an identical one is stored."""
+    fid, fname = resolve_feature(source, filing_type)
+    merged_extra = dict(extra or {})
+    # Last line of defence: identical summary text for the same ticker is
+    # the same alert, whichever raw filing it came from.
+    merged_extra["summary_hash"] = summary_hash(ticker, summary)
+    if _alert_exists("summary_hash", merged_extra["summary_hash"]):
+        print(f"[DUPLICATE ALERT SUPPRESSED] {ticker}: identical summary already stored")
+        return None
+    merged_extra["feature_id"] = fid
+    merged_extra["feature_name"] = fname
+    alert_dict = {
+        "ticker": ticker,
+        "summary": summary,
+        "impact": impact,
+        "source": source,
+        "filing_type": filing_type,
+        "extra": merged_extra,
+        "delivered": False,
+        "summary_id": summary_id
+    }
+    if is_real_url(link):
+        alert_dict["link"] = link
+    return alert_dict
+
+
 def store_alert(ticker, summary, impact, source, filing_type="", extra=None, summary_id=None, link=None):
     try:
         fid, fname = resolve_feature(source, filing_type)
-        merged_extra = dict(extra or {})
-        # Last line of defence: identical summary text for the same ticker is
-        # the same alert, whichever raw filing it came from.
-        merged_extra["summary_hash"] = summary_hash(ticker, summary)
-        if _alert_exists("summary_hash", merged_extra["summary_hash"]):
-            print(f"[DUPLICATE ALERT SUPPRESSED] {ticker}: identical summary already stored")
+        alert_dict = _alert_row(ticker, summary, impact, source, filing_type, extra, summary_id, link)
+        if alert_dict is None:
             return False
-        merged_extra["feature_id"] = fid
-        merged_extra["feature_name"] = fname
-        alert_dict = {
-            "ticker": ticker,
-            "summary": summary,
-            "impact": impact,
-            "source": source,
-            "filing_type": filing_type,
-            "extra": merged_extra,
-            "delivered": False,
-            "summary_id": summary_id
-        }
-        if is_real_url(link):
-            alert_dict["link"] = link
         supabase.table("alerts").insert(alert_dict).execute()
-        print(f"[ALERT READY] {impact} -- {ticker}: {summary[:80]}... (Feature {fid}/11 {fname})")
+        print(f"[ALERT READY] {impact} -- {ticker}: {summary[:80]}... (Feature {fid}/{TOTAL_FEATURES} {fname})")
         return True
     except Exception as e:
         print(f"[ERROR] Failed to store alert: {e}")
         return False
+
+_IMPACT_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+_MAX_FANOUT = 20
+
+
+def _fanout_tickers(extra, primary):
+    """Other watched tickers this filing's single summary should also go to."""
+    out, seen = [], {(primary or "").upper()}
+    for t in (extra or {}).get("fanout_tickers") or []:
+        t = str(t or "").strip().upper()
+        if t and t not in seen and all(c.isalnum() or c in "-." for c in t):
+            seen.add(t)
+            out.append(t)
+    return out[:_MAX_FANOUT]
+
 
 def update_filing_status(filing_id, status):
     try:
@@ -1071,6 +1095,14 @@ def _process_filing(filing):
     impact = impact_result.get("impact", "LOW").upper()
     if impact not in ("HIGH", "MEDIUM", "LOW"):
         impact = "LOW"
+    # A poller that knows what KIND of event this is can set a floor. The
+    # impact prompt is written for operating companies and has no idea that a
+    # fund liquidation ends the holder's investment; a LOW verdict there would
+    # sit under every user's default MEDIUM floor and never be delivered.
+    floor = str((extra or {}).get("impact_floor") or "").upper()
+    if _IMPACT_RANK.get(floor, 0) > _IMPACT_RANK.get(impact, 0):
+        print(f"[IMPACT] {impact} raised to source floor {floor} for {filing_type}")
+        impact = floor
     print(f"[IMPACT] {impact}")
 
     # Step 6: Semantic deduplication.
@@ -1111,9 +1143,41 @@ def _process_filing(filing):
 
     summary_id = store_summary(filing_id=filing_id, ticker=ticker, summary=summary,
                                 impact=impact, event_type=filing_type)
-    store_alert(ticker=ticker, summary=summary, impact=impact, source=source,
-                filing_type=filing_type, extra=extra, summary_id=summary_id, 
-                link=filing.get("filing_url"))
+    if _fanout_tickers(extra, ticker):
+        # Every copy of this one event shares a group id, so delivery sends a
+        # user who watches two of the tickers one message, not two.
+        extra["fanout_group"] = f"{source}:{filing_id}"
+    fanout = _fanout_tickers(extra, ticker)
+    if not fanout:
+        store_alert(ticker=ticker, summary=summary, impact=impact, source=source,
+                    filing_type=filing_type, extra=extra, summary_id=summary_id,
+                    link=filing.get("filing_url"))
+    else:
+        # One document, several watched tickers (a fund supplement covering two
+        # watched ETFs). The summary is reused verbatim for the others —
+        # summarising the same text once per ticker is exactly the redundant
+        # prompt spend the pipeline is built to avoid. Each copy is its own row
+        # (delivery routes by ticker) and carries ITS fund's name. All rows go
+        # in ONE insert, so a delivery cycle never sees half the group and
+        # sends a user who watches two of the tickers the same event twice.
+        names = extra.get("fanout_names") or {}
+        rows = []
+        for t in [ticker] + fanout:
+            e = extra if t == ticker else dict(extra, fanout_of=ticker)
+            if t != ticker and names.get(t):
+                e = dict(e, company_name=names[t],
+                         title=f"{names[t]}: {extra.get('event_label') or filing_type}")
+            row = _alert_row(t, summary, impact, source, filing_type, e, summary_id,
+                             filing.get("filing_url"))
+            if row:
+                rows.append(row)
+        if rows:
+            try:
+                supabase.table("alerts").insert(rows).execute()
+                print(f"[ALERT READY] {impact} -- {', '.join(r['ticker'] for r in rows)}: "
+                      f"{summary[:80]}... (one summary, {len(rows)} tickers)")
+            except Exception as e:
+                print(f"[ERROR] Failed to store fan-out alerts: {e}")
     update_filing_status(filing_id, "PROCESSED")
     print(f"[DONE] {ticker} -- {impact} alert stored ({summarization_attempts} attempt(s), "
           f"{usage['input']}+{usage['output']} tokens in+out)")
@@ -1219,7 +1283,10 @@ def expire_stale_filings(force=False):
 # arriving before the vendor calendars do, and it is low volume â€” the CIK dedup
 # in poll_edgar_generic_async means a handful of new registrants a day, not one
 # row per amendment â€” so it cannot crowd out the news tier.
-PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT", "SEC_IPO"]
+# SEC_FUND is Feature 16 (ETF liquidation / merger / index / fee filings): a
+# primary-source SEC document, watchlist-gated before it is queued, and a
+# handful a week — it belongs in front of the news backlog with the 8-Ks.
+PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT", "SEC_IPO", "SEC_FUND"]
 # EARNINGS_MISS/BEAT arrive under source="FMP", which is shared with ordinary
 # vendor content, so they need the filing_type axis to be prioritised at all â€”
 # exactly the gap that left INSIDER_FMP stuck behind the news backlog. An EPS

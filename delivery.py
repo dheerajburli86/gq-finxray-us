@@ -135,6 +135,11 @@ COMPANY_ONLY_SOURCES = {
     "FMP_TRANSCRIPT", "FMP_ANALYST", "TECHNICAL", "LARGE_TRADE",
     "CNBC", "REUTERS", "MARKETWATCH", "NASDAQ", "IBD", "FORTUNE",
     "CNN", "BLOOMBERG", "YAHOO", "SEEKINGALPHA",
+    # ETF features 14-16. Each alert is about ONE fund and its ticker is the
+    # ETF's own symbol, so it is watchlist-routed like any company alert. Listed
+    # explicitly so a fund filing whose ticker failed to resolve is dropped
+    # instead of falling into the ticker catch-all and reaching every user.
+    "ETF_PORTFOLIO", "ETF_EXPENSE", "FUND_MANAGER", "SEC_FUND",
 }
 COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 
@@ -721,6 +726,10 @@ async def deliver_pending_alerts():
     alert_state = {}
     # user_id -> [(aid, user, text, reason), ...], sent in order, one task/user
     per_user_queue = {}
+    # (user_id, extra.fanout_group) already queued this cycle. One SEC fund
+    # filing can cover two watched ETFs and is stored as one alert row per
+    # ticker; a user watching both should get it once.
+    groups_queued = set()
 
     # â”€â”€ Phase 1: resolve audience + build message text for every alert â”€â”€â”€â”€â”€â”€â”€â”€
     # Cheap, synchronous, no network â€” safe to do inline before fanning out the
@@ -755,10 +764,19 @@ async def deliver_pending_alerts():
             alert_state[aid] = {"alert": alert, "retry_needed": False, "fanned": False,
                                 "sent": 0, "failed": 0, "recipients": 0, "error": None}
 
+            group = (alert.get("extra") or {}).get("fanout_group")
             for user, reason in audience:
                 uid = user["user_id"]
                 if (aid, uid) in already:
                     continue
+
+                if group:
+                    if (uid, group) in groups_queued:
+                        ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],
+                                       "status": "SKIPPED", "reason": "same_event_other_ticker"})
+                        stats["skipped"] += 1
+                        continue
+                    groups_queued.add((uid, group))
 
                 if sent_today.get(uid, 0) >= user["max_alerts_per_day"]:
                     ledger.append({"alert_id": aid, "user_id": uid, "chat_id": user["chat_id"],

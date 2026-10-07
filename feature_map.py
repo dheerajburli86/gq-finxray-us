@@ -153,6 +153,36 @@ FEATURES[WATCHLIST_HEATMAP_FEATURE] = {
     "market_wide": False,   # personal by construction
 }
 
+# ── ETF features ──────────────────────────────────────────────────────────────
+# All three are watchlist-scoped: the alert's ticker IS the ETF's ticker, so a
+# user receives them only for ETFs on their own watchlist. Three separate
+# features rather than one so each can be muted independently.
+FEATURES[14] = {
+    "name": "ETF Portfolio & Expense Changes",
+    "detail": ("Holdings added to / removed from a watched ETF (>=0.5% of the fund) "
+               "and confirmed expense-ratio changes, from FMP. Rule-based, no LLM."),
+    "sources": {"ETF_PORTFOLIO", "ETF_EXPENSE"},
+    "filing_types": {"ETF_HOLDINGS_ADDED", "ETF_HOLDINGS_REMOVED", "ETF_HOLDINGS_CHANGE",
+                     "ETF_EXPENSE_INCREASE", "ETF_EXPENSE_DECREASE"},
+    "market_wide": False,
+}
+FEATURES[15] = {
+    "name": "Fund Manager Changes",
+    "detail": ("Portfolio manager added/removed for watched ETFs — SEC 497 stickers "
+               "plus 485BPOS/497K roster diffs. Rule-based, no LLM."),
+    "sources": {"FUND_MANAGER"},
+    "filing_types": {"PM_ADDED", "PM_REMOVED", "PM_CHANGE"},
+    "market_wide": False,
+}
+FEATURES[16] = {
+    "name": "ETF Fund Actions",
+    "detail": ("Liquidation, merger/reorganization, index or strategy change and fee "
+               "change for watched ETFs — SEC 497 / N-14, AI-summarized."),
+    "sources": {"SEC_FUND"},
+    "filing_types": {"ETF_LIQUIDATION", "ETF_MERGER", "ETF_STRATEGY_CHANGE", "ETF_FEE_CHANGE"},
+    "market_wide": False,
+}
+
 TOTAL_FEATURES = len(FEATURES)
 
 UNMAPPED = {"name": "Unmapped", "detail": "Did not match a known source/filing_type pair."}

@@ -113,6 +113,15 @@ from market_reports import (send_premarket_report, send_market_open_report,
 # ── Feature 13: Watchlist Heatmap ─────────────────────────────────────────────
 from watchlist_heatmap import (run_watchlist_heatmap_midday,
                                run_watchlist_heatmap_eod)
+# ── Feature 14: ETF Portfolio & Expense Changes (FMP) ─────────────────────────
+from etf_data_poller import run_etf_data_poller_full, run_etf_data_poller_light
+# ── Feature 15: Fund Manager Changes (SEC) ────────────────────────────────────
+from fund_manager_poller import (run_fund_universe_refresh, run_fund_manager_events,
+                                 run_fund_manager_rosters, run_fund_manager_backfill)
+# ── Feature 16: ETF Fund Actions — liquidation / merger / index / fee (SEC) ───
+from etf_fund_events_poller import run_etf_fund_events_poller
+
+from feature_map import TOTAL_FEATURES
 
 
 # ── Delivery ──────────────────────────────────────────────────────────────────
@@ -342,7 +351,32 @@ def run_scheduler():
     schedule.every().day.at("12:45").do(job(run_watchlist_heatmap_midday))
     schedule.every().day.at("16:20").do(job(run_watchlist_heatmap_eod))
 
-    logger.info("[SCHEDULER] %d jobs registered across 13 features", len(schedule.jobs))
+    # ── Feature 14 — ETF Portfolio & Expense Changes (FMP) ────────────────────
+    # Walks all ~4,150 ETFs so a newly watched fund already has a baseline;
+    # alerts only for watched ones. FMP publishes holdings overnight and through
+    # the day, so a pre-market pass and an evening pass catch both. The poller
+    # skips weekends itself and is version-gated, so the second pass only
+    # alerts on a snapshot FMP has actually changed since the first.
+    # Runs ~25-45 min on the job pool at ETF_FMP_RPS (default 6 req/s).
+    schedule.every().day.at("07:00").do(job(run_etf_data_poller_full))
+    schedule.every().day.at("18:30").do(job(run_etf_data_poller_light))
+
+    # ── Feature 15 — Fund Manager Changes (SEC) ───────────────────────────────
+    # Not on the SEC lane: these share sec_client's request window but take at
+    # most FUND_SEC_MAX_SHARE of it, and they are slow by design — the Sunday
+    # backfill runs for hours and must never hold an 8-K worker.
+    schedule.every().day.at("05:10").do(job(run_fund_universe_refresh))
+    schedule.every(60).minutes.do(job(run_fund_manager_events))
+    schedule.every().day.at("06:20").do(job(run_fund_manager_rosters))
+    schedule.every().sunday.at("02:00").do(job(run_fund_manager_backfill))
+
+    # ── Feature 16 — ETF Fund Actions (SEC) ───────────────────────────────────
+    # Hourly with a 2-day lookback; etf_fund_events.doc_key makes the overlap
+    # free. Matches become raw_filings rows and are summarised by the pipeline.
+    schedule.every(60).minutes.do(job(run_etf_fund_events_poller))
+
+    logger.info("[SCHEDULER] %d jobs registered across %d features",
+                len(schedule.jobs), TOTAL_FEATURES)
     while True:
         schedule.run_pending()
         time.sleep(1)
