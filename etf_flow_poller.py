@@ -140,7 +140,10 @@ def check_etf_momentum(etf_info):
         "volume": int(volume),
         "prev_volume": int(prev_volume),
         "volume_ratio": round(volume_ratio, 2),
-        "signal": signal_text
+        "signal": signal_text,
+        # Seeds broadcast; a fund that is only here because someone watchlisted
+        # it goes to that someone. See delivery._broadcastable.
+        "watchlist_only": not etf_info.get("seed", True),
     })
 
     return signal_type
@@ -152,14 +155,17 @@ def build_universe():
 
     ETF_UNIVERSE alone is a hardcoded eleven tickers that predate watchlists, so
     a user watching forty funds got momentum signals for whichever of those
-    eleven happened to move and silence for the other twenty-nine. Now that
-    Feature 7 is watchlist-routed in delivery.py, polling a fund nobody holds
-    costs a wasted snapshot call and polling one somebody does hold is the whole
-    feature. Names and categories come from etf_master where it has them; the
-    seeds keep their curated labels, and an unknown fund falls back to its own
-    ticker so a missing master row degrades the caption rather than the alert.
+    eleven happened to move and silence for the other twenty-nine.
+
+    The seeds stay the broadcast product and keep reaching every subscriber. The
+    funds added from watchlists are tagged watchlist_only, which delivery uses to
+    route them to the people watching them and to nobody else -- otherwise one
+    user adding UVXY would put UVXY momentum in everybody's inbox. Names and
+    categories come from etf_master where it has them; the seeds keep their
+    curated labels, and an unknown fund falls back to its own ticker so a missing
+    master row degrades the caption rather than the alert.
     """
-    universe = {e["ticker"]: dict(e) for e in ETF_UNIVERSE}
+    universe = {e["ticker"]: dict(e, seed=True) for e in ETF_UNIVERSE}
     try:
         sb = get_supabase()
         watched = {(r.get("ticker") or "").upper()
@@ -181,7 +187,8 @@ def build_universe():
                     continue
                 universe[t] = {"ticker": t,
                                "name": meta[t].get("name") or t,
-                               "category": meta[t].get("category") or "ETF"}
+                               "category": meta[t].get("category") or "ETF",
+                               "seed": False}
     except Exception as e:
         logger.error(f"[ETF FLOW] Could not load watchlisted ETFs, using seeds only: {e}")
     return list(universe.values())

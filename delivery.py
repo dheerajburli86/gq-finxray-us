@@ -102,16 +102,13 @@ MARKET_WIDE_FILING_TYPES = {
     "HEATMAP_WEEKLY", "HEATMAP_MONTHLY",
     "MARKET_REPORT", "MACRO_BRIEFING",
     "IPO_UPCOMING",
-    # Feature 7 (ETF momentum) used to be listed here, which broadcast every
-    # momentum signal to every subscriber regardless of watchlist. Each of those
-    # alerts carries a real, tradeable ETF ticker, so it CAN be watchlist-routed
-    # -- and feature_map has always declared Feature 7 market_wide=False. Routing
-    # it market-wide here was the disagreement that put QQQ/XLE momentum in the
-    # inbox of users who follow neither. It is company-scoped now; see
-    # COMPANY_ONLY_SOURCES below.
+    # etf_flow_poller emits these two, not INFLOW/OUTFLOW. The old names were
+    # left here after the poller was rewritten, so the source-level match below
+    # was the only thing still routing Feature 7.
+    "BULLISH_MOMENTUM", "BEARISH_MOMENTUM", "INFLOW", "OUTFLOW",
 }
 MARKET_WIDE_SOURCES = {
-    "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "FMP_IPO",
+    "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "ETF_FLOW", "FMP_IPO",
     # Feature 8's EDGAR half: an S-1 registration, captured by
     # edgar_poller_async.poll_sec_s1_async under its own source rather than
     # SEC_EDGAR. It has to route market-wide â€” the registrant is pre-IPO, so no
@@ -143,9 +140,6 @@ COMPANY_ONLY_SOURCES = {
     # explicitly so a fund filing whose ticker failed to resolve is dropped
     # instead of falling into the ticker catch-all and reaching every user.
     "ETF_PORTFOLIO", "ETF_EXPENSE", "FUND_MANAGER", "SEC_FUND",
-    # Feature 7. A momentum signal names one fund and files under that fund's
-    # own ticker, so it routes exactly like any other single-ticker alert.
-    "ETF_FLOW",
 }
 COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 
@@ -183,6 +177,22 @@ def _is_market_wide(alert):
     if ticker in ("", "MARKET", "UNKNOWN"):
         return True
     return False
+
+
+def _broadcastable(alert):
+    """
+    False for a market-wide alert that exists only because somebody watchlisted
+    its ticker, so it reaches that person and nobody else.
+
+    Feature 7 polls a fixed eleven-ETF universe plus whatever funds users
+    actually watch. The seeds are the broadcast product and keep going to every
+    subscriber. The watchlist-derived ones are not: widening the universe would
+    otherwise push UVXY and TQQQ momentum into the inbox of every user on the
+    system purely because one user added them. The poller tags those rows
+    extra.watchlist_only; a missing tag means broadcast, so every other poller
+    and every row written before this existed is unaffected.
+    """
+    return not (alert.get("extra") or {}).get("watchlist_only")
 
 
 IMPACT_RANK = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -431,21 +441,45 @@ def resolve_audience(alert, users, watchers):
     if _is_market_wide(alert):
         if not broadcast_enabled():
             return []
-        candidates = [u for u in users.values() if u.get("receive_market_wide", True)]
+
+        # Two legs, unioned, because some market-wide products carry a REAL
+        # ticker. Feature 7's momentum signals are the case in point: they are
+        # broadcast by design, but a user who holds QQQ wants the QQQ signal even
+        # after switching market-wide updates off, and before this the two were
+        # the same switch -- opting out of the macro digest also silenced
+        # momentum on funds they actually watch. The legs are deliberately
+        # additive: every user who received an alert before still receives it,
+        # with the same reason line.
+        pairs = {}
+
         if ticker and ticker not in ("MARKET", "UNKNOWN"):
-            # e.g. an IPO â€” name the company, it reads better than "market-wide".
-            reason = (f"You're receiving this because {ticker} is a market-wide "
-                      f"update. Turn these off any time with /settings.")
-        else:
-            reason = ("You're receiving this because it's a market-wide update. "
-                      "Turn these off any time with /settings.")
+            for uid in watchers.get(ticker, set()):
+                if uid in users:
+                    pairs[uid] = (users[uid],
+                                  f"You're receiving this because {ticker} is on "
+                                  f"your watchlist.")
+
+        if _broadcastable(alert):
+            if ticker and ticker not in ("MARKET", "UNKNOWN"):
+                # e.g. an IPO â€” name the company, it reads better than "market-wide".
+                reason = (f"You're receiving this because {ticker} is a market-wide "
+                          f"update. Turn these off any time with /settings.")
+            else:
+                reason = ("You're receiving this because it's a market-wide update. "
+                          "Turn these off any time with /settings.")
+            for u in users.values():
+                if not u.get("receive_market_wide", True):
+                    continue
+                pairs.setdefault(u["user_id"], (u, reason))
+
+        candidate_pairs = list(pairs.values())
     else:
         uids = watchers.get(ticker, set())
-        candidates = [users[uid] for uid in uids if uid in users]
         reason = f"You're receiving this because {ticker} is on your watchlist."
+        candidate_pairs = [(users[uid], reason) for uid in uids if uid in users]
 
     audience = []
-    for u in candidates:
+    for u, reason in candidate_pairs:
         if alert_rank < IMPACT_RANK.get(u["min_impact"], 2):
             continue                       # below this user's impact floor
         if fid in u["muted_features"]:
