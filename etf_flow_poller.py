@@ -146,11 +146,53 @@ def check_etf_momentum(etf_info):
     return signal_type
 
 
+def build_universe():
+    """
+    Every ETF anybody actually watches, plus the eleven seeds above.
+
+    ETF_UNIVERSE alone is a hardcoded eleven tickers that predate watchlists, so
+    a user watching forty funds got momentum signals for whichever of those
+    eleven happened to move and silence for the other twenty-nine. Now that
+    Feature 7 is watchlist-routed in delivery.py, polling a fund nobody holds
+    costs a wasted snapshot call and polling one somebody does hold is the whole
+    feature. Names and categories come from etf_master where it has them; the
+    seeds keep their curated labels, and an unknown fund falls back to its own
+    ticker so a missing master row degrades the caption rather than the alert.
+    """
+    universe = {e["ticker"]: dict(e) for e in ETF_UNIVERSE}
+    try:
+        sb = get_supabase()
+        watched = {(r.get("ticker") or "").upper()
+                   for r in (sb.table("watchlists").select("ticker").execute().data or [])
+                   if r.get("ticker")}
+        extra = watched - set(universe)
+        if extra:
+            meta = {}
+            tickers = sorted(extra)
+            for i in range(0, len(tickers), 200):      # PostgREST puts in.() in the URL
+                chunk = tickers[i:i + 200]
+                rows = (sb.table("etf_master").select("ticker, name, category")
+                        .in_("ticker", chunk).execute().data or [])
+                meta.update({(r["ticker"] or "").upper(): r for r in rows})
+            for t in tickers:
+                # Not in etf_master means it is a stock, not a fund -- skip it
+                # rather than emit an "ETF Momentum Alert" for a single company.
+                if t not in meta:
+                    continue
+                universe[t] = {"ticker": t,
+                               "name": meta[t].get("name") or t,
+                               "category": meta[t].get("category") or "ETF"}
+    except Exception as e:
+        logger.error(f"[ETF FLOW] Could not load watchlisted ETFs, using seeds only: {e}")
+    return list(universe.values())
+
+
 def run_etf_flow_poller():
     """Poll ETF momentum signals (volume + price spikes)."""
     logger.info("[ETF FLOW] Starting ETF momentum poller...")
     alerts_generated = 0
-    for etf in ETF_UNIVERSE:
+    etf_universe = build_universe()
+    for etf in etf_universe:
         try:
             result = check_etf_momentum(etf)
             if result:
@@ -158,7 +200,7 @@ def run_etf_flow_poller():
                 logger.info(f"[ETF FLOW] {etf['ticker']} — {result} detected")
         except Exception as e:
             logger.error(f"[ETF FLOW] Error checking {etf['ticker']}: {e}")
-    logger.info(f"[ETF FLOW] Done. {len(ETF_UNIVERSE)} ETFs checked, {alerts_generated} alerts generated.")
+    logger.info(f"[ETF FLOW] Done. {len(etf_universe)} ETFs checked, {alerts_generated} alerts generated.")
 
 
 if __name__ == "__main__":

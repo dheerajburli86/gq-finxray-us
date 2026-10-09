@@ -102,13 +102,16 @@ MARKET_WIDE_FILING_TYPES = {
     "HEATMAP_WEEKLY", "HEATMAP_MONTHLY",
     "MARKET_REPORT", "MACRO_BRIEFING",
     "IPO_UPCOMING",
-    # etf_flow_poller emits these two, not INFLOW/OUTFLOW. The old names were
-    # left here after the poller was rewritten, so the source-level match below
-    # was the only thing still routing Feature 7.
-    "BULLISH_MOMENTUM", "BEARISH_MOMENTUM", "INFLOW", "OUTFLOW",
+    # Feature 7 (ETF momentum) used to be listed here, which broadcast every
+    # momentum signal to every subscriber regardless of watchlist. Each of those
+    # alerts carries a real, tradeable ETF ticker, so it CAN be watchlist-routed
+    # -- and feature_map has always declared Feature 7 market_wide=False. Routing
+    # it market-wide here was the disagreement that put QQQ/XLE momentum in the
+    # inbox of users who follow neither. It is company-scoped now; see
+    # COMPANY_ONLY_SOURCES below.
 }
 MARKET_WIDE_SOURCES = {
-    "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "ETF_FLOW", "FMP_IPO",
+    "SECTOR_HEATMAP", "MARKET_REPORT", "MACRO_ROUNDUP", "FMP_IPO",
     # Feature 8's EDGAR half: an S-1 registration, captured by
     # edgar_poller_async.poll_sec_s1_async under its own source rather than
     # SEC_EDGAR. It has to route market-wide â€” the registrant is pre-IPO, so no
@@ -140,6 +143,9 @@ COMPANY_ONLY_SOURCES = {
     # explicitly so a fund filing whose ticker failed to resolve is dropped
     # instead of falling into the ticker catch-all and reaching every user.
     "ETF_PORTFOLIO", "ETF_EXPENSE", "FUND_MANAGER", "SEC_FUND",
+    # Feature 7. A momentum signal names one fund and files under that fund's
+    # own ticker, so it routes exactly like any other single-ticker alert.
+    "ETF_FLOW",
 }
 COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 
@@ -890,6 +896,14 @@ async def deliver_photo(image_path, caption, source, filing_type,
         targets = [u for u in users.values() if u.get("receive_market_wide", True)]
     else:
         targets = []
+
+    # Heatmaps are the only product that reaches a user without passing through
+    # resolve_audience, so muted_features was never consulted here: a user who
+    # muted Feature 9 or 13 in /settings kept receiving the images anyway, with
+    # no way to stop them. Apply the same mute the text fan-out applies.
+    fid, _ = resolve_feature(source, filing_type)
+    if fid:
+        targets = [u for u in targets if fid not in u["muted_features"]]
 
     if not targets:
         logger.info("[DELIVERY] Photo %s: no eligible recipients", filing_type)
