@@ -50,6 +50,20 @@ SCHEDULE (main.py, ET)
   07:00  run_etf_data_poller_full   holdings, expenses, performance, company data
   18:30  run_etf_data_poller_light  holdings + expenses only
 Mon–Fri only (ETF_POLL_ANY_DAY=true overrides).
+
+MODES
+-----
+  full     everything
+  light    holdings + expenses (the diff that produces alerts)
+  refdata  master + performance + company data, NO holdings
+
+`refdata` exists because etf_company_data and etf_performance were reachable
+only through a full run, which re-pulls every portfolio in the universe -- the
+slowest call there is -- to fill two tables that do not need it. It makes no
+alerts and ignores the weekly company-refresh gate, so it is the mode to run
+by hand when those tables are empty or stale:
+
+    python etf_data_poller.py refdata
 """
 
 import hashlib
@@ -516,19 +530,31 @@ def process_etf(ctx, ticker, name):
     state = dict(ctx.states.get(ticker) or {"ticker": ticker})
     try:
         info = fmp.raw_info(ticker)
-        raw = fmp.raw_holdings(ticker)
         fund = (info or {}).get("name") or name or ticker
         website = (info or {}).get("website")
         asset_class = (info or {}).get("assetClass")
 
         if info:
             res["master"] = fmp.master_row(ticker, name, info)
-        handle_holdings(ctx, ticker, fund, asset_class, raw, state, website, res)
-        handle_expense(ctx, ticker, fund, info, state, website, res)
 
-        if ctx.mode == "full":
+        # "refdata" fills the reference tables -- profile, sector and country
+        # weights, returns -- without touching holdings. Those were previously
+        # reachable only through a "full" run, so the only way to populate
+        # etf_company_data was to re-pull every portfolio in the universe: the
+        # slowest call in the poller, for data the run does not need. Skipping
+        # it here also means a refdata run cannot emit an alert, so it is safe
+        # to run by hand at any hour.
+        if ctx.mode != "refdata":
+            raw = fmp.raw_holdings(ticker)
+            handle_holdings(ctx, ticker, fund, asset_class, raw, state, website, res)
+            handle_expense(ctx, ticker, fund, info, state, website, res)
+
+        if ctx.mode in ("full", "refdata"):
             res["perf"] = fmp.performance_row(ticker, fmp.raw_price_change(ticker), ctx.today)
-            if _company_due(state):
+            # refdata ignores the weekly refresh gate on purpose: it is the
+            # manual backfill, and waiting a week to repair a gap is not a
+            # repair. Scheduled full runs still honour it.
+            if ctx.mode == "refdata" or _company_due(state):
                 res["company"] = fmp.company_row(ticker, info, fmp.raw_profile(ticker),
                                                  fmp.raw_sector_weights(ticker),
                                                  fmp.raw_country_weights(ticker))
