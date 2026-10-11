@@ -120,6 +120,8 @@ from fund_manager_poller import (run_fund_universe_refresh, run_fund_manager_eve
                                  run_fund_manager_rosters, run_fund_manager_backfill)
 # ── Feature 16: ETF Fund Actions — liquidation / merger / index / fee (SEC) ───
 from etf_fund_events_poller import run_etf_fund_events_poller
+# ── Features 7 (v2) + 17: ETF signal engine — opt-in per user ─────────────────
+from etf_signals_poller import run_etf_signals
 
 from feature_map import TOTAL_FEATURES
 
@@ -211,7 +213,7 @@ def run_scheduler():
     for warm in (poll_sec_8k, poll_sec_form4, poll_sec_10q, poll_sec_10k):
         sec_job(warm)()
     for warm in (poll_all_news, poll_fmp_news, run_technical_poller,
-                 run_etf_flow_poller, poll_analyst_ratings):
+                 run_etf_flow_poller, run_etf_signals, poll_analyst_ratings):
         job(warm)()
 
     # ── Features 1 & 5 — SEC EDGAR, the fast lane ─────────────────────────────
@@ -299,6 +301,17 @@ def run_scheduler():
 
     # ── Feature 7 — ETF Flow ──────────────────────────────────────────────────
     schedule.every(60).minutes.do(job(run_etf_flow_poller))
+
+    # ── Features 7 (v2) & 17 — ETF signal engine ──────────────────────────────
+    # Momentum, unusual moves, out/under-performance vs SPY, streaks and
+    # drawdowns, each measured against the fund's own history. Self-gating:
+    # weekends, holidays and a day with nobody opted in
+    # (user_preferences.etf_signals_beta) return before any API call. Cost when
+    # live: one Massive snapshot per run plus one daily-bars call per watched
+    # fund per session. The 16:03 run makes sure the closing print is judged
+    # whatever minute the 15-minute ticks happen to land on.
+    schedule.every(15).minutes.do(job(run_etf_signals))
+    schedule.every().day.at("16:03").do(job(run_etf_signals))
 
     # ── Feature 8 — IPO Deep Dive ─────────────────────────────────────────────
     schedule.every().day.at("08:00").do(job(run_ipo_poller))

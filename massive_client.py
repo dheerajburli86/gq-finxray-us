@@ -100,6 +100,41 @@ def get_aggregates(ticker, multiplier=1, timespan="day", from_date=None, to_date
     return []
 
 
+def get_dividend_history(ticker, since, max_pages=3):
+    """
+    [{"ex_date": "YYYY-MM-DD", "cash": float}] for every cash distribution of
+    `ticker` with an ex-date on or after `since` (YYYY-MM-DD), declared future
+    ones included. None when ANY page could not be read -- a partial list would
+    silently mis-adjust prices, so callers must treat None as "unknown".
+
+    Needed because adjusted=true daily bars and the snapshot's prevDay adjust
+    for splits only: on an ex-date a fund's price drops by its distribution,
+    and income funds drift down by their payouts. Without adding those back, a
+    bond or covered-call fund reads as falling when its total return is flat.
+    """
+    params = {"ticker": ticker, "ex_dividend_date.gte": since, "limit": 1000,
+              "sort": "ex_dividend_date", "order": "asc"}
+    out = []
+    for _ in range(max_pages):
+        data = _get("/v3/reference/dividends", params)
+        if not data or not isinstance(data.get("results"), list):
+            return None
+        for r in data["results"]:
+            try:
+                amt = float(r.get("cash_amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            ex = str(r.get("ex_dividend_date") or "")[:10]
+            if amt > 0 and len(ex) == 10:
+                out.append({"ex_date": ex, "cash": amt})
+        nxt = data.get("next_url") or ""
+        cursor = nxt.split("cursor=", 1)[1].split("&", 1)[0] if "cursor=" in nxt else None
+        if not cursor:
+            return out
+        params = {"cursor": cursor}
+    return None
+
+
 def get_grouped_daily(date_str):
     """Every US stock's OHLCV for a single trading day — one call."""
     data = _get(f"/v2/aggs/grouped/locale/us/market/stocks/{date_str}", {"adjusted": "true"})

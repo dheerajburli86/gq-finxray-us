@@ -65,6 +65,8 @@ REQUIRED = {
     "run_fund_universe_refresh": 15, "run_fund_manager_events": 15,
     "run_fund_manager_rosters": 15, "run_fund_manager_backfill": 15,
     "run_etf_fund_events_poller": 16,
+    # ETF signal engine: v2 momentum (Feature 7) + price signals (Feature 17).
+    "run_etf_signals": 17,
 }
 covered = set()
 for fn, fid in REQUIRED.items():
@@ -103,7 +105,9 @@ for src, ft, tk in [("FMP_NEWS", "NEWS", "MARKET"), ("SEC_EDGAR", "8-K", "UNKNOW
                     ("ETF_PORTFOLIO", "ETF_HOLDINGS_ADDED", "UNKNOWN"),
                     ("ETF_EXPENSE", "ETF_EXPENSE_INCREASE", ""),
                     ("FUND_MANAGER", "PM_REMOVED", "UNKNOWN"),
-                    ("SEC_FUND", "ETF_LIQUIDATION", "MARKET")]:
+                    ("SEC_FUND", "ETF_LIQUIDATION", "MARKET"),
+                    ("ETF_SIGNAL", "ETF_BIG_MOVE_DOWN", "UNKNOWN"),
+                    ("ETF_SIGNAL", "ETF_MOMENTUM_UP", "")]:
     leaked = delivery._is_market_wide({"source": src, "filing_type": ft, "ticker": tk})
     check(f"{src}/{ft} (ticker={tk!r}) stays watchlist-scoped", not leaked,
           "would be broadcast to every subscriber")
@@ -138,6 +142,13 @@ EMISSIONS = [
     ("FUND_MANAGER", "PM_ADDED"), ("FUND_MANAGER", "PM_REMOVED"), ("FUND_MANAGER", "PM_CHANGE"),
     ("SEC_FUND", "ETF_LIQUIDATION"), ("SEC_FUND", "ETF_MERGER"),
     ("SEC_FUND", "ETF_STRATEGY_CHANGE"), ("SEC_FUND", "ETF_FEE_CHANGE"),
+    # ETF signal engine (etf_signals_poller): Feature 7 v2 + Feature 17
+    ("ETF_SIGNAL", "ETF_MOMENTUM_UP"), ("ETF_SIGNAL", "ETF_MOMENTUM_DOWN"),
+    ("ETF_SIGNAL", "ETF_BIG_MOVE_UP"), ("ETF_SIGNAL", "ETF_BIG_MOVE_DOWN"),
+    ("ETF_SIGNAL", "ETF_OUTPERFORM"), ("ETF_SIGNAL", "ETF_UNDERPERFORM"),
+    ("ETF_SIGNAL", "ETF_STREAK_UP"), ("ETF_SIGNAL", "ETF_STREAK_DOWN"),
+    ("ETF_SIGNAL", "ETF_DRAWDOWN_5"), ("ETF_SIGNAL", "ETF_DRAWDOWN_10"),
+    ("ETF_SIGNAL", "ETF_DRAWDOWN_20"),
 ]
 tagged = set()
 for src, ft in EMISSIONS:

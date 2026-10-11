@@ -13,13 +13,16 @@ Runs every 60 minutes via scheduler in main.py.
 """
 
 import logging
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from supabase import create_client
 import os
 
 import massive_client
 from feature_map import tag_extra
+from heatmap_generator import is_trading_day
+from watchlist_util import get_watched_tickers
 
 load_dotenv()
 
@@ -30,6 +33,36 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 VOLUME_SPIKE_THRESHOLD = 1.5
 PRICE_MOVE_THRESHOLD = 1.0
+
+ET = ZoneInfo("America/New_York")
+OPEN_MINUTES = 9 * 60 + 30
+
+
+def in_session_window(now_et=None):
+    """
+    Trading days only. On a weekend or holiday every snapshot is a previous
+    session's, so the only thing a run there could do is re-send it -- which is
+    exactly how Friday's PSP signal arrived again on Saturday and on Sunday.
+    Trading-day runs at any hour stay (the post-close ones are where this
+    poller's full-day comparison actually fires); _snapshot_is_today() rejects
+    the stale bar that is still in the snapshot between midnight and ~04:00 ET.
+    """
+    now_et = now_et or datetime.now(ET)
+    return is_trading_day(now_et.date())
+
+
+def _snapshot_is_today(snap, now_et=None):
+    """False when the snapshot's last update is not from today's ET session."""
+    now_et = now_et or datetime.now(ET)
+    stamp = snap.get("updated") or (snap.get("lastTrade") or {}).get("t")
+    try:
+        stamp = float(stamp)
+    except (TypeError, ValueError):
+        # No timestamp to judge by: before the open it can only be yesterday's bar.
+        return now_et.hour * 60 + now_et.minute >= OPEN_MINUTES
+    seconds = stamp / 1e9 if stamp > 1e14 else (stamp / 1e3 if stamp > 1e11 else stamp)
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).astimezone(ET).date() == now_et.date()
+
 
 ETF_UNIVERSE = [
     {"ticker": "SPY",  "name": "S&P 500 ETF",                "category": "Broad Market"},
@@ -52,13 +85,14 @@ def get_supabase():
 
 def already_sent_today(ticker, signal_type):
     sb = get_supabase()
-    today = date.today().isoformat()
+    # ET midnight, not UTC midnight of the ET date (which is 20:00 ET the day before).
+    midnight_et = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
     result = sb.table("alerts") \
         .select("id") \
         .eq("ticker", ticker) \
         .eq("source", "ETF_FLOW") \
         .eq("filing_type", signal_type) \
-        .gte("created_at", f"{today}T00:00:00+00:00") \
+        .gte("created_at", midnight_et.isoformat()) \
         .execute()
     return len(result.data) > 0
 
@@ -85,7 +119,7 @@ def check_etf_momentum(etf_info):
     category = etf_info["category"]
 
     snap = massive_client.get_snapshot(ticker)
-    if not snap:
+    if not snap or not _snapshot_is_today(snap):
         return None
 
     day = snap.get("day", {}) or {}
@@ -125,7 +159,7 @@ def check_etf_momentum(etf_info):
     summary = (
         f"{emoji} ETF Momentum Alert — {ticker}\n\n"
         f"ETF: {name} ({category})\n"
-        f"Price:  ({sign}{change_p:.2f}%)\n"
+        f"Price: ${price:,.2f} ({sign}{change_p:.2f}%)\n"
         f"Volume: {int(volume):,} ({volume_ratio:.1f}x prior session)\n"
         f"Signal: {signal_text}\n"
         f"_Note: This is a momentum signal based on volume/price, not official fund flow data._\n"
@@ -168,9 +202,9 @@ def build_universe():
     universe = {e["ticker"]: dict(e, seed=True) for e in ETF_UNIVERSE}
     try:
         sb = get_supabase()
-        watched = {(r.get("ticker") or "").upper()
-                   for r in (sb.table("watchlists").select("ticker").execute().data or [])
-                   if r.get("ticker")}
+        # Paginated (watchlist_util). A bare select stops at PostgREST's
+        # 1,000-row cap, silently dropping every watched fund past it.
+        watched = {(t or "").upper() for t in get_watched_tickers(force=True) if t}
         extra = watched - set(universe)
         if extra:
             meta = {}
@@ -196,6 +230,9 @@ def build_universe():
 
 def run_etf_flow_poller():
     """Poll ETF momentum signals (volume + price spikes)."""
+    if not in_session_window():
+        logger.info("[ETF FLOW] Not a trading day -- skipping (the snapshot can only hold a past session).")
+        return
     logger.info("[ETF FLOW] Starting ETF momentum poller...")
     alerts_generated = 0
     etf_universe = build_universe()

@@ -83,8 +83,12 @@ FEATURES = {
     7: {
         "name": "ETF Flow Alerts",
         "detail": "Institutional inflow/outflow signal from ETF volume + price-move thresholds.",
-        "sources": {"ETF_FLOW"},
-        "filing_types": {"INFLOW", "OUTFLOW"},
+        # ETF_FLOW is v1 (etf_flow_poller, BULLISH/BEARISH_MOMENTUM). ETF_SIGNAL
+        # is the v2 engine (etf_signals_poller), whose momentum rows stay
+        # Feature 7 so a user's Feature 7 mute keeps meaning "no momentum".
+        "sources": {"ETF_FLOW", "ETF_SIGNAL"},
+        "filing_types": {"INFLOW", "OUTFLOW", "BULLISH_MOMENTUM", "BEARISH_MOMENTUM",
+                         "ETF_MOMENTUM_UP", "ETF_MOMENTUM_DOWN"},
         "market_wide": False,
     },
     8: {
@@ -180,6 +184,20 @@ FEATURES[16] = {
                "change for watched ETFs — SEC 497 / N-14, AI-summarized."),
     "sources": {"SEC_FUND"},
     "filing_types": {"ETF_LIQUIDATION", "ETF_MERGER", "ETF_STRATEGY_CHANGE", "ETF_FEE_CHANGE"},
+    "market_wide": False,
+}
+
+FEATURES[17] = {
+    "name": "ETF Price Signals",
+    "detail": ("Unusually large moves, out/under-performance vs the S&P 500, winning/losing "
+               "streaks and 5/10/20% drawdowns for watched ETFs -- each measured against the "
+               "fund's own history. Rule-based, no LLM. Opt-in (etf_signals_beta)."),
+    "sources": {"ETF_SIGNAL"},
+    "filing_types": {"ETF_BIG_MOVE_UP", "ETF_BIG_MOVE_DOWN", "ETF_OUTPERFORM", "ETF_UNDERPERFORM",
+                     "ETF_STREAK_UP", "ETF_STREAK_DOWN",
+                     # one type per depth etf_signals_poller.SUPPORTED_DRAWDOWNS allows
+                     "ETF_DRAWDOWN_5", "ETF_DRAWDOWN_10", "ETF_DRAWDOWN_15",
+                     "ETF_DRAWDOWN_20", "ETF_DRAWDOWN_25", "ETF_DRAWDOWN_30"},
     "market_wide": False,
 }
 

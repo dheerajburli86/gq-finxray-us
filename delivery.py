@@ -140,8 +140,19 @@ COMPANY_ONLY_SOURCES = {
     # explicitly so a fund filing whose ticker failed to resolve is dropped
     # instead of falling into the ticker catch-all and reaching every user.
     "ETF_PORTFOLIO", "ETF_EXPENSE", "FUND_MANAGER", "SEC_FUND",
+    # ETF signal engine v2 (Features 7 + 17): always about one watched fund.
+    "ETF_SIGNAL",
 }
 COMPANY_ONLY_FILING_TYPES = {"NEWS"}
+
+# ── ETF signal engine rollout ─────────────────────────────────────────────────
+# etf_signals_poller (source ETF_SIGNAL) replaces etf_flow_poller (ETF_FLOW) for
+# users who opted in with user_preferences.etf_signals_beta. The two are kept
+# mutually exclusive per user: opted-in users get ONLY v2, everyone else gets
+# ONLY v1 -- so nobody receives the same fund's momentum twice, and nobody who
+# did not opt in sees any change at all.
+ETF_V2_SOURCES = {"ETF_SIGNAL"}
+ETF_V1_SOURCES = {"ETF_FLOW"}
 
 
 def _is_market_wide(alert):
@@ -287,9 +298,12 @@ def _fetch_active_users():
                  .select("id, telegram_chat_id, telegram_username, display_name, is_active")
                  .eq("is_active", True)
                  .execute()).data or []
+        # "*" rather than a column list: an optional column (etf_signals_beta)
+        # that has not been migrated yet is then simply absent from the row,
+        # instead of failing this query -- which would stop delivery for
+        # every user, not just the feature that needed the column.
         prefs = (supabase.table("user_preferences")
-                 .select("user_id, min_impact, muted_features, max_alerts_per_day, "
-                         "receive_market_wide")
+                 .select("*")
                  .execute()).data or []
     except Exception as e:
         logger.error(f"[DELIVERY] Failed to load users/preferences: {e}")
@@ -314,6 +328,8 @@ def _fetch_active_users():
             # is TRUE. `p.get(...) is not False` keeps a missing row opted IN
             # instead of silently opting the user out of every market-wide alert.
             "receive_market_wide": p.get("receive_market_wide") is not False,
+            # Opt-in, so only an explicit TRUE counts; missing row/column = off.
+            "etf_signals_beta": p.get("etf_signals_beta") is True,
         }
     return out
 
@@ -477,6 +493,12 @@ def resolve_audience(alert, users, watchers):
         uids = watchers.get(ticker, set())
         reason = f"You're receiving this because {ticker} is on your watchlist."
         candidate_pairs = [(users[uid], reason) for uid in uids if uid in users]
+
+    src = (source or "").upper()
+    if src in ETF_V2_SOURCES:
+        candidate_pairs = [(u, r) for u, r in candidate_pairs if u.get("etf_signals_beta")]
+    elif src in ETF_V1_SOURCES:
+        candidate_pairs = [(u, r) for u, r in candidate_pairs if not u.get("etf_signals_beta")]
 
     audience = []
     for u, reason in candidate_pairs:
