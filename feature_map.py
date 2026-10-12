@@ -201,46 +201,6 @@ FEATURES[17] = {
     "market_wide": False,
 }
 
-# ── Stock reference & ownership features ─────────────────────────────────────
-# Stock-side equivalents of the India CMOTS company master. Watchlist-scoped:
-# the alert ticker is the stock's own (the OLD ticker for a symbol change, since
-# that is what is on the watchlist). Alerts gated by STOCK_ALERTS_ENABLED.
-FEATURES[18] = {
-    "name": "Listing & Identity Changes",
-    "detail": ("Ticker change, company rename, exchange transfer (incl. to OTC) and delisting "
-               "for watched stocks — SEC ticker registry cross-checked with Massive. Rule-based."),
-    "sources": {"STOCK_MASTER"},
-    "filing_types": {"STOCK_SYMBOL_CHANGE", "STOCK_NAME_CHANGE", "STOCK_EXCHANGE_CHANGE",
-                     "STOCK_DELISTED"},
-    "market_wide": False,
-}
-FEATURES[19] = {
-    "name": "Classification Changes",
-    "detail": ("Market-cap class moves (mega/large/mid/small/micro/nano), sector "
-               "reclassification, and S&P 500 / Nasdaq-100 / Dow additions and removals — FMP. "
-               "Rule-based."),
-    "sources": {"STOCK_MASTER"},
-    "filing_types": {"STOCK_MCAP_CLASS_UP", "STOCK_MCAP_CLASS_DOWN", "STOCK_SECTOR_CHANGE",
-                     "STOCK_INDEX_ADDED", "STOCK_INDEX_REMOVED"},
-    "market_wide": False,
-}
-FEATURES[20] = {
-    "name": "ETF Ownership Changes",
-    "detail": ("ETFs adding or dropping a watched stock (>=0.5% of the fund), sized in dollars "
-               "from fund AUM — the reverse of Feature 14's holdings diffs. Rule-based."),
-    "sources": {"ETF_HOLDER"},
-    "filing_types": {"STOCK_ETF_ADDED", "STOCK_ETF_REMOVED"},
-    "market_wide": False,
-}
-FEATURES[21] = {
-    "name": "Institutional Ownership (13F)",
-    "detail": ("Quarterly 13F summary for watched stocks once filings settle: institutions "
-               "holding, ownership %, new/closed positions — FMP. Rule-based."),
-    "sources": {"INST_13F"},
-    "filing_types": {"INST_OWNERSHIP_UP", "INST_OWNERSHIP_DOWN"},
-    "market_wide": False,
-}
-
 TOTAL_FEATURES = len(FEATURES)
 
 UNMAPPED = {"name": "Unmapped", "detail": "Did not match a known source/filing_type pair."}

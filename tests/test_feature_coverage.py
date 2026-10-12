@@ -67,17 +67,13 @@ REQUIRED = {
     "run_etf_fund_events_poller": 16,
     # ETF signal engine: v2 momentum (Feature 7) + price signals (Feature 17).
     "run_etf_signals": 17,
-    # Stock reference + ownership.
-    "run_stock_master": (18, 19), "run_stock_etf_holders": 20, "run_stock_13f": 21,
 }
 covered = set()
-for fn, fids in REQUIRED.items():
-    fids = fids if isinstance(fids, tuple) else (fids,)
+for fn, fid in REQUIRED.items():
     scheduled = f"job({fn})" in main_src or f"sec_job({fn})" in main_src
-    check(f"Feature {'/'.join(str(f) for f in fids):>5} · {fn} scheduled", scheduled,
-          "not wired into run_scheduler()")
+    check(f"Feature {fid:>2} · {fn} scheduled", scheduled, "not wired into run_scheduler()")
     if scheduled:
-        covered.update(fids)
+        covered.add(fid)
 check(f"every one of the {len(feature_map.FEATURES)} features has a scheduled entry point",
       covered == set(feature_map.FEATURES),
       f"missing {sorted(set(feature_map.FEATURES) - covered)}")
@@ -153,14 +149,6 @@ EMISSIONS = [
     ("ETF_SIGNAL", "ETF_STREAK_UP"), ("ETF_SIGNAL", "ETF_STREAK_DOWN"),
     ("ETF_SIGNAL", "ETF_DRAWDOWN_5"), ("ETF_SIGNAL", "ETF_DRAWDOWN_10"),
     ("ETF_SIGNAL", "ETF_DRAWDOWN_20"),
-    # stock_master_poller (18, 19) + stock_ownership_poller (20, 21)
-    ("STOCK_MASTER", "STOCK_SYMBOL_CHANGE"), ("STOCK_MASTER", "STOCK_NAME_CHANGE"),
-    ("STOCK_MASTER", "STOCK_EXCHANGE_CHANGE"), ("STOCK_MASTER", "STOCK_DELISTED"),
-    ("STOCK_MASTER", "STOCK_MCAP_CLASS_UP"), ("STOCK_MASTER", "STOCK_MCAP_CLASS_DOWN"),
-    ("STOCK_MASTER", "STOCK_SECTOR_CHANGE"), ("STOCK_MASTER", "STOCK_INDEX_ADDED"),
-    ("STOCK_MASTER", "STOCK_INDEX_REMOVED"),
-    ("ETF_HOLDER", "STOCK_ETF_ADDED"), ("ETF_HOLDER", "STOCK_ETF_REMOVED"),
-    ("INST_13F", "INST_OWNERSHIP_UP"), ("INST_13F", "INST_OWNERSHIP_DOWN"),
 ]
 tagged = set()
 for src, ft in EMISSIONS:

@@ -122,8 +122,6 @@ from fund_manager_poller import (run_fund_universe_refresh, run_fund_manager_eve
 from etf_fund_events_poller import run_etf_fund_events_poller
 # ── Features 7 (v2) + 17: ETF signal engine — opt-in per user ─────────────────
 from etf_signals_poller import run_etf_signals
-from stock_master_poller import run_stock_master
-from stock_ownership_poller import run_stock_etf_holders, run_stock_13f
 
 from feature_map import TOTAL_FEATURES
 
@@ -389,20 +387,6 @@ def run_scheduler():
     # Hourly with a 2-day lookback; etf_fund_events.doc_key makes the overlap
     # free. Matches become raw_filings rows and are summarised by the pipeline.
     schedule.every(60).minutes.do(job(run_etf_fund_events_poller))
-
-    # ── Features 18-19 — Stock company master (SEC + FMP + Massive) ───────────
-    # Daily, before the open. SEC regenerates its ticker file overnight; changes
-    # need two separate days to confirm, so once a day is the natural cadence.
-    schedule.every().day.at("06:10").do(job(run_stock_master))
-
-    # ── Feature 20 — ETF ownership of watched stocks ──────────────────────────
-    # Reads what the Feature 14 passes (07:00 full, 18:30 light) just stored.
-    schedule.every().day.at("08:10").do(job(run_stock_etf_holders))
-    schedule.every().day.at("19:40").do(job(run_stock_etf_holders))
-
-    # ── Feature 21 — 13F institutional ownership ──────────────────────────────
-    # Self-gated: fetches only in the weeks after a quarter's 13F totals settle.
-    schedule.every().day.at("06:40").do(job(run_stock_13f))
 
     logger.info("[SCHEDULER] %d jobs registered across %d features",
                 len(schedule.jobs), TOTAL_FEATURES)

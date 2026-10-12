@@ -142,8 +142,6 @@ COMPANY_ONLY_SOURCES = {
     "ETF_PORTFOLIO", "ETF_EXPENSE", "FUND_MANAGER", "SEC_FUND",
     # ETF signal engine v2 (Features 7 + 17): always about one watched fund.
     "ETF_SIGNAL",
-    # Stock reference + ownership (Features 18-21): always about one stock.
-    "STOCK_MASTER", "ETF_HOLDER", "INST_13F",
 }
 COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 
