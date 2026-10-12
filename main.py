@@ -122,6 +122,8 @@ from fund_manager_poller import (run_fund_universe_refresh, run_fund_manager_eve
 from etf_fund_events_poller import run_etf_fund_events_poller
 # ── Features 7 (v2) + 17: ETF signal engine — opt-in per user ─────────────────
 from etf_signals_poller import run_etf_signals
+from etf_listing_poller import run_etf_listing_poller
+from etf_expense_extractor import run_expense_backfill
 
 from feature_map import TOTAL_FEATURES
 
@@ -387,6 +389,14 @@ def run_scheduler():
     # Hourly with a 2-day lookback; etf_fund_events.doc_key makes the overlap
     # free. Matches become raw_filings rows and are summarised by the pipeline.
     schedule.every(60).minutes.do(job(run_etf_fund_events_poller))
+
+    # ── ETF scheme master upkeep (Features 14 / 16) ───────────────────────────
+    # Launches join etf_master before the 07:00 Feature 14 pass baselines them;
+    # closures of watched funds alert under Feature 16.
+    schedule.every().day.at("06:30").do(job(run_etf_listing_poller))
+    # Prospectus fee tables (management fee, waiver, gross/net) for ETFs that
+    # have none yet; new prospectuses are read by the Feature 15 roster job.
+    schedule.every().day.at("05:40").do(job(run_expense_backfill))
 
     logger.info("[SCHEDULER] %d jobs registered across %d features",
                 len(schedule.jobs), TOTAL_FEATURES)

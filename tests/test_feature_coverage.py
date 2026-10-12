@@ -67,6 +67,8 @@ REQUIRED = {
     "run_etf_fund_events_poller": 16,
     # ETF signal engine: v2 momentum (Feature 7) + price signals (Feature 17).
     "run_etf_signals": 17,
+    # ETF scheme master upkeep: closures alert under 16; fee tables feed 14.
+    "run_etf_listing_poller": 16, "run_expense_backfill": 14,
 }
 covered = set()
 for fn, fid in REQUIRED.items():
@@ -149,6 +151,7 @@ EMISSIONS = [
     ("ETF_SIGNAL", "ETF_STREAK_UP"), ("ETF_SIGNAL", "ETF_STREAK_DOWN"),
     ("ETF_SIGNAL", "ETF_DRAWDOWN_5"), ("ETF_SIGNAL", "ETF_DRAWDOWN_10"),
     ("ETF_SIGNAL", "ETF_DRAWDOWN_20"),
+    ("ETF_PORTFOLIO", "ETF_WEIGHT_SHIFT"), ("ETF_LISTING", "ETF_DELISTED"),
 ]
 tagged = set()
 for src, ft in EMISSIONS:

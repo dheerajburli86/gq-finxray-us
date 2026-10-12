@@ -142,6 +142,8 @@ COMPANY_ONLY_SOURCES = {
     "ETF_PORTFOLIO", "ETF_EXPENSE", "FUND_MANAGER", "SEC_FUND",
     # ETF signal engine v2 (Features 7 + 17): always about one watched fund.
     "ETF_SIGNAL",
+    # ETF closures (etf_listing_poller): always about one watched fund.
+    "ETF_LISTING",
 }
 COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 

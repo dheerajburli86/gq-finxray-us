@@ -135,6 +135,29 @@ def get_dividend_history(ticker, since, max_pages=3):
     return None
 
 
+def get_reference_tickers(market="stocks", active=True, max_pages=40):
+    """
+    Every ticker Massive lists for `market`, 1,000 per page, following the
+    cursor. Rows carry ticker, name, type (ETF, ETN, ETV, CS ...), active,
+    primary_exchange. None when ANY page fails: a partial list would read as
+    hundreds of closures to a caller diffing against it.
+    """
+    params = {"market": market, "active": "true" if active else "false",
+              "limit": 1000, "sort": "ticker", "order": "asc"}
+    out = []
+    for _ in range(max_pages):
+        data = _get("/v3/reference/tickers", params)
+        if not data or not isinstance(data.get("results"), list):
+            return None
+        out.extend(data["results"])
+        nxt = data.get("next_url") or ""
+        cursor = nxt.split("cursor=", 1)[1].split("&", 1)[0] if "cursor=" in nxt else None
+        if not cursor:
+            return out
+        params = {"cursor": cursor}
+    return None
+
+
 def get_grouped_daily(date_str):
     """Every US stock's OHLCV for a single trading day — one call."""
     data = _get(f"/v2/aggs/grouped/locale/us/market/stocks/{date_str}", {"adjusted": "true"})

@@ -83,6 +83,7 @@ from supabase import create_client
 import etf_fmp_client as fmp
 from feature_map import tag_extra
 from watchlist_util import get_watched_tickers, log_poller_error
+import etf_expense_extractor as fee_extractor
 
 load_dotenv()
 
@@ -107,6 +108,15 @@ MAX_CHURN = float(os.getenv("ETF_MAX_CHURN", "0.6"))
 MIN_KEEP_FRACTION = float(os.getenv("ETF_MIN_KEEP_FRACTION", "0.5"))
 SKIP_CLASSES = {c.strip().lower() for c in os.getenv(
     "ETF_HOLDINGS_ALERT_SKIP_CLASSES", "fixed income,bond,bonds,money market").split(",") if c.strip()}
+# Resized positions (ETF_WEIGHT_SHIFT): a holding's share count moved by
+# SHIFT_MIN_REL more than the fund's own creations/redemptions did, AND its
+# weight moved by SHIFT_MIN_PTS. Price drift alone never qualifies: shares are
+# unchanged, so the position tracks the fund-wide flow exactly.
+SHIFT_MIN_WEIGHT = float(os.getenv("ETF_SHIFT_MIN_WEIGHT", "1.0"))    # % of fund, either side
+SHIFT_MIN_PTS = float(os.getenv("ETF_SHIFT_MIN_PTS", "0.5"))          # weight change, points
+SHIFT_MIN_REL = float(os.getenv("ETF_SHIFT_MIN_REL", "0.25"))         # 25% beyond fund flow
+SHIFT_HIGH_PTS = float(os.getenv("ETF_SHIFT_HIGH_PTS", "3.0"))
+SHIFT_MIN_PAIRS = int(os.getenv("ETF_SHIFT_MIN_PAIRS", "8"))
 EXPENSE_MIN_DELTA = float(os.getenv("ETF_EXPENSE_MIN_DELTA", "0.005"))   # percentage points
 EXPENSE_HIGH_DELTA = float(os.getenv("ETF_EXPENSE_HIGH_DELTA", "0.10"))
 EXPENSE_CONFIRM_RUNS = int(os.getenv("ETF_EXPENSE_CONFIRM_RUNS", "2"))
@@ -179,7 +189,7 @@ def load_states():
 
 
 def load_stored_holdings(ticker):
-    rows = _select_all("etf_holdings", "security_key, security_symbol, security_name, portfolio_pct",
+    rows = _select_all("etf_holdings", "security_key, security_symbol, security_name, portfolio_pct, shares",
                        "security_key", {"ticker": ticker})
     return {r["security_key"]: r for r in rows}
 
@@ -268,6 +278,73 @@ def holdings_alert(fund, ticker, added, removed, n_small, n_positions, as_of):
     else:
         ftype = "ETF_HOLDINGS_REMOVED"
     return " ".join(parts), impact, ftype
+
+
+def weight_shifts(old, new_rows):
+    """
+    Positions held in both snapshots whose SHARE COUNT changed beyond the fund's
+    overall flow -- an active add or trim, or an index rebalance -- rather than
+    a weight that drifted with the price.
+
+    flow = median over all paired positions of new_shares / old_shares. Index
+    funds scale every line by the same creation/redemption factor, so a line
+    tracking `flow` was not traded; one 25%+ away from it was. A vendor switching
+    share units moves every line together and cancels out the same way.
+    -> [change dicts], largest weight move first
+    """
+    pairs = []
+    for k, n in new_rows.items():
+        o = old.get(k)
+        if not o:
+            continue
+        so, sn = fmp.num(o.get("shares")), fmp.num(n.get("shares"))
+        if not so or not sn or so <= 0 or sn <= 0:
+            continue
+        pairs.append((k, o, n, sn / so))
+    if len(pairs) < SHIFT_MIN_PAIRS:
+        return []
+    ratios = sorted(r for _, _, _, r in pairs)
+    mid = len(ratios) // 2
+    flow = ratios[mid] if len(ratios) % 2 else (ratios[mid - 1] + ratios[mid]) / 2
+    if flow <= 0:
+        return []
+    out = []
+    for k, o, n, r in pairs:
+        wo, wn = _w(o), _w(n)
+        if max(wo, wn) < SHIFT_MIN_WEIGHT:
+            continue
+        rel, dw = r / flow - 1.0, wn - wo
+        if abs(rel) < SHIFT_MIN_REL or abs(dw) < SHIFT_MIN_PTS or (rel > 0) != (dw > 0):
+            continue
+        c = {"security_key": k, "security_symbol": n.get("security_symbol") or o.get("security_symbol"),
+             "security_name": n.get("security_name") or o.get("security_name"),
+             "weight_prev": round(wo, 4), "weight_new": round(wn, 4),
+             "shares_vs_flow_pct": round(rel * 100, 1)}
+        if is_alertable_line(c):
+            out.append(c)
+    return sorted(out, key=lambda c: -abs(c["weight_new"] - c["weight_prev"]))
+
+
+def shift_alert(fund, ticker, shifts, n_positions, as_of):
+    """-> (summary, impact, filing_type)"""
+    def line(c):
+        return (f"{_label(c)} {c['weight_prev']:.2f}% -> {c['weight_new']:.2f}% of the fund "
+                f"(shares {'+' if c['shares_vs_flow_pct'] > 0 else ''}{c['shares_vs_flow_pct']:.0f}% "
+                f"beyond fund flows)")
+    up = [c for c in shifts if c["weight_new"] > c["weight_prev"]]
+    down = [c for c in shifts if c["weight_new"] < c["weight_prev"]]
+    parts = [f"{fund} ({ticker}) resized existing positions."]
+    for label, lst in (("Increased", up), ("Decreased", down)):
+        if lst:
+            shown = "; ".join(line(c) for c in lst[:LIST_LIMIT])
+            more = f"; and {len(lst) - LIST_LIMIT} more" if len(lst) > LIST_LIMIT else ""
+            parts.append(f"{label}: {shown}{more}.")
+    when = _fmt_as_of(as_of)
+    parts.append(f"The fund holds {n_positions} positions" + (f" as of {when}." if when else "."))
+    parts.append("Share counts are compared net of the fund's own creations and redemptions, "
+                 "so price moves alone do not trigger this.")
+    top = max(abs(c["weight_new"] - c["weight_prev"]) for c in shifts)
+    return " ".join(parts), ("HIGH" if top >= SHIFT_HIGH_PTS else "MEDIUM"), "ETF_WEIGHT_SHIFT"
 
 
 def expense_alert(fund, ticker, old, new):
@@ -487,6 +564,21 @@ def handle_holdings(ctx, ticker, fund, asset_class, raw, state, website, res):
                     res["alerts"] += 1
                     mark_changes_alerted(ticker, version)
 
+    if not baseline and ticker in ctx.watched and class_alerts_holdings(asset_class):
+        shifts = weight_shifts(old, rows)
+        if shifts:
+            summary, impact, ftype = shift_alert(fund, ticker, shifts, len(rows), as_of)
+            extra = {
+                "dedup_key": f"{SOURCE_PORTFOLIO}:{ticker}:{version}:shift",
+                "company_name": fund, "etf_ticker": ticker, "version_from": prev_version,
+                "version_to": version, "as_of": as_of, "positions": len(rows),
+                "shifts": [{"symbol": c["security_symbol"], "name": c["security_name"],
+                            "weight_prev": c["weight_prev"], "weight_new": c["weight_new"],
+                            "shares_vs_flow_pct": c["shares_vs_flow_pct"]} for c in shifts],
+            }
+            if emit_alert(ticker, SOURCE_PORTFOLIO, ftype, impact, summary, extra, website):
+                res["alerts"] += 1
+
     replace_holdings(ticker, kept, list(old), as_of)
     state.update(holdings_version=version, holdings_count=len(rows),
                  holdings_checked_at=_now_iso())
@@ -508,13 +600,19 @@ def handle_expense(ctx, ticker, fund, info, state, website, res):
     if confirmed and ticker in ctx.watched:
         old, new = confirmed
         summary, impact, ftype = expense_alert(fund, ticker, old, new)
+        fees = fee_extractor.latest(sb(), ticker)
+        fee_line = fee_extractor.breakdown_text(fees)
+        if fee_line:
+            summary += (f" Latest prospectus fee table ({fees.get('form') or 'SEC'}, filed "
+                        f"{fees.get('filing_date')}): {fee_line}.")
         # No date in the key: a crash between alert and state flush must not
         # let the same change re-confirm and alert again tomorrow. The 30-day
         # window still lets a genuine repeat of the same move alert later.
         extra = {"dedup_key": f"{SOURCE_EXPENSE}:{ticker}:{old}->{new}",
                  "company_name": fund, "etf_ticker": ticker,
                  "expense_ratio_old": old, "expense_ratio_new": new,
-                 "change_bp": round((new - old) * 100, 2)}
+                 "change_bp": round((new - old) * 100, 2),
+                 "fee_breakdown": ({f: fees.get(f) for f in fee_extractor.FIELDS} if fee_line else None)}
         if emit_alert(ticker, SOURCE_EXPENSE, ftype, impact, summary, extra, website,
                       within_days=EXPENSE_DEDUP_DAYS):
             res["alerts"] += 1

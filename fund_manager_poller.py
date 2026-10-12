@@ -725,6 +725,14 @@ def process_roster_filing(meta, watched, emit_diffs=True) -> dict:
     if not html:
         mark_processed(meta["accession"], "ROSTER", meta["cik"], meta["form"], meta["filing_date"], "NO_DOC")
         return {}
+    # Same document carries the inline-XBRL fee table: store the ETF expense
+    # breakdown while it is in hand (data only; never blocks the roster work).
+    try:
+        import etf_expense_extractor as fee
+        fee.store_from_filing(html, meta, load_universe(), [s["series_id"] for s in series], sb())
+        mark_processed(meta["accession"], "EXPENSE", meta["cik"], meta["form"], meta["filing_date"], "OK")
+    except Exception as e:
+        log_poller_error("expense_extract", e, {"accession": meta["accession"]})
     rosters = fx.extract_rosters(html, series, meta["filing_date"])
     rosters.pop("_unattributed", None)
     meta["detection"] = "ROSTER_DIFF"

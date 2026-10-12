@@ -163,10 +163,12 @@ FEATURES[WATCHLIST_HEATMAP_FEATURE] = {
 # features rather than one so each can be muted independently.
 FEATURES[14] = {
     "name": "ETF Portfolio & Expense Changes",
-    "detail": ("Holdings added to / removed from a watched ETF (>=0.5% of the fund) "
-               "and confirmed expense-ratio changes, from FMP. Rule-based, no LLM."),
+    "detail": ("Holdings added to / removed from a watched ETF (>=0.5% of the fund), existing "
+               "positions resized beyond fund flows, and confirmed expense-ratio changes (with the "
+               "prospectus fee breakdown), from FMP + SEC. Rule-based, no LLM."),
     "sources": {"ETF_PORTFOLIO", "ETF_EXPENSE"},
     "filing_types": {"ETF_HOLDINGS_ADDED", "ETF_HOLDINGS_REMOVED", "ETF_HOLDINGS_CHANGE",
+                     "ETF_WEIGHT_SHIFT",
                      "ETF_EXPENSE_INCREASE", "ETF_EXPENSE_DECREASE"},
     "market_wide": False,
 }
@@ -182,8 +184,11 @@ FEATURES[16] = {
     "name": "ETF Fund Actions",
     "detail": ("Liquidation, merger/reorganization, index or strategy change and fee "
                "change for watched ETFs — SEC 497 / N-14, AI-summarized."),
-    "sources": {"SEC_FUND"},
-    "filing_types": {"ETF_LIQUIDATION", "ETF_MERGER", "ETF_STRATEGY_CHANGE", "ETF_FEE_CHANGE"},
+    # ETF_LISTING: the fund dropped off Massive's list of trading tickers
+    # (etf_listing_poller) -- the market-side confirmation of a closure.
+    "sources": {"SEC_FUND", "ETF_LISTING"},
+    "filing_types": {"ETF_LIQUIDATION", "ETF_MERGER", "ETF_STRATEGY_CHANGE", "ETF_FEE_CHANGE",
+                     "ETF_DELISTED"},
     "market_wide": False,
 }
 
