@@ -189,23 +189,7 @@ def get_stock_by_ticker(ticker):
             return r.data[0]
     except Exception as e:
         log.error("[DB] stock lookup %s failed: %s", ticker, e)
-    return get_etf_by_ticker(ticker) or get_mf_by_ticker(ticker)
-
-
-def get_mf_by_ticker(ticker):
-    """A mutual fund share class from mf_master (SEC's fund registry), shaped
-    like a stocks row so /add treats it like anything else."""
-    try:
-        r = (supabase.table("mf_master").select("ticker, series_name, class_name, is_active")
-             .eq("ticker", ticker.upper()).limit(1).execute())
-    except Exception as e:
-        log.error("[DB] mutual fund lookup %s failed: %s", ticker, e)
-        return None
-    if not r.data or r.data[0].get("is_active") is False:
-        return None
-    row = r.data[0]
-    return {"ticker": row["ticker"], "name": row.get("series_name"),
-            "sector": f"Mutual Fund · {row.get('class_name') or 'Fund'}", "is_fund": True}
+    return get_etf_by_ticker(ticker)
 
 
 def search_stocks_by_prefix(prefix, limit=8):
@@ -225,16 +209,6 @@ def search_stocks_by_prefix(prefix, limit=8):
                      "exchange": e.get("exchange")} for e in (r.data or []) if e["ticker"] not in have]
         except Exception as e:
             log.error("[DB] etf search %s failed: %s", prefix, e)
-    if len(out) < limit:
-        try:
-            r = (supabase.table("mf_master").select("ticker, class_name")
-                 .ilike("ticker", f"{prefix.upper()}%").eq("is_active", True)
-                 .limit(limit - len(out)).execute())
-            have = {s.get("ticker") for s in out}
-            out += [{"ticker": m["ticker"], "sector": f"Mutual Fund · {m.get('class_name') or 'Fund'}",
-                     "exchange": None} for m in (r.data or []) if m["ticker"] not in have]
-        except Exception as e:
-            log.error("[DB] mutual fund search %s failed: %s", prefix, e)
     return out
 
 

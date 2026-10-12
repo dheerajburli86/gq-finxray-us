@@ -144,8 +144,6 @@ COMPANY_ONLY_SOURCES = {
     "ETF_SIGNAL",
     # ETF closures (etf_listing_poller): always about one watched fund.
     "ETF_LISTING",
-    # Mutual funds (Feature 18): always about one watched share class.
-    "MF_PORTFOLIO", "MF_EXPENSE",
 }
 COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 

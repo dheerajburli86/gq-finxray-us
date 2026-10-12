@@ -181,7 +181,7 @@ FEATURES[15] = {
     "market_wide": False,
 }
 FEATURES[16] = {
-    "name": "Fund Actions (ETF & Mutual Fund)",
+    "name": "ETF Fund Actions",
     "detail": ("Liquidation, merger/reorganization, index or strategy change and fee "
                "change for watched ETFs — SEC 497 / N-14, AI-summarized."),
     # ETF_LISTING: the fund dropped off Massive's list of trading tickers
@@ -189,17 +189,6 @@ FEATURES[16] = {
     "sources": {"SEC_FUND", "ETF_LISTING"},
     "filing_types": {"ETF_LIQUIDATION", "ETF_MERGER", "ETF_STRATEGY_CHANGE", "ETF_FEE_CHANGE",
                      "ETF_DELISTED"},
-    "market_wide": False,
-}
-
-FEATURES[18] = {
-    "name": "Mutual Fund Portfolio & Expense Changes",
-    "detail": ("Quarterly holdings added / exited / resized for watched mutual funds from SEC "
-               "Form N-PORT, and expense-ratio changes between prospectuses (SEC fee tables). "
-               "Rule-based, no LLM."),
-    "sources": {"MF_PORTFOLIO", "MF_EXPENSE"},
-    "filing_types": {"MF_HOLDINGS_ADDED", "MF_HOLDINGS_REMOVED", "MF_HOLDINGS_CHANGE",
-                     "MF_WEIGHT_SHIFT", "MF_EXPENSE_INCREASE", "MF_EXPENSE_DECREASE"},
     "market_wide": False,
 }
 

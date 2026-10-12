@@ -124,7 +124,6 @@ from etf_fund_events_poller import run_etf_fund_events_poller
 from etf_signals_poller import run_etf_signals
 from etf_listing_poller import run_etf_listing_poller
 from etf_expense_extractor import run_expense_backfill
-from mf_poller import refresh_mf_master, run_mf_holdings
 
 from feature_map import TOTAL_FEATURES
 
@@ -398,14 +397,6 @@ def run_scheduler():
     # Prospectus fee tables (management fee, waiver, gross/net) for ETFs that
     # have none yet; new prospectuses are read by the Feature 15 roster job.
     schedule.every().day.at("05:40").do(job(run_expense_backfill))
-
-    # ── Feature 18 — Mutual funds (SEC) ───────────────────────────────────────
-    # Scheme master first (it is what /add checks), then watched funds' newest
-    # public N-PORT. N-PORT is quarterly with up to 60 days' lag, so most days
-    # this finds nothing new and makes one request per watched registrant.
-    # Mutual-fund manager changes and fund actions run under Features 15 / 16.
-    schedule.every().day.at("05:20").do(job(refresh_mf_master))
-    schedule.every().day.at("08:40").do(job(run_mf_holdings))
 
     logger.info("[SCHEDULER] %d jobs registered across %d features",
                 len(schedule.jobs), TOTAL_FEATURES)

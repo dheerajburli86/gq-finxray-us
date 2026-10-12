@@ -16,10 +16,8 @@ Two entry points:
   run_expense_backfill()          daily: newest prospectus for ETF registrants
                                   that have no breakdown yet, a few per run
 
-ETFs: data only -- Feature 14 already alerts on expense-ratio changes (FMP),
-and the breakdown is added to that alert's text. Mutual funds have no daily
-expense feed, so a watched share class whose new prospectus fee table differs
-from its previous one alerts here (MF_EXPENSE, Feature 18).
+Data only: Feature 14 already alerts on expense-ratio changes, and Feature 16
+on fee-change filings. The breakdown is added to the Feature 14 alert text.
 """
 
 import logging
@@ -203,114 +201,26 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _in_table(sb, table, tickers):
+def _etf_tickers(sb, tickers):
     tickers, out = sorted(tickers), set()
-    try:
-        for i in range(0, len(tickers), 200):
-            rows = sb.table(table).select("ticker").in_("ticker", tickers[i:i + 200]).execute().data or []
-            out |= {r["ticker"] for r in rows}
-    except Exception:
-        return set()          # table not migrated yet: treat as none
+    for i in range(0, len(tickers), 200):
+        rows = sb.table("etf_master").select("ticker").in_("ticker", tickers[i:i + 200]).execute().data or []
+        out |= {r["ticker"] for r in rows}
     return out
 
 
-def _etf_tickers(sb, tickers):
-    return _in_table(sb, "etf_master", tickers)
-
-
 def store(sb, tables, meta):
-    """tables from extract_fee_tables; keeps ETFs and mutual funds. -> rows written"""
+    """tables from extract_fee_tables; keeps ETFs only. -> rows written"""
     if not tables:
         return 0
     etfs = _etf_tickers(sb, tables.keys())
-    mfs = _in_table(sb, "mf_master", set(tables) - etfs)
     rows = [dict({f: rec.get(f) for f in FIELDS}, ticker=t, series_id=rec.get("series_id"),
                  class_id=rec.get("class_id"), accession=meta["accession"], form=meta.get("form"),
                  filing_date=meta.get("filing_date"), source_url=meta.get("url"), extracted_at=_now())
-            for t, rec in tables.items() if t in etfs or t in mfs]
-    if mfs:
-        # fund_type exists only once the mutual-fund migration ran, which is
-        # also what makes mfs non-empty. Every row gets the key (PGRST102).
-        for r in rows:
-            r["fund_type"] = "MF" if r["ticker"] in mfs else "ETF"
+            for t, rec in tables.items() if t in etfs]
     for i in range(0, len(rows), 500):
         sb.table("etf_expense_breakdown").upsert(rows[i:i + 500], on_conflict="ticker,accession").execute()
     return len(rows)
-
-
-MF_FEE_MIN_DELTA = float(os.getenv("MF_FEE_MIN_DELTA", "0.005"))     # percentage points
-MF_FEE_HIGH_DELTA = float(os.getenv("MF_FEE_HIGH_DELTA", "0.10"))
-
-
-def mf_fee_alerts(sb, tables, meta, watched):
-    """
-    Mutual funds have no daily expense-ratio feed, so a change is read off the
-    prospectus itself: a watched share class whose new fee table differs from
-    the previous prospectus. Call BEFORE store() so "previous" is still the
-    older filing. -> alert rows written
-    """
-    from feature_map import tag_extra
-    cands = sorted(t for t in tables if t in watched)
-    if not cands:
-        return 0
-    mfs = _in_table(sb, "mf_master", cands)
-    names = {}
-    if mfs:
-        for r in sb.table("mf_master").select("ticker, series_name, class_name").in_("ticker", sorted(mfs)).execute().data or []:
-            names[r["ticker"]] = r
-    rows = []
-    for t in sorted(mfs):
-        new = tables[t]
-        prev = None
-        for r in (sb.table("etf_expense_breakdown").select("*").eq("ticker", t)
-                  .order("filing_date", desc=True).limit(5).execute().data or []):
-            if r.get("accession") != meta["accession"] and str(r.get("filing_date") or "") < str(meta.get("filing_date") or ""):
-                prev = r
-                break
-        if not prev:
-            continue                                   # first prospectus seen: baseline
-        field = "net_expense_ratio" if new.get("net_expense_ratio") is not None and prev.get("net_expense_ratio") is not None \
-            else "gross_expense_ratio"
-        a, b = prev.get(field), new.get(field)
-        if a is None or b is None or abs(float(b) - float(a)) < MF_FEE_MIN_DELTA:
-            continue
-        a, b = float(a), float(b)
-        up = b > a
-        key = f"MF_EXPENSE:{t}:{meta['accession']}"
-        try:
-            if sb.table("alerts").select("id").eq("extra->>dedup_key", key).limit(1).execute().data:
-                continue
-        except Exception:
-            continue                                   # ledger unreadable: fail closed
-        n = names.get(t) or {}
-        fund = " ".join(x for x in (n.get("series_name"), n.get("class_name")) if x) or t
-        kind = "net" if field == "net_expense_ratio" else "total"
-        line = breakdown_text(new)
-        summary = (f"{fund} ({t}) {'raised' if up else 'lowered'} its {kind} expense ratio from {a:.2f}% to "
-                   f"{b:.2f}% ({'+' if up else '-'}{abs(b - a) * 100:.0f} basis points), per its new prospectus "
-                   f"({meta.get('form')}, filed {meta.get('filing_date')}); the previous one was filed "
-                   f"{prev.get('filing_date')}. On $10,000 invested the annual cost moves from ${a * 100:,.2f} "
-                   f"to ${b * 100:,.2f}." + (f" Fee table: {line}." if line else ""))
-        ftype = "MF_EXPENSE_INCREASE" if up else "MF_EXPENSE_DECREASE"
-        extra = {"dedup_key": key, "headline": f"{fund}: expense ratio {'up' if up else 'down'} to {b:.2f}%",
-                 "company_name": fund, "expense_ratio_old": a, "expense_ratio_new": b,
-                 "fee_breakdown": {f: new.get(f) for f in FIELDS}, "accession": meta["accession"],
-                 "filed_at": _now()}
-        rows.append({"ticker": t, "summary": summary,
-                     "impact": "HIGH" if up and (b - a) >= MF_FEE_HIGH_DELTA else "MEDIUM",
-                     "source": "MF_EXPENSE", "filing_type": ftype, "delivered": False,
-                     "filing_url": meta.get("url"), "extra": tag_extra(extra, "MF_EXPENSE", ftype)})
-    if rows:
-        sb.table("alerts").insert(rows).execute()
-    return len(rows)
-
-
-def _watched():
-    try:
-        import fund_manager_poller as fm
-        return fm.watched_tickers()
-    except Exception:
-        return set()
 
 
 def latest(sb, ticker):
@@ -342,7 +252,6 @@ def store_from_filing(html, meta, universe, filing_series, sb):
     """Hook for fund_manager_poller: the prospectus is already downloaded."""
     by_class, by_series = _maps(universe)
     tables = _fill_ids(extract_fee_tables(html, by_class, by_series, filing_series), universe)
-    mf_fee_alerts(sb, tables, meta, _watched())
     return store(sb, tables, meta)
 
 
@@ -376,20 +285,14 @@ def run_expense_backfill(max_docs=None):
         if not u["by_ticker"]:
             return
         have = _paged_col(sb, "etf_expense_breakdown", "series_id")
-        # Every ETF series, plus the mutual funds someone watches (there are
-        # ~10,000 MF series; only watched ones need a baseline for alerts).
-        watched = _watched()
-        watched_mf = {v["series_id"] for t, v in u["by_ticker"].items()
-                      if t in watched and v.get("fund_type") == "MF"}
         missing_by_cik = {}
         for sid, v in u["by_series"].items():
-            if (v.get("fund_type") == "ETF" or sid in watched_mf) and sid not in have:
+            if v.get("fund_type") == "ETF" and sid not in have:
                 missing_by_cik.setdefault(v["cik"], set()).add(sid)
-        order = sorted(missing_by_cik, key=lambda c: (not (missing_by_cik[c] & watched_mf), c))
         cutoff = (date.today() - timedelta(days=BACKFILL_LOOKBACK_DAYS)).isoformat()
         by_class, by_series = _maps(u)
         written = docs = 0
-        for cik in order:
+        for cik in sorted(missing_by_cik):
             missing = missing_by_cik[cik]
             if budget <= 0:
                 break
@@ -416,7 +319,6 @@ def run_expense_backfill(max_docs=None):
                         continue                                  # transient; retried next run
                     docs += 1
                     tables = _fill_ids(extract_fee_tables(html, by_class, by_series, series), u)
-                    mf_fee_alerts(sb, tables, meta, watched)
                     n = store(sb, tables, meta)
                     written += n
                     missing -= {r.get("series_id") for r in tables.values()}

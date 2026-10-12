@@ -69,7 +69,6 @@ REQUIRED = {
     "run_etf_signals": 17,
     # ETF scheme master upkeep: closures alert under 16; fee tables feed 14.
     "run_etf_listing_poller": 16, "run_expense_backfill": 14,
-    "refresh_mf_master": 18, "run_mf_holdings": 18,
 }
 covered = set()
 for fn, fid in REQUIRED.items():
@@ -153,9 +152,6 @@ EMISSIONS = [
     ("ETF_SIGNAL", "ETF_DRAWDOWN_5"), ("ETF_SIGNAL", "ETF_DRAWDOWN_10"),
     ("ETF_SIGNAL", "ETF_DRAWDOWN_20"),
     ("ETF_PORTFOLIO", "ETF_WEIGHT_SHIFT"), ("ETF_LISTING", "ETF_DELISTED"),
-    ("MF_PORTFOLIO", "MF_HOLDINGS_ADDED"), ("MF_PORTFOLIO", "MF_HOLDINGS_REMOVED"),
-    ("MF_PORTFOLIO", "MF_HOLDINGS_CHANGE"), ("MF_PORTFOLIO", "MF_WEIGHT_SHIFT"),
-    ("MF_EXPENSE", "MF_EXPENSE_INCREASE"), ("MF_EXPENSE", "MF_EXPENSE_DECREASE"),
 ]
 tagged = set()
 for src, ft in EMISSIONS:
