@@ -444,6 +444,22 @@ n_f = len(FETCHED)
 MF.run_mf_holdings()
 check("and not downloaded again", not any("BQ1SU6" in u for u in FETCHED[n_f:]))
 
+
+# EDGAR lists the HTML rendering as the primary document; the XML sits beside it
+XSL = "xslFormNPORT-P_X01/primary_doc.xml"
+HDR["B-X-SU7"] = ["SU7"]
+db.tables["mf_master"].append({"ticker": "UAAGX", "cik": "555555", "series_id": "SU7", "fund_type": "MUTUAL_FUND",
+                               "is_active": True, "series_name": "Fund SU7"})
+SEC.docs[SUBS2] = {"filings": {"recent": {"form": ["NPORT-P"], "filingDate": ["2026-05-28"],
+                                          "accessionNumber": ["B-X-SU7"], "primaryDocument": [XSL]}}}
+SEC.docs[FM._archive(CIK2, "B-X-SU7", XSL)] = "<html><body><table><tr><td>Name</td></tr></table></body></html>"
+d2("B-X-SU7", nport("SU7", "2026-03-31", BASE))
+MF.run_mf_holdings()
+check("HTML-rendered primary document: the raw XML beside it is read",
+      any(r["series_id"] == "SU7" and r.get("accession") for r in db.rows("mf_holdings_state"))
+      and len([r for r in db.rows("mf_holdings") if r["series_id"] == "SU7"]) == len(BASE))
+check("the HTML page is not needed", not any(u.endswith(XSL) and "BXSU7" in u for u in FETCHED[-6:]))
+
 # recheck windows: after a full pass nothing is re-listed until they elapse
 MF.RECHECK_WATCHED_DAYS, MF.RECHECK_DAYS = 1, 3
 n_f = len(FETCHED)

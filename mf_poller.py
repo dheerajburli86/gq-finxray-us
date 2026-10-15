@@ -475,14 +475,22 @@ def process_series(series_id, tickers, filing, cik, sent, docs=None):
           .execute().data or [None])[0]
     if st and st.get("accession") == filing["accession"]:
         return 0                                   # already processed: no re-download
-    url = fm._archive(cik, filing["accession"], filing["primary_doc"] or "primary_doc.xml")
-    if docs is not None:
-        docs[0] -= 1
-    xml = fm.sec.text(url)
-    snap = parse_nport(xml) if xml else None
+    # EDGAR's submissions list the HTML rendering of an N-PORT
+    # ("xslFormNPORT-P_X01/primary_doc.xml"); the data is the plain XML beside it.
+    listed = filing["primary_doc"] or "primary_doc.xml"
+    raw = listed.rsplit("/", 1)[-1] or "primary_doc.xml"
+    snap = url = None
+    for name in ([raw] + ([listed] if listed != raw else [])):
+        url = fm._archive(cik, filing["accession"], name)
+        if docs is not None:
+            docs[0] -= 1
+        xml = fm.sec.text(url)
+        snap = parse_nport(xml) if xml else None
+        if snap and snap["holdings"]:
+            break
     if not snap or not snap["holdings"]:
-        fm.log_poller_error("mf_nport_parse", "empty or unreadable N-PORT", {"url": url})
-        _record_error(series_id, "empty or unreadable N-PORT")
+        fm.log_poller_error("mf_nport_parse", f"empty or unreadable N-PORT: {url}", {"url": url})
+        _record_error(series_id, f"empty or unreadable N-PORT: {url}")
         return 0
     if snap.get("series_id") and snap["series_id"] != series_id:
         return 0
