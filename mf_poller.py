@@ -54,6 +54,28 @@ LIST_LIMIT = 8
 DEDUP_DAYS = 200
 
 
+# fund_type in mf_master: which rows can produce portfolio alerts.
+#   MUTUAL_FUND  ordinary open-end funds                      -> alerts
+#   MONEY_MARKET stable-NAV funds; they file N-MFP, not N-PORT -> listed, no alerts
+#   INSURANCE    sold only inside annuities/policies           -> listed, no alerts
+INSURANCE_RE = re.compile(r"variable|separate account|college retirement|insurance (products|series|trust|fund)"
+                          r"|annuity|life insurance|\bVIT\b", re.I)
+MONEY_MARKET_RE = re.compile(r"money market|treasury (obligations|fund|money)|cash (reserves|management|trust)"
+                             r"|government (obligations|cash|money)|prime (obligations|fund|reserves)|liquidity"
+                             r"|municipal money|tax.exempt (money|cash)|reserve fund|sweep", re.I)
+ALERT_FUND_TYPES = ("MUTUAL_FUND",)
+RETIRE_MAX_FRACTION = 0.15            # more than this "gone" at once = a bad download
+
+
+def classify_mf(ticker, entity_name=None, series_name=None):
+    t = (ticker or "").upper()
+    if not (len(t) == 5 and t.endswith("X") and t.isalpha()) or INSURANCE_RE.search(entity_name or ""):
+        return "INSURANCE"
+    if MONEY_MARKET_RE.search(series_name or ""):
+        return "MONEY_MARKET"
+    return "MUTUAL_FUND"
+
+
 def sb():
     return fm.sb()
 
@@ -152,6 +174,7 @@ def master_rows(universe, names):
         n = names.get(v.get("class_id")) or names.get(v.get("series_id")) or {}
         rows.append({"ticker": t, "cik": v["cik"], "series_id": v["series_id"], "class_id": v.get("class_id"),
                      "entity_name": n.get("entity_name"), "series_name": n.get("series_name"),
+                     "fund_type": classify_mf(t, n.get("entity_name"), n.get("series_name")),
                      "class_name": n.get("class_name") if n.get("class_id") == v.get("class_id") else None,
                      "city": n.get("city"), "state": n.get("state"), "is_active": True, "updated_at": _now()})
     return rows
@@ -160,8 +183,19 @@ def master_rows(universe, names):
 def watched_mfs(universe=None):
     """{ticker: universe row} for watched tickers that are mutual funds."""
     u = universe or fm.load_universe()
-    return {t: u["by_ticker"][t] for t in fm.watched_tickers()
-            if t in u["by_ticker"] and u["by_ticker"][t].get("fund_type") == "MF"}
+    out = {t: u["by_ticker"][t] for t in fm.watched_tickers()
+           if t in u["by_ticker"] and u["by_ticker"][t].get("fund_type") == "MF"}
+    if not out:
+        return out
+    types = {}
+    ticks = sorted(out)
+    for i in range(0, len(ticks), 200):
+        for r in (sb().table("mf_master").select("ticker, fund_type").in_("ticker", ticks[i:i + 200])
+                  .execute().data or []):
+            types[r["ticker"]] = r.get("fund_type")
+    # Money market and insurance-only funds are listed so they can be found,
+    # but they have no N-PORT book to alert on. Unknown (not in mf_master yet) passes.
+    return {t: v for t, v in out.items() if types.get(t) in (None,) + ALERT_FUND_TYPES}
 
 
 def refresh_mf_master():
@@ -175,9 +209,15 @@ def refresh_mf_master():
         for i in range(0, len(rows), 1000):
             sb().table("mf_master").upsert(rows[i:i + 1000], on_conflict="ticker").execute()
         live = {r["ticker"] for r in rows}
-        stored = {r["ticker"] for r in _paged(lambda: sb().table("mf_master").select("ticker")
-                                               .eq("is_active", True).order("ticker"))}
+        # Insurance-only funds may be absent from the registry; they are never retired here.
+        stored = {r["ticker"] for r in _paged(lambda: sb().table("mf_master").select("ticker, fund_type")
+                                               .eq("is_active", True).order("ticker"))
+                  if r.get("fund_type") != "INSURANCE"}
         gone = sorted(stored - live)
+        if stored and len(gone) > RETIRE_MAX_FRACTION * len(stored):
+            fm.log_poller_error("refresh_mf_master", f"{len(gone)} of {len(stored)} funds missing from the "
+                                "registry -- looks like a bad download, retiring none")
+            gone = []
         for i in range(0, len(gone), 100):
             sb().table("mf_master").update({"is_active": False}).in_("ticker", gone[i:i + 100]).execute()
         enriched = enrich_watched(u)

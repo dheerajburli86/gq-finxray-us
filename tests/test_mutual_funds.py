@@ -55,8 +55,13 @@ add_fund("VFIAX", "0000036405", "S000002839", "C000007773")
 add_fund("VFINX", "0000036405", "S000002839", "C000007772")
 add_fund("VTSAX", "0000036405", "S000002848", "C000007806")
 add_fund("SPY", "0000884394", "S000099999", "C000099999", "ETF")
+def _tk(i):                       # realistic mutual fund ticker: 4 letters + X
+    a = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return a[i // 17576 % 26] + a[i // 676 % 26] + a[i // 26 % 26] + a[i % 26] + "X"
+
+
 for i in range(6000):
-    add_fund(f"MF{i:04d}", "0000000777", f"S1{i:08d}", f"C1{i:08d}")
+    add_fund("Q" + _tk(i)[1:], "0000000777", f"S1{i:08d}", f"C1{i:08d}")
 FM.load_universe = lambda force=False: U
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -307,6 +312,47 @@ aud = delivery.resolve_audience({"source": "MF_PORTFOLIO", "filing_type": "MF_HO
 check("reaches watcher, mute honoured", sorted(u["user_id"] for u, _ in aud) == ["u1"])
 msg = str(alert_formatter.build_message(dict(db.rows("alerts")[0])))
 check("renders", "Feature 18" in msg and "Fund Portfolio Changes" in msg, msg[:300])
+
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n=== 8. FUND TYPES: WHICH FUNDS CAN ALERT ===")
+check("ordinary fund", MF.classify_mf("VFIAX", "VANGUARD INDEX FUNDS", "Vanguard 500 Index Fund") == "MUTUAL_FUND")
+check("insurance portfolio ticker shape", MF.classify_mf("VPVLDVV", "PIMCO VARIABLE INSURANCE TRUST", "PIMCO Low Duration") == "INSURANCE")
+check("variable insurance trust", MF.classify_mf("IAVGX", "VOYA VARIABLE INSURANCE TRUST", "Growth and Income") == "INSURANCE")
+check("money market", MF.classify_mf("ACTXX", "JANUS INVESTMENT FUND", "Janus Henderson Government Money Market Fund") == "MONEY_MARKET")
+check("sector fund named Insurance stays a mutual fund",
+      MF.classify_mf("FSPCX", "FIDELITY SELECT PORTFOLIOS", "Insurance Portfolio") == "MUTUAL_FUND")
+check("master rows carry fund_type", all(r["fund_type"] in ("MUTUAL_FUND", "MONEY_MARKET", "INSURANCE")
+                                          for r in MF.master_rows(U, {})))
+
+db.tables["mf_master"].extend([
+    {"ticker": "MMKTX", "cik": "9", "series_id": "SMM", "fund_type": "MONEY_MARKET", "is_active": True},
+    {"ticker": "INSVX", "cik": "9", "series_id": "SIN", "fund_type": "INSURANCE", "is_active": True},
+    {"ticker": "NEWWX", "cik": "9", "series_id": "SNEW", "is_active": True}])
+for t_, sid_ in (("MMKTX", "SMM"), ("INSVX", "SIN"), ("NEWWX", "SNEW")):
+    add_fund(t_, "0000000009", sid_, "C" + sid_)
+WATCH |= {"MMKTX", "INSVX", "NEWWX"}
+w = MF.watched_mfs(U)
+check("money market and insurance funds are not polled", "MMKTX" not in w and "INSVX" not in w, sorted(w))
+check("ordinary and not-yet-listed funds are polled", {"VFIAX", "VTSAX", "NEWWX"} <= set(w), sorted(w))
+
+# retirement safety: a short registry read must not wipe the list
+db.tables["mf_master"] = [r for r in db.rows("mf_master") if r["ticker"] not in ("OLDMF2",)]
+db.tables["mf_master"].append({"ticker": "OLDMF2", "cik": "1", "series_id": "S9", "fund_type": "MUTUAL_FUND", "is_active": True})
+db.tables["mf_master"].append({"ticker": "OLDINX", "cik": "1", "series_id": "S8", "fund_type": "INSURANCE", "is_active": True})
+FM.load_universe = lambda force=False: U
+MF.refresh_mf_master()
+m2 = {r["ticker"]: r for r in db.rows("mf_master")}
+check("closed ordinary fund retired", m2["OLDMF2"]["is_active"] is False)
+check("insurance fund absent from registry is not retired", m2["OLDINX"]["is_active"] is True)
+part = {"by_ticker": dict(list(U["by_ticker"].items())[:5100]), "by_series": {}, "ciks": set()}
+for r in db.rows("mf_master"):
+    r["is_active"] = True
+FM.load_universe = lambda force=False: part
+MF.refresh_mf_master()
+live = sum(1 for r in db.rows("mf_master") if r["is_active"] and r.get("fund_type") != "INSURANCE")
+check("registry missing >15% of funds: retires none", live == sum(1 for r in db.rows("mf_master") if r.get("fund_type") != "INSURANCE"), live)
+FM.load_universe = lambda force=False: U
+WATCH -= {"MMKTX", "INSVX", "NEWWX"}
 
 print()
 if failures:

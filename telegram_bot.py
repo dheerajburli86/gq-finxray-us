@@ -196,7 +196,7 @@ def get_mf_by_ticker(ticker):
     """A mutual fund share class from mf_master (SEC's fund registry), shaped
     like a stocks row so /add treats it like anything else."""
     try:
-        r = (supabase.table("mf_master").select("ticker, series_name, class_name, is_active")
+        r = (supabase.table("mf_master").select("ticker, series_name, class_name, is_active, fund_type")
              .eq("ticker", ticker.upper()).limit(1).execute())
     except Exception as e:
         log.error("[DB] mutual fund lookup %s failed: %s", ticker, e)
@@ -204,8 +204,9 @@ def get_mf_by_ticker(ticker):
     if not r.data or r.data[0].get("is_active") is False:
         return None
     row = r.data[0]
+    kind = {"MONEY_MARKET": "Money Market Fund", "INSURANCE": "Insurance Fund"}.get(row.get("fund_type"), "Mutual Fund")
     return {"ticker": row["ticker"], "name": row.get("series_name"),
-            "sector": f"Mutual Fund · {row.get('class_name') or 'Fund'}", "is_fund": True}
+            "sector": f"{kind} · {row.get('class_name') or 'Fund'}", "is_fund": True}
 
 
 def search_stocks_by_prefix(prefix, limit=8):

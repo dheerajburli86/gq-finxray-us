@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS public.mf_master (
     class_name      TEXT,          -- share class, e.g. "Admiral Shares"
     city            TEXT,
     state           TEXT,
+    fund_type       TEXT,          -- MUTUAL_FUND | MONEY_MARKET | INSURANCE (only MUTUAL_FUND alerts)
     fund_family     TEXT,          -- FMP, when it covers the fund
     category        TEXT,          -- FMP asset class / category
     aum             NUMERIC,
