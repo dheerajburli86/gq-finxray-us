@@ -406,6 +406,10 @@ def run_scheduler():
     # Mutual-fund manager changes and fund actions run under Features 15 / 16.
     schedule.every().day.at("05:20").do(job(refresh_mf_master))
     schedule.every().day.at("08:40").do(job(run_mf_holdings))
+    # Every ordinary mutual fund's holdings are stored (not just watched ones), a
+    # few thousand documents per run, so a second pass finishes the first fill in
+    # days. Both passes are rate-limited through the shared SEC window.
+    schedule.every().day.at("21:40").do(job(run_mf_holdings))
 
     logger.info("[SCHEDULER] %d jobs registered across %d features",
                 len(schedule.jobs), TOTAL_FEATURES)

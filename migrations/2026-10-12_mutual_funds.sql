@@ -78,6 +78,8 @@ CREATE TABLE IF NOT EXISTS public.mf_holdings_state (
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE public.mf_holdings_state ADD COLUMN IF NOT EXISTS last_error TEXT;
+
 CREATE TABLE IF NOT EXISTS public.mf_holdings_changes (
     id            BIGSERIAL PRIMARY KEY,
     series_id     TEXT NOT NULL,

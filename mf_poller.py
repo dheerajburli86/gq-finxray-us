@@ -27,6 +27,7 @@ import io
 import logging
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET_XML
 from datetime import date, datetime, timedelta, timezone
 
@@ -43,8 +44,13 @@ SERIES_CLASS_BASE = "https://www.sec.gov/files/investment/data/other/"
 MIN_MF_TICKERS = 5000
 FMP_REFRESH_DAYS = 7
 NPORT_LOOKBACK_DAYS = 200
-HEADER_BUDGET = 300                   # filing headers read per run
-MAX_STORED = 1000                     # heaviest positions kept per fund
+HEADER_BUDGET = 2500                  # filing headers read per run
+DOC_BUDGET = 1500                     # N-PORT documents downloaded per run
+RUN_SECONDS = 90 * 60                 # stop a run after this long, resume next run
+RECHECK_WATCHED_DAYS = 1              # how often a registrant with a watched fund is re-listed
+RECHECK_DAYS = 3                      # ... and any other registrant
+ERROR_RETRY_DAYS = 7                  # a fund whose filing could not be read waits this long
+MAX_STORED = 500                      # heaviest positions kept per fund
 ALERT_MIN_WEIGHT = 0.5                # percent of net assets
 ALERT_HIGH_WEIGHT = 5.0
 MAX_CHURN = 0.6
@@ -166,13 +172,21 @@ def fetch_series_class():
     return {}
 
 
+def _cik_plain(cik):
+    """mf_master keeps CIKs without leading zeros; SEC URLs want them padded."""
+    try:
+        return str(int(cik))
+    except (TypeError, ValueError):
+        return str(cik)
+
+
 def master_rows(universe, names):
     rows = []
     for t, v in universe["by_ticker"].items():
         if v.get("fund_type") != "MF":
             continue
         n = names.get(v.get("class_id")) or names.get(v.get("series_id")) or {}
-        rows.append({"ticker": t, "cik": v["cik"], "series_id": v["series_id"], "class_id": v.get("class_id"),
+        rows.append({"ticker": t, "cik": _cik_plain(v["cik"]), "series_id": v["series_id"], "class_id": v.get("class_id"),
                      "entity_name": n.get("entity_name"), "series_name": n.get("series_name"),
                      "fund_type": classify_mf(t, n.get("entity_name"), n.get("series_name")),
                      "class_name": n.get("class_name") if n.get("class_id") == v.get("class_id") else None,
@@ -397,7 +411,7 @@ def build_alert(fund, ticker, d, rep_date, filing_date, debt):
 
 
 # ── N-PORT discovery ─────────────────────────────────────────────────────────
-def nport_filings(cik, budget):
+def nport_filings(cik, budget, incomplete=None):
     """Recent public N-PORT filings of one registrant -> [{accession, series_ids,
     filing_date, primary_doc}], newest first. Series membership is read once
     per filing from its header and kept in mf_nport_filings."""
@@ -417,6 +431,8 @@ def nport_filings(cik, budget):
                   .in_("accession", acc[i:i + 100]).execute().data or []):
             known[r["accession"]] = r.get("series_ids") or []
     for c in cands:
+        if c["accession"] not in known and budget[0] <= 0 and incomplete is not None:
+            incomplete.append(c["accession"])           # header not read: series membership unknown
         if c["accession"] not in known and budget[0] > 0:
             budget[0] -= 1
             sids = [s["series_id"] for s in fm.fetch_series_header(cik, c["accession"])]
@@ -437,17 +453,36 @@ def load_sent():
     return {(r.get("extra") or {}).get("dedup_key") for r in rows} - {None}
 
 
-def process_series(series_id, tickers, filing, cik, sent):
-    """One new N-PORT for one watched series. -> alerts written"""
+def _record_error(series_id, message):
+    try:
+        sb().table("mf_holdings_state").upsert(
+            {"series_id": series_id, "checked_at": _now(), "last_error": str(message)[:200]},
+            on_conflict="series_id").execute()
+    except Exception as e:                     # never let bookkeeping stop a run
+        fm.log_poller_error("mf_record_error", e, {"series_id": series_id})
+
+
+def touch_checked(series_ids):
+    rows = [{"series_id": s, "checked_at": _now()} for s in series_ids]
+    for i in range(0, len(rows), 500):
+        sb().table("mf_holdings_state").upsert(rows[i:i + 500], on_conflict="series_id").execute()
+
+
+def process_series(series_id, tickers, filing, cik, sent, docs=None):
+    """One new N-PORT for one series. Every ordinary fund is stored; alerts are
+    written only for `tickers` (the share classes somebody watches). -> alerts written"""
     st = (sb().table("mf_holdings_state").select("*").eq("series_id", series_id).limit(1)
           .execute().data or [None])[0]
     if st and st.get("accession") == filing["accession"]:
         return 0                                   # already processed: no re-download
     url = fm._archive(cik, filing["accession"], filing["primary_doc"] or "primary_doc.xml")
+    if docs is not None:
+        docs[0] -= 1
     xml = fm.sec.text(url)
     snap = parse_nport(xml) if xml else None
     if not snap or not snap["holdings"]:
         fm.log_poller_error("mf_nport_parse", "empty or unreadable N-PORT", {"url": url})
+        _record_error(series_id, "empty or unreadable N-PORT")
         return 0
     if snap.get("series_id") and snap["series_id"] != series_id:
         return 0
@@ -463,7 +498,7 @@ def process_series(series_id, tickers, filing, cik, sent):
             fm.log(f"{series_id}: {d['rebaseline']}")
         else:
             names = {r["ticker"]: r for r in (sb().table("mf_master").select("ticker, series_name, class_name")
-                                             .in_("ticker", sorted(tickers)).execute().data or [])}
+                                             .in_("ticker", sorted(tickers)).execute().data or [])} if tickers else {}
             debt = is_debt_fund(snap["holdings"])
             rows = []
             for t in sorted(tickers):
@@ -512,43 +547,114 @@ def process_series(series_id, tickers, filing, cik, sent):
     sb().table("mf_holdings_state").upsert(
         {"series_id": series_id, "accession": filing["accession"], "rep_date": snap["rep_date"],
          "net_assets": snap.get("net_assets"), "holdings_count": len(snap["holdings"]),
-         "checked_at": _now(), "updated_at": _now()}, on_conflict="series_id").execute()
+         "checked_at": _now(), "updated_at": _now(), "last_error": None}, on_conflict="series_id").execute()
     return written
 
 
-def run_mf_holdings():
-    """Daily. Only watched mutual funds are fetched; the first filing seen for a
-    fund is its silent baseline."""
+def mf_series_universe():
+    """{series_id: {"cik", "tickers"}} for every ordinary mutual fund in mf_master."""
+    rows = _paged(lambda: sb().table("mf_master").select("ticker, cik, series_id, fund_type")
+                  .eq("is_active", True).order("ticker"))
+    out = {}
+    for r in rows:
+        if r.get("fund_type") not in (None,) + ALERT_FUND_TYPES or not r.get("series_id"):
+            continue
+        out.setdefault(r["series_id"], {"cik": str(r["cik"]).zfill(10), "tickers": set()})["tickers"].add(r["ticker"])
+    return out
+
+
+def _due(state, watched, now):
+    """Has this fund's registrant waited long enough since we last looked?"""
+    at = (state or {}).get("checked_at")
+    if not at:
+        return True
     try:
+        t = datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    days = ERROR_RETRY_DAYS if (state or {}).get("last_error") else (RECHECK_WATCHED_DAYS if watched else RECHECK_DAYS)
+    return now - t >= timedelta(days=days)
+
+
+def _load_states():
+    try:
+        rows = _paged(lambda: sb().table("mf_holdings_state").select("series_id, checked_at, last_error")
+                      .order("series_id"))
+    except Exception:                      # last_error column not added yet
+        rows = _paged(lambda: sb().table("mf_holdings_state").select("series_id, checked_at").order("series_id"))
+    return {r["series_id"]: r for r in rows}
+
+
+def run_mf_holdings():
+    """Twice a day. Every ordinary mutual fund's newest public N-PORT is read and
+    stored (heaviest MAX_STORED positions), working through a few thousand
+    documents a run until all funds are covered, then re-checking each registrant
+    every few days. Funds somebody watches go first and are the only ones that
+    alert; the first filing seen for a fund is its silent baseline."""
+    try:
+        started = time.monotonic()
         u = fm.load_universe()
         watched = watched_mfs(u)
-        if not watched:
-            return
-        by_series = {}
+        watched_by_series = {}
         for t, v in watched.items():
-            by_series.setdefault(v["series_id"], {"cik": v["cik"], "tickers": set()})["tickers"].add(t)
-        sent = load_sent()
-        budget = [HEADER_BUDGET]
-        alerts = 0
+            watched_by_series.setdefault(v["series_id"], set()).add(t)
+        by_series = mf_series_universe()
+        for t, v in watched.items():                 # watched funds are covered even if mf_master lags
+            by_series.setdefault(v["series_id"], {"cik": str(v["cik"]).zfill(10), "tickers": set()})
+        if not by_series:
+            return
+        for sid, s_ in by_series.items():
+            s_["watched"] = watched_by_series.get(sid, set())
+        states = _load_states()
+        now = datetime.now(timezone.utc)
         by_cik = {}
-        for sid, v in by_series.items():
-            by_cik.setdefault(v["cik"], []).append(sid)
-        for cik, sids in sorted(by_cik.items()):
+        for sid, s_ in by_series.items():
+            by_cik.setdefault(s_["cik"], []).append(sid)
+
+        def cik_key(cik):
+            sids = by_cik[cik]
+            return (0 if any(by_series[x]["watched"] for x in sids) else 1,
+                    min(str((states.get(x) or {}).get("checked_at") or "") for x in sids))
+
+        order = [c for c in sorted(by_cik, key=cik_key)
+                 if any(_due(states.get(x), bool(by_series[x]["watched"]), now) for x in by_cik[c])]
+        sent = load_sent()
+        hb, docs = [HEADER_BUDGET], [DOC_BUDGET]
+        alerts = covered = registrants = 0
+        for cik in order:
+            if hb[0] <= 0 or docs[0] <= 0 or time.monotonic() - started > RUN_SECONDS:
+                break
+            incomplete = []
             try:
-                filings = nport_filings(cik, budget)
+                filings = nport_filings(cik, hb, incomplete)
             except Exception as e:
                 fm.log_poller_error("mf_nport_list", e, {"cik": cik})
                 continue
-            for sid in sids:
-                newest = next((f for f in filings if sid in (f.get("series_ids") or [])), None)
-                if not newest:
+            registrants += 1
+            handled = []
+            for sid in by_cik[cik]:
+                if not _due(states.get(sid), bool(by_series[sid]["watched"]), now):
                     continue
-                try:
-                    alerts += process_series(sid, by_series[sid]["tickers"], newest, cik, sent)
-                except Exception as e:
-                    fm.log_poller_error("mf_process_series", e, {"series_id": sid})
-        fm.log(f"mf holdings: {len(by_series)} watched funds, {alerts} alerts, "
-               f"{HEADER_BUDGET - budget[0]} filing headers read")
+                newest = next((f for f in filings if sid in (f.get("series_ids") or [])), None)
+                if newest:
+                    if docs[0] <= 0:
+                        break
+                    try:
+                        alerts += process_series(sid, by_series[sid]["watched"], newest, cik, sent, docs)
+                    except Exception as e:
+                        fm.log_poller_error("mf_process_series", e, {"series_id": sid})
+                        continue                     # not marked checked: retried next run
+                    handled.append(sid)
+                elif not incomplete:
+                    handled.append(sid)              # no public N-PORT yet; look again later
+            if handled:
+                touch_checked(handled)
+                covered += len(handled)
+        fm.log(f"mf holdings: {registrants}/{len(order)} due registrants, {covered} funds covered of "
+               f"{len(by_series)}, {alerts} alerts, {DOC_BUDGET - docs[0]} documents and "
+               f"{HEADER_BUDGET - hb[0]} headers read")
     except Exception as e:
         fm.log_poller_error("run_mf_holdings", e)
 

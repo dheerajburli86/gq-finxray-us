@@ -220,6 +220,9 @@ def doc(adsh, xml):
 
 
 db.tables["alerts"] = []
+# the 6,000 synthetic funds were only needed for the master refresh; keep the real ones here
+db.tables["mf_master"] = [r for r in db.rows("mf_master") if r["ticker"] in ("VFIAX", "VFINX", "VTSAX")]
+MF.RECHECK_WATCHED_DAYS = MF.RECHECK_DAYS = 0        # no waiting between runs in this section
 HDR.update({"A-Q1-500": ["S000002839"], "A-Q1-TSM": ["S000002848"], "A-Q2-500": ["S000002839"],
             "A-Q2-500-AMEND": ["S000002839"]})
 filings(("A-Q1-500", "2026-05-28", "NPORT-P"), ("A-Q1-TSM", "2026-05-28", "NPORT-P"), ("X", "2026-05-01", "N-CSR"))
@@ -227,7 +230,7 @@ doc("A-Q1-500", nport("S000002839", "2026-03-31", BASE))
 doc("A-Q1-TSM", nport("S000002848", "2026-03-31", BASE))
 MF.run_mf_holdings()
 check("first filing per fund is a silent baseline", db.rows("alerts") == [] and
-      {r["series_id"] for r in db.rows("mf_holdings_state")} == {"S000002839", "S000002848"})
+      {r["series_id"] for r in db.rows("mf_holdings_state") if r.get("accession")} == {"S000002839", "S000002848"})
 check("headers read once and cached", len(db.rows("mf_nport_filings")) == 2)
 n_hdr = len(FETCHED)
 MF.run_mf_holdings()
@@ -353,6 +356,101 @@ live = sum(1 for r in db.rows("mf_master") if r["is_active"] and r.get("fund_typ
 check("registry missing >15% of funds: retires none", live == sum(1 for r in db.rows("mf_master") if r.get("fund_type") != "INSURANCE"), live)
 FM.load_universe = lambda force=False: U
 WATCH -= {"MMKTX", "INSVX", "NEWWX"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n=== 9. SCRAPE EVERY ORDINARY FUND, ALERT ONLY WATCHED ===")
+CIK2 = "0000555555"
+SUBS2 = FM.URL_SUBMISSIONS.format(cik10=CIK2)
+MF.RECHECK_WATCHED_DAYS = MF.RECHECK_DAYS = 0
+db.tables["alerts"] = []
+db.tables["mf_master"] = [r for r in db.rows("mf_master") if r["ticker"] in ("VFIAX", "VFINX", "VTSAX")]
+for t_, sid_, ft_ in (("UAAAX", "SU1", "MUTUAL_FUND"), ("UAABX", "SU2", "MUTUAL_FUND"), ("UAACX", "SU3", "INSURANCE")):
+    db.tables["mf_master"].append({"ticker": t_, "cik": "555555", "series_id": sid_, "fund_type": ft_,
+                                   "is_active": True, "series_name": "Fund " + sid_})
+rows9 = []
+
+
+def f2(*rows):
+    SEC.docs[SUBS2] = {"filings": {"recent": {
+        "form": ["NPORT-P"] * len(rows), "filingDate": [r[1] for r in rows],
+        "accessionNumber": [r[0] for r in rows], "primaryDocument": ["primary_doc.xml"] * len(rows)}}}
+
+
+def d2(adsh, xml):
+    SEC.docs[FM._archive(CIK2, adsh, "primary_doc.xml")] = xml
+
+
+HDR.update({"B-Q1-SU1": ["SU1"], "B-Q1-SU2": ["SU2"], "B-Q1-SU3": ["SU3"]})
+f2(("B-Q1-SU1", "2026-05-28"), ("B-Q1-SU2", "2026-05-28"), ("B-Q1-SU3", "2026-05-28"))
+for sid_ in ("SU1", "SU2", "SU3"):
+    d2(f"B-Q1-{sid_}", nport(sid_, "2026-03-31", BASE))
+alerts_before = len(db.rows("alerts"))
+MF.run_mf_holdings()
+have = {r["series_id"] for r in db.rows("mf_holdings_state") if r.get("accession")}
+check("unwatched funds are scraped and baselined", {"SU1", "SU2"} <= have, sorted(have))
+check("their holdings are stored", len([r for r in db.rows("mf_holdings") if r["series_id"] == "SU1"]) == len(BASE))
+check("insurance-only fund never downloaded", not any("BQ1SU3" in u for u in FETCHED))
+check("no alerts for unwatched funds", len(db.rows("alerts")) == alerts_before)
+
+q2b = [r for r in BASE if r[0] != "CO10"] + [("NEWCO", "123456789", "US1234567890", "NW", 500.0, 3.0, "EC")]
+HDR["B-Q2-SU1"] = ["SU1"]
+f2(("B-Q2-SU1", "2026-08-28"), ("B-Q1-SU1", "2026-05-28"), ("B-Q1-SU2", "2026-05-28"), ("B-Q1-SU3", "2026-05-28"))
+d2("B-Q2-SU1", nport("SU1", "2026-06-30", q2b))
+MF.run_mf_holdings()
+check("unwatched change: recorded for display, no alert",
+      any(c["series_id"] == "SU1" for c in db.rows("mf_holdings_changes")) and len(db.rows("alerts")) == alerts_before)
+add_fund("UAAAX", CIK2, "SU1", "CSU1")          # the registry lists it; now somebody watches it
+WATCH.add("UAAAX")
+HDR["B-Q3-SU1"] = ["SU1"]
+f2(("B-Q3-SU1", "2026-11-25"), ("B-Q2-SU1", "2026-08-28"), ("B-Q1-SU2", "2026-05-28"), ("B-Q1-SU3", "2026-05-28"))
+d2("B-Q3-SU1", nport("SU1", "2026-09-30", [r for r in q2b if r[0] != "CO9"]))
+MF.run_mf_holdings()
+got = [a for a in db.rows("alerts") if a["ticker"] == "UAAAX"]
+check("once watched, the next filing alerts", len(got) == 1 and got[0]["extra"]["feature_id"] == 18, got)
+WATCH.discard("UAAAX")
+
+# budgets: one document per run, the rest wait for the next run
+for t_, sid_ in (("UAADX", "SU4"), ("UAAEX", "SU5")):
+    db.tables["mf_master"].append({"ticker": t_, "cik": "555555", "series_id": sid_, "fund_type": "MUTUAL_FUND",
+                                   "is_active": True, "series_name": "Fund " + sid_})
+    HDR[f"B-Q1-{sid_}"] = [sid_]
+    d2(f"B-Q1-{sid_}", nport(sid_, "2026-03-31", BASE))
+f2(("B-Q3-SU1", "2026-11-25"), ("B-Q1-SU2", "2026-05-28"), ("B-Q1-SU3", "2026-05-28"),
+   ("B-Q1-SU4", "2026-05-28"), ("B-Q1-SU5", "2026-05-28"))
+MF.DOC_BUDGET = 1
+
+
+def stored(sid_):
+    return any(r["series_id"] == sid_ and r.get("accession") for r in db.rows("mf_holdings_state"))
+
+
+MF.run_mf_holdings()
+check("document budget: one new fund this run", sum(stored(x) for x in ("SU4", "SU5")) == 1)
+MF.run_mf_holdings()
+check("the rest on the next run", stored("SU4") and stored("SU5"))
+MF.DOC_BUDGET = 1500
+
+# an unreadable filing is remembered and not hammered
+db.tables["mf_master"].append({"ticker": "UAAFX", "cik": "555555", "series_id": "SU6", "fund_type": "MUTUAL_FUND",
+                               "is_active": True, "series_name": "Fund SU6"})
+HDR["B-Q1-SU6"] = ["SU6"]
+d2("B-Q1-SU6", "this is not xml")
+f2(("B-Q3-SU1", "2026-11-25"), ("B-Q1-SU2", "2026-05-28"), ("B-Q1-SU3", "2026-05-28"),
+   ("B-Q1-SU4", "2026-05-28"), ("B-Q1-SU5", "2026-05-28"), ("B-Q1-SU6", "2026-05-28"))
+MF.run_mf_holdings()
+st6 = next(r for r in db.rows("mf_holdings_state") if r["series_id"] == "SU6")
+check("unreadable filing: error remembered", st6.get("last_error") and not st6.get("accession"), st6)
+n_f = len(FETCHED)
+MF.run_mf_holdings()
+check("and not downloaded again", not any("BQ1SU6" in u for u in FETCHED[n_f:]))
+
+# recheck windows: after a full pass nothing is re-listed until they elapse
+MF.RECHECK_WATCHED_DAYS, MF.RECHECK_DAYS = 1, 3
+n_f = len(FETCHED)
+MF.run_mf_holdings()
+check("inside the recheck window: no requests to SEC",
+      not [u for u in FETCHED[n_f:] if SUBS2 in u or "primary_doc" in u], FETCHED[n_f:])
+MF.RECHECK_WATCHED_DAYS = MF.RECHECK_DAYS = 0
 
 print()
 if failures:
