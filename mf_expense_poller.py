@@ -147,8 +147,10 @@ def build_alert(fund_name, family, ticker, class_name, prev, new, field, meta):
     kind = "net" if field == "net_expense_ratio" else "total"
     cls = f" {class_name}" if class_name else ""
     parts = [
+        # `{b - a:+.2f}` already carries the sign. A second literal "+" in front
+        # of it rendered every increase as "(++0.07 points)" in the live alert.
         f"{fund_name}{cls} ({ticker}) {'raised' if up else 'lowered'} its {kind} expense ratio "
-        f"from {a:.2f}% to {b:.2f}% ({'+' if up else ''}{b - a:+.2f} points).",
+        f"from {a:.2f}% to {b:.2f}% ({b - a:+.2f} points).",
         f"On $10,000 invested the annual cost moves from ${a * 100:,.2f} to ${b * 100:,.2f}.",
     ]
     bd = ft.breakdown_text(new)

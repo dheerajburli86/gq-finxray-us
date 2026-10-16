@@ -365,6 +365,112 @@ for fn in ("run_mf_manager_events", "run_mf_manager_rosters", "run_mf_manager_ba
 check("the scheme diff runs after the register refresh",
       src.index('at("05:20").do(job(refresh_mf_master))') < src.index('do(job(run_mf_scheme_poll))'))
 
+print("\n15. Regressions found by the 2026-10-16 deep debug")
+
+# (a) The delta already carries its own sign. A literal "+" in front of a
+# "+.2f" rendered every increase to the holder as "(++0.07 points)".
+_s, _i, _t = FEE.build_alert(
+    "American Balanced Fund", "American Funds", "ABALX", "Class A",
+    {"net_expense_ratio": 0.55, "filing_date": "2025-10-01"},
+    {"net_expense_ratio": 0.62}, "net_expense_ratio",
+    {"accession": "a", "form": "485BPOS", "filing_date": "2026-10-16", "url": "u"})
+check("a fee increase renders one sign, not two", "++" not in _s,
+      [w for w in _s.split() if "++" in w])
+check("the increase still shows the delta", "+0.07" in _s, _s[:90])
+check("and the cost on $10,000 is right", "$55.00" in _s and "$62.00" in _s)
+
+# (b) The effective date must come from an event that actually HAS one.
+# Testing the flag alone picked the first event whose flag was merely absent,
+# whose effective_date is None, so "effective November 1" was announced to
+# holders as effective on the filing date.
+mc._uni_cache.clear()
+mc._uni_at.clear()
+_db = FakeDB()
+mc.sb = lambda: _db
+_db.tables["mf_master"] = [
+    {"ticker": "FGRIX", "cik": "35315", "series_id": "S000007080", "class_id": "C1",
+     "entity_name": "Fidelity", "series_name": "Growth & Income", "class_name": "",
+     "fund_type": "MUTUAL_FUND", "is_active": True}]
+_meta = {"accession": "0000035315-26-000123", "cik": "35315", "form": "497",
+         "filing_date": "2026-10-16", "url": "https://sec.gov/x.htm",
+         "series_names": {"S000007080": "Growth & Income"}, "detection": "STICKER_497"}
+MGR.emit("S000007080",
+         # The addition sorts first and carries NO effective date at all.
+         [{"event_type": "ADDED", "manager": "Alice Ng", "manager_key": "alice ng"},
+          {"event_type": "REMOVED", "manager": "John Doe", "manager_key": "john doe",
+           "effective_date": "2026-11-01", "effective_date_is_filing_date": False}],
+         _meta, {"FGRIX"})
+_rows = _db.table("alerts").select("*").execute().data
+check("a stated effective date survives an undated event sorting first",
+      len(_rows) == 1 and _rows[0]["extra"].get("effective_date") == "2026-11-01",
+      _rows[0]["extra"].get("effective_date") if _rows else "no alert")
+check("and the holder reads that date, not the filing date",
+      _rows and "Nov 01, 2026" in _rows[0]["summary"],
+      _rows[0]["summary"][:140] if _rows else "")
+
+# (c) A cosmetic edit between two vintages of SEC's register must not reach a
+# holder as "your fund was renamed" to what reads as the same name.
+for _a, _b in (("Gamma Advisors, Inc.", "Gamma Advisors Inc"),
+               ("Alpha-Beta Fund", "Alpha Beta Fund"),
+               ("A.B.C. Fund", "ABC Fund"),
+               ("ABC Fund", "abc  fund")):
+    check(f"cosmetic register edit is not a rename: {_a!r} -> {_b!r}",
+          SCH._same_name(_a, _b))
+for _a, _b in (("Alpha Growth Fund", "Alpha Value Fund"),
+               ("Growth Fund", "Growth Fund II"),
+               ("Income Fund A", "Income Fund B"),
+               ("Gamma Advisors", "Gamma Capital LLC")):
+    check(f"a real rename is still caught: {_a!r} -> {_b!r}",
+          not SCH._same_name(_a, _b))
+check("a punctuation-only fund rename produces no diff",
+      SCH.diff_register(
+          {"X": {"ticker": "X", "series_id": "S", "series_name": "A.B.C. Fund",
+                 "entity_name": "Advisors, Inc."}},
+          {"X": {"ticker": "X", "series_id": "S", "series_name": "ABC Fund",
+                 "entity_name": "Advisors Inc"}}) == {
+          "added": [], "retired": [], "renamed": [], "families": []})
+
+# (d) The universe cache is keyed on the fund-type filter. mf_scheme_poller
+# asks for every type; a single-slot cache then handed that whole-register
+# result to the next poller that wanted ordinary funds only, making
+# money-market and insurance-dedicated funds alertable.
+mc._uni_cache.clear()
+mc._uni_at.clear()
+_db2 = FakeDB()
+mc.sb = lambda: _db2
+_db2.tables["mf_master"] = [
+    {"ticker": "ORDIN", "cik": "1", "series_id": "S1", "class_id": "C1", "entity_name": "E",
+     "series_name": "Ordinary", "class_name": "", "fund_type": "MUTUAL_FUND", "is_active": True},
+    {"ticker": "MMFXX", "cik": "1", "series_id": "S2", "class_id": "C2", "entity_name": "E",
+     "series_name": "Cash Reserves", "class_name": "", "fund_type": "MONEY_MARKET",
+     "is_active": True}]
+check("the default universe is ordinary funds only",
+      set(mc.load_mf_universe(force=True)["by_ticker"]) == {"ORDIN"})
+check("types=None deliberately sees the whole register",
+      set(mc.load_mf_universe(force=True, types=None)["by_ticker"]) == {"ORDIN", "MMFXX"})
+check("and that does NOT leak into the next default call",
+      set(mc.load_mf_universe()["by_ticker"]) == {"ORDIN"},
+      sorted(mc.load_mf_universe()["by_ticker"]))
+
+# (e) fanout_group identifies one event. Falling back to filing_type made
+# delivery drop the second of two unrelated funds in the same cycle as
+# "same_event_other_ticker".
+_db3 = FakeDB()
+mc.sb = lambda: _db3
+mc.emit_alerts("MF_FEE", ["AAA"], "s1", "HIGH", "MF_EXPENSE_INCREASE", {})
+mc.emit_alerts("MF_FEE", ["BBB"], "s2", "HIGH", "MF_EXPENSE_INCREASE", {})
+_g = [r["extra"].get("fanout_group") for r in _db3.table("alerts").select("*").execute().data]
+check("no event key -> no fanout_group, so two funds are not collapsed",
+      _g == [None, None], _g)
+_db4 = FakeDB()
+mc.sb = lambda: _db4
+mc.emit_alerts("MF_FEE", ["AAA", "BBB"], "s", "HIGH", "MF_EXPENSE_INCREASE",
+               {}, dedup_key="evt-1")
+_g4 = {r["extra"].get("fanout_group")
+       for r in _db4.table("alerts").select("*").execute().data}
+check("one event across two share classes shares one fanout_group",
+      _g4 == {"evt-1"}, _g4)
+
 print()
 if failures:
     print(f"FAILURES ({len(failures)}): " + ", ".join(failures))

@@ -306,8 +306,14 @@ def recent_filings(cik, forms, days_back):
 # Universe — mutual funds only, straight out of mf_master
 # ─────────────────────────────────────────────────────────────────────────────
 
-_uni_cache: dict | None = None
-_uni_at = 0.0
+# Keyed on the fund-type filter, NOT just on time. mf_scheme_poller calls this
+# with types=None because a money-market class appearing in SEC's register is
+# still a register change; a single-slot cache then handed that whole-register
+# result to the next poller that asked for ordinary funds only, and for up to
+# MF_UNIVERSE_TTL seconds money-market and insurance-dedicated funds were
+# alertable — exactly what ALERTABLE_TYPES exists to prevent.
+_uni_cache: dict[tuple, dict] = {}
+_uni_at: dict[tuple, float] = {}
 UNIVERSE_TTL = float(os.getenv("MF_UNIVERSE_TTL", "900"))
 
 
@@ -315,14 +321,17 @@ def load_mf_universe(force: bool = False, types=ALERTABLE_TYPES) -> dict:
     """
     {"by_ticker": {TICKER: row}, "by_series": {S000…: {...tickers}}, "by_cik": {cik: [series]}}
 
-    `types` is which fund_type rows to include. A row whose fund_type is NULL
-    predates the classifier and is treated as an ordinary fund, which is the
-    same rule mf_poller uses — a fund is only excluded once it has actually
-    been classified as money-market or insurance-dedicated.
+    `types` is which fund_type rows to include, and is part of the cache key.
+    A row whose fund_type is NULL predates the classifier and is treated as an
+    ordinary fund, which is the same rule mf_poller uses — a fund is only
+    excluded once it has actually been classified as money-market or
+    insurance-dedicated.
     """
     global _uni_cache, _uni_at
-    if _uni_cache is not None and not force and (time.monotonic() - _uni_at) < UNIVERSE_TTL:
-        return _uni_cache
+    ckey = tuple(sorted(types)) if types else ()
+    if (not force and ckey in _uni_cache
+            and (time.monotonic() - _uni_at.get(ckey, 0.0)) < UNIVERSE_TTL):
+        return _uni_cache[ckey]
     rows = paged(lambda: sb().table("mf_master")
                  .select("ticker,cik,series_id,class_id,entity_name,series_name,class_name,fund_type")
                  .eq("is_active", True).order("ticker"))
@@ -344,10 +353,10 @@ def load_mf_universe(force: bool = False, types=ALERTABLE_TYPES) -> dict:
         if r.get("class_id"):
             s["class_ids"].append(r["class_id"])
         by_cik.setdefault(r["cik"], set()).add(sid)
-    _uni_cache = {"by_ticker": by_ticker, "by_series": by_series,
-                  "by_cik": {k: sorted(v) for k, v in by_cik.items()}}
-    _uni_at = time.monotonic()
-    return _uni_cache
+    _uni_cache[ckey] = {"by_ticker": by_ticker, "by_series": by_series,
+                        "by_cik": {k: sorted(v) for k, v in by_cik.items()}}
+    _uni_at[ckey] = time.monotonic()
+    return _uni_cache[ckey]
 
 
 def watched_tickers() -> set[str]:
@@ -460,11 +469,21 @@ def emit_alerts(source, tickers, summary, impact, filing_type, extra, url=None,
     body = dict(extra or {})
     if dedup_key:
         body["dedup_key"] = dedup_key
+        # fanout_group identifies ONE EVENT, so that a user watching two share
+        # classes covered by the same filing is sent one message rather than
+        # two. It must never fall back to filing_type: delivery skips any later
+        # alert whose (user, group) it has already queued this cycle, so two
+        # unrelated funds both raising their fee in the same cycle would share
+        # the group "MF_EXPENSE_INCREASE" and the second fund's alert would be
+        # dropped as "same_event_other_ticker". With no event identity, no
+        # group — each alert is then delivered on its own, which is correct for
+        # a single-ticker alert.
+        body["fanout_group"] = dedup_key
     rows = [{
         "ticker": t, "summary": summary, "impact": impact, "source": source,
         "filing_type": filing_type, "delivered": False,
         "filing_url": url, "link": url,
-        "extra": tag_extra(dict(body, fanout_group=dedup_key or filing_type), source, filing_type),
+        "extra": tag_extra(body, source, filing_type),
     } for t in tickers]
     try:
         sb().table("alerts").insert(rows).execute()

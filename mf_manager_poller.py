@@ -229,8 +229,15 @@ def emit(series_id, new_events, meta, watched) -> int:
     removed = [e for e in new_events if e["event_type"] == "REMOVED"]
     roster, _ = current_roster(series_id)
     remaining = [r["manager_name"] for r in roster]
-    eff = next((e.get("effective_date") for e in new_events
-                if not e.get("effective_date_is_filing_date")), None) or meta["filing_date"]
+    # The first event carrying a REAL effective date the filing stated. Testing
+    # the flag alone picked the first event whose flag was merely absent, whose
+    # effective_date is then None -- so a supplement saying "effective November
+    # 1" was announced to holders as effective on its own filing date, because
+    # an unrelated addition happened to sort first in the list.
+    eff = next((e["effective_date"] for e in new_events
+                if e.get("effective_date")
+                and not e.get("effective_date_is_filing_date")),
+               None) or meta["filing_date"]
     name = meta.get("series_names", {}).get(series_id) or s.get("series_name") or series_id
     summary, impact, ftype = build_alert(name, s.get("entity_name"), added, removed,
                                          remaining, eff, meta)

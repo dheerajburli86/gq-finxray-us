@@ -77,8 +77,38 @@ def _err(job, e, ctx=None):
 
 
 def _norm_name(s):
-    """Compare names without being fooled by punctuation or case."""
-    return re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower()).strip()
+    """
+    Compare names without being fooled by punctuation, case or spacing.
+
+    The runs of whitespace MUST be collapsed. Replacing punctuation with a
+    space and stopping there left "A.B.C. Fund" as "a b c  fund" against "ABC
+    Fund" as "abc fund" -- so a registrant merely tidying the punctuation in a
+    fund or firm name read as a rename, and every holder was told their fund
+    had been renamed to the same name. The family variant was worse: one
+    "Advisors, Inc." -> "Advisors Inc" edit in the register fanned a
+    MF_FAMILY_CHANGE out to every watched ticker in the house.
+    """
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (s or "").lower())).strip()
+
+
+def _squash(s):
+    """Letters and digits only — "A.B.C. Fund" and "ABC Fund" both -> "abcfund"."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def _same_name(a, b) -> bool:
+    """
+    True when two register spellings are the same name.
+
+    Both forms are checked because neither alone is enough. The token form
+    ("gamma advisors inc") handles dropped commas and hyphens but splits a
+    de-dotted initialism; the squashed form ("abcfund") handles the initialism
+    but would ignore word boundaries on its own. A rename only alerts when the
+    name differs under BOTH, so a cosmetic edit between two vintages of SEC's
+    register — which happens on every refresh — never reaches a holder as
+    "your fund was renamed" to what reads as the same name.
+    """
+    return _norm_name(a) == _norm_name(b) or _squash(a) == _squash(b)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,13 +292,13 @@ def diff_register(old, new):
     retired = [old[t] for t in old if t not in new and old[t].get("is_active", True)]
     renamed = [(old[t], new[t]) for t in new
                if t in old and old[t].get("series_name") and new[t].get("series_name")
-               and _norm_name(old[t]["series_name"]) != _norm_name(new[t]["series_name"])]
+               and not _same_name(old[t]["series_name"], new[t]["series_name"])]
     fam = {}
     for t, r in new.items():
         o = old.get(t)
         if not o or not o.get("entity_name") or not r.get("entity_name"):
             continue
-        if _norm_name(o["entity_name"]) != _norm_name(r["entity_name"]):
+        if not _same_name(o["entity_name"], r["entity_name"]):
             fam.setdefault((o["entity_name"], r["entity_name"]), []).append(t)
     return {"added": added, "retired": retired, "renamed": renamed,
             "families": [(a, b, ts) for (a, b), ts in fam.items()]}
