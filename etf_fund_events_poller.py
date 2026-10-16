@@ -370,7 +370,13 @@ def watched_funds():
     "CIK<cik>"), so a UIT's own 497 / N-14 filings are still searched."""
     u = fm.load_universe()
     watched = fm.watched_tickers()
-    out = {t: u["by_ticker"][t] for t in watched if t in u["by_ticker"]}
+    # ETFs only. Mutual fund actions are Feature 21 (mf_events_poller), which
+    # covers four events an ETF cannot have — closing to new investors,
+    # reopening, a share class conversion and an adviser change — and words the
+    # rest for a fund holder. Without this gate a watched mutual fund would be
+    # searched and alerted by both pollers.
+    out = {t: u["by_ticker"][t] for t in watched
+           if t in u["by_ticker"] and u["by_ticker"][t].get("fund_type") == "ETF"}
     missing = watched - set(out)
     if missing:
         etfs = _etf_master_tickers(missing)

@@ -189,31 +189,50 @@ def test_full_flow():
     assert cur == {"Michelle Louie", "John P. Smith"}
     assert not fake.db.get("alerts")
 
-    # 2. sticker: Smith leaves -> event + roster update + ONE alert for watched VEXPX only
+    # 2. sticker: Smith leaves -> event recorded + roster updated.
+    #
+    #    NO ALERT, because VEXPX is a MUTUAL FUND. Mutual fund manager changes
+    #    are Feature 19 (mf_manager_poller), which words them for a fund holder
+    #    and has its own schedule; this ETF poller stops at the data. Before
+    #    that split the same change would have alerted twice, once from each
+    #    poller. The data collection below is deliberately unchanged — every
+    #    series still gets a roster here, which is what the ETF side needs.
     P.run_event_poll(days_back=30)
     evs = fake.db["fund_manager_events"]
     assert [(e["event_type"], e["manager_name"]) for e in evs] == [("REMOVED", "John P. Smith")]
     assert evs[0]["effective_date"] == "2026-10-03"
+    assert not fake.db.get("alerts"), "ETF poller must not alert on a mutual fund"
+    assert {r["manager_name"] for r in fake.db["fund_managers"] if r["is_current"]} == {"Michelle Louie"}
+
+    # 2b. the same change, with the fund classified as an ETF, DOES alert here.
+    u["by_series"]["S000002500"]["fund_type"] = "ETF"
+    n = P.emit_alerts("S000002500",
+                      [{"event_type": "REMOVED", "manager": "John P. Smith",
+                        "manager_key": "john p smith"}],
+                      {"accession": "A1", "form": "497", "filing_date": "2026-10-01",
+                       "url": "u", "series_names": {"S000002500": "Explorer Fund"}},
+                      P.watched_tickers())
     alerts = fake.db["alerts"]
-    assert [a["ticker"] for a in alerts] == ["VEXPX"]           # VEXRX not watched -> no alert
+    assert n == 1 and [a["ticker"] for a in alerts] == ["VEXPX"]   # VEXRX not watched
     a = alerts[0]
     assert a["filing_type"] == "PM_REMOVED" and a["impact"] == "MEDIUM"
     assert "John P. Smith is leaving" in a["summary"] and "Michelle Louie" in a["summary"]
     assert a["extra"]["current_team"] == ["Michelle Louie"]
-    assert {r["manager_name"] for r in fake.db["fund_managers"] if r["is_current"]} == {"Michelle Louie"}
+    u["by_series"]["S000002500"]["fund_type"] = "MF"               # back to a mutual fund
+    fake.db["alerts"] = []
 
     # 3. idempotent: re-running the poll creates nothing new
     P.run_event_poll(days_back=30)
-    assert len(fake.db["fund_manager_events"]) == 1 and len(fake.db["alerts"]) == 1
+    assert len(fake.db["fund_manager_events"]) == 1 and not fake.db["alerts"]
 
-    # 4. next prospectus adds Haddad with no sticker -> ROSTER_DIFF catches it;
-    #    Smith's removal is NOT re-alerted (sticker already reported it)
+    # 4. next prospectus adds Haddad with no sticker -> ROSTER_DIFF catches it.
+    #    Still a mutual fund, so still data only, no alert from this poller.
     P.process_roster_filing(_roster_meta("prosp2.htm", "0000932471-26-000900", "2026-12-20"),
                             P.watched_tickers(), emit_diffs=True)
     evs = [(e["event_type"], e["manager_name"], e["detection_source"]) for e in fake.db["fund_manager_events"]]
     assert ("ADDED", "Omar Haddad", "ROSTER_DIFF") in evs
     assert len(evs) == 2
-    assert fake.db["alerts"][-1]["filing_type"] == "PM_ADDED"
+    assert not fake.db["alerts"]
 
     # 5. an older prospectus never overwrites a newer roster
     P.process_roster_filing(_roster_meta("prosp.htm", "0000932471-24-000001", "2024-12-20"),

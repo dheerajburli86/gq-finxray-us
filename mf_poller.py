@@ -376,8 +376,20 @@ def build_alert(fund, ticker, d, rep_date, filing_date, debt):
     if not (adds or rems or resz):
         return None
 
+    # Company data behind each line (mf_company_data, filled daily): sector and
+    # market-cap class, so a holder reads "Nvidia (NVDA), large-cap Technology"
+    # rather than the bare issuer string the filing used. Best-effort — a line
+    # with nothing on file is named exactly as before.
+    try:
+        import mf_company_data as mcd
+        desc = mcd.describe([c.get("security_key") for c in (adds + rems + resz)])
+    except Exception:
+        desc = {}
+
     def lbl(c):
-        return edp._label(c)
+        base = edp._label(c)
+        d = desc.get(c.get("security_key"))
+        return f"{base}, {d}" if d else base
 
     parts = [f"{fund} ({ticker}) quarterly portfolio, as of {rep_date} (SEC Form N-PORT, filed {filing_date})."]
     if adds:

@@ -1286,7 +1286,14 @@ def expire_stale_filings(force=False):
 # SEC_FUND is Feature 16 (ETF liquidation / merger / index / fee filings): a
 # primary-source SEC document, watchlist-gated before it is queued, and a
 # handful a week — it belongs in front of the news backlog with the 8-Ks.
-PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT", "SEC_IPO", "SEC_FUND"]
+# MF_EVENT is Feature 21, the same thing for MUTUAL FUNDS (mf_events_poller):
+# liquidation, merger, adviser change, a fund closing to new investors, a share
+# class being converted. Mutual funds are a separate product with a separate
+# poller, so they carry their own source rather than sharing SEC_FUND — but the
+# queueing argument is identical: primary-source, watchlist-gated, low volume,
+# and time-critical (a holder of a closing fund has days to act). Both fan out
+# through extra.fanout_tickers and both honour extra.impact_floor below.
+PRIORITY_SOURCES = ["SEC_EDGAR", "FMP_TRANSCRIPT", "SEC_IPO", "SEC_FUND", "MF_EVENT"]
 # EARNINGS_MISS/BEAT arrive under source="FMP", which is shared with ordinary
 # vendor content, so they need the filing_type axis to be prioritised at all â€”
 # exactly the gap that left INSIDER_FMP stuck behind the news backlog. An EPS

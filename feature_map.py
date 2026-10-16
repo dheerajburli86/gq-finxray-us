@@ -192,14 +192,60 @@ FEATURES[16] = {
     "market_wide": False,
 }
 
+# ── Mutual fund features ──────────────────────────────────────────────────────
+# Mutual funds are a different product from ETFs — quarterly N-PORT disclosure
+# instead of a daily holdings file, share classes instead of one ticker, funds
+# that close to new investors, advisers that can be replaced. So they get their
+# own pollers (mf_*.py), their own sources and their own feature ids rather
+# than a share of the ETF ones, and a user mutes mutual fund news without
+# muting the ETF equivalent.
 FEATURES[18] = {
-    "name": "Mutual Fund Portfolio & Expense Changes",
-    "detail": ("Quarterly holdings added / exited / resized for watched mutual funds from SEC "
-               "Form N-PORT, and expense-ratio changes between prospectuses (SEC fee tables). "
-               "Rule-based, no LLM."),
+    "name": "Mutual Fund Portfolio Changes",
+    "detail": ("Quarterly holdings added / exited / resized for watched mutual funds, from SEC "
+               "Form N-PORT. Rule-based, no LLM."),
+    # MF_EXPENSE is the legacy filing_type from when fee changes shared this
+    # feature. Kept so historical rows still resolve rather than reading
+    # "Unmapped"; new fee alerts are Feature 20.
     "sources": {"MF_PORTFOLIO", "MF_EXPENSE"},
     "filing_types": {"MF_HOLDINGS_ADDED", "MF_HOLDINGS_REMOVED", "MF_HOLDINGS_CHANGE",
                      "MF_WEIGHT_SHIFT", "MF_EXPENSE_INCREASE", "MF_EXPENSE_DECREASE"},
+    "market_wide": False,
+}
+FEATURES[19] = {
+    "name": "Mutual Fund Manager Changes",
+    "detail": ("Portfolio manager added / removed at a watched mutual fund — SEC 497 supplements "
+               "plus 485BPOS / 497K prospectus roster diffs. Rule-based, no LLM."),
+    "sources": {"MF_MANAGER"},
+    "filing_types": {"MF_PM_ADDED", "MF_PM_REMOVED", "MF_PM_CHANGE"},
+    "market_wide": False,
+}
+FEATURES[20] = {
+    "name": "Mutual Fund Expense Ratios",
+    "detail": ("Expense ratio raised or lowered between prospectuses for a watched share class, "
+               "with the full SEC fee table: management fee, 12b-1, other expenses, acquired "
+               "fund fees, waiver and net. Rule-based, no LLM."),
+    "sources": {"MF_FEE"},
+    "filing_types": {"MF_EXPENSE_INCREASE", "MF_EXPENSE_DECREASE"},
+    "market_wide": False,
+}
+FEATURES[21] = {
+    "name": "Mutual Fund Actions",
+    "detail": ("Liquidation, merger, adviser change, closing or reopening to investors, share "
+               "class conversion, strategy change and announced fee changes for watched mutual "
+               "funds — SEC Form 497 / N-14, AI-summarized."),
+    "sources": {"MF_EVENT"},
+    "filing_types": {"MF_LIQUIDATION", "MF_MERGER", "MF_ADVISER_CHANGE", "MF_CLOSED",
+                     "MF_REOPENED", "MF_SHARE_CLASS", "MF_STRATEGY_CHANGE", "MF_FEE_CHANGE"},
+    "market_wide": False,
+}
+FEATURES[22] = {
+    "name": "Mutual Fund Scheme & Family Updates",
+    "detail": ("A new share class of a fund you hold, your own ticker leaving SEC's register, a "
+               "fund renamed, or the fund family renamed after an acquisition — from SEC's "
+               "investment company series and class register. Rule-based, no LLM."),
+    "sources": {"MF_SCHEME"},
+    "filing_types": {"MF_NEW_SHARE_CLASS", "MF_TICKER_RETIRED", "MF_FUND_RENAMED",
+                     "MF_FAMILY_CHANGE"},
     "market_wide": False,
 }
 

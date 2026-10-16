@@ -242,13 +242,27 @@ MF_FEE_MIN_DELTA = float(os.getenv("MF_FEE_MIN_DELTA", "0.005"))     # percentag
 MF_FEE_HIGH_DELTA = float(os.getenv("MF_FEE_HIGH_DELTA", "0.10"))
 
 
+# Mutual fund fee alerts moved OUT of this ETF module to their own poller
+# (mf_expense_poller.py, Feature 20, source MF_FEE), which reads the same SEC
+# fee tables but keeps its own schedule, its own baseline table and wording for
+# a fund holder — share classes of one mutual fund differ by load and 12b-1 fee,
+# which has no ETF equivalent. Leaving this path live as well would alert the
+# same change twice from two sources. The function is kept, and still works, so
+# the behaviour can be restored by flipping this one flag.
+MF_FEE_ALERTS_ENABLED = os.getenv("ETF_EXPENSE_MF_ALERTS", "0") == "1"
+
+
 def mf_fee_alerts(sb, tables, meta, watched):
     """
+    Superseded by mf_expense_poller.run_mf_expense_poll(). Off by default.
+
     Mutual funds have no daily expense-ratio feed, so a change is read off the
     prospectus itself: a watched share class whose new fee table differs from
     the previous prospectus. Call BEFORE store() so "previous" is still the
     older filing. -> alert rows written
     """
+    if not MF_FEE_ALERTS_ENABLED:
+        return 0
     from feature_map import tag_extra
     cands = sorted(t for t in tables if t in watched)
     if not cands:

@@ -533,6 +533,13 @@ def emit_alerts(series_id, new_events, meta, watched):
         return 0
     u = load_universe()
     s = u["by_series"].get(series_id) or {}
+    # ETFs only. Mutual fund manager changes are Feature 19, written by
+    # mf_manager_poller with wording for a fund holder rather than an ETF
+    # holder. Without this gate the same change would alert twice, once from
+    # each poller, for any mutual fund in SEC's registry. Rosters are still
+    # collected here for every series — only the ALERT is ETF-only.
+    if s.get("fund_type") != "ETF":
+        return 0
     hits = [t for t in s.get("tickers", []) if t in watched]
     if not hits:
         return 0

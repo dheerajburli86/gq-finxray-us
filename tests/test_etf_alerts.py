@@ -763,9 +763,13 @@ fmm = importlib.reload(fm)
 db8 = FakeDB()
 fmm.sb = lambda: db8
 VS = [{"series_id": "S000002500", "series_name": "Vanguard Explorer Fund", "classes": []}]
+# An ETF fixture, because this poller now alerts for ETFs only — mutual fund
+# manager changes are Feature 19 (mf_manager_poller). What is under test here
+# (one sticker filed under two accessions alerts once; a manager bio in a
+# summary prospectus is not a change) is the same for either product.
 fmm._universe_cache = {"by_ticker": {"VEXPX": {"cik": "0000932471", "series_id": "S000002500",
-                                               "class_id": "C1", "fund_type": "MF"}},
-                       "by_series": {"S000002500": {"cik": "0000932471", "tickers": ["VEXPX"], "fund_type": "MF"}},
+                                               "class_id": "C1", "fund_type": "ETF"}},
+                       "by_series": {"S000002500": {"cik": "0000932471", "tickers": ["VEXPX"], "fund_type": "ETF"}},
                        "ciks": {"0000932471"}}
 fmm.fetch_series_header = lambda cik, adsh: VS
 STICKER = ("<p>Supplement dated October 1, 2026 to the Prospectus for Vanguard Explorer Fund</p>"

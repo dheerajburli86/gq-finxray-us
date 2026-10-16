@@ -144,8 +144,18 @@ COMPANY_ONLY_SOURCES = {
     "ETF_SIGNAL",
     # ETF closures (etf_listing_poller): always about one watched fund.
     "ETF_LISTING",
-    # Mutual funds (Feature 18): always about one watched share class.
-    "MF_PORTFOLIO", "MF_EXPENSE",
+    # Mutual funds (Features 18-22). Each alert is about ONE fund and carries
+    # that fund's own share-class ticker, so it is watchlist-routed like any
+    # company alert. Listed explicitly so a fund filing whose ticker failed to
+    # resolve is dropped instead of falling into the ticker catch-all and
+    # reaching every user.
+    #   MF_PORTFOLIO  quarterly holdings added / exited / resized (mf_poller)
+    #   MF_EXPENSE    legacy fee alerts, superseded by MF_FEE
+    #   MF_MANAGER    portfolio manager changes (mf_manager_poller)
+    #   MF_FEE        expense ratio changes (mf_expense_poller)
+    #   MF_EVENT      liquidation / merger / adviser / closing (mf_events_poller)
+    #   MF_SCHEME     new share class, ticker retired, renames (mf_scheme_poller)
+    "MF_PORTFOLIO", "MF_EXPENSE", "MF_MANAGER", "MF_FEE", "MF_EVENT", "MF_SCHEME",
 }
 COMPANY_ONLY_FILING_TYPES = {"NEWS"}
 

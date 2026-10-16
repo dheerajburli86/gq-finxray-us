@@ -125,6 +125,14 @@ from etf_signals_poller import run_etf_signals
 from etf_listing_poller import run_etf_listing_poller
 from etf_expense_extractor import run_expense_backfill
 from mf_poller import refresh_mf_master, run_mf_holdings
+# Mutual fund pollers (Features 19-22). Separate from the ETF stack above:
+# different filings, different events, different wording, own schedules.
+from mf_manager_poller import (run_mf_manager_events, run_mf_manager_rosters,
+                               run_mf_manager_backfill)
+from mf_expense_poller import run_mf_expense_poll, run_mf_expense_backfill
+from mf_events_poller import run_mf_fund_events_poller
+from mf_scheme_poller import run_mf_scheme_poll
+from mf_company_data import run_mf_company_data
 
 from feature_map import TOTAL_FEATURES
 
@@ -399,17 +407,57 @@ def run_scheduler():
     # have none yet; new prospectuses are read by the Feature 15 roster job.
     schedule.every().day.at("05:40").do(job(run_expense_backfill))
 
-    # ── Feature 18 — Mutual funds (SEC) ───────────────────────────────────────
-    # Scheme master first (it is what /add checks), then watched funds' newest
-    # public N-PORT. N-PORT is quarterly with up to 60 days' lag, so most days
-    # this finds nothing new and makes one request per watched registrant.
-    # Mutual-fund manager changes and fund actions run under Features 15 / 16.
+    # ── Features 18-22 — MUTUAL FUNDS (SEC) ───────────────────────────────────
+    # Mutual funds have their own pollers (mf_*.py), separate from the ETF
+    # stack above: a different disclosure regime (quarterly Form N-PORT, not a
+    # daily holdings file), share classes instead of one ticker, and events an
+    # ETF cannot have (closing to new investors, a share class conversion, an
+    # adviser change). Separate sources, separate feature ids, separate
+    # schedules — and each job is rate-limited through the SAME shared SEC
+    # window as the 8-K lane, so none of this can starve the fast lane.
+    #
+    # Order within the morning matters: the register (05:20) is what every
+    # other mutual-fund job reads, and the scheme diff (05:30) must run on a
+    # register that was just refreshed, or it reports yesterday's changes.
+
+    # Feature 18 — scheme master, then quarterly portfolio changes.
     schedule.every().day.at("05:20").do(job(refresh_mf_master))
     schedule.every().day.at("08:40").do(job(run_mf_holdings))
     # Every ordinary mutual fund's holdings are stored (not just watched ones), a
     # few thousand documents per run, so a second pass finishes the first fill in
-    # days. Both passes are rate-limited through the shared SEC window.
+    # days.
     schedule.every().day.at("21:40").do(job(run_mf_holdings))
+
+    # Feature 22 — what changed in SEC's fund register: a new share class of a
+    # fund you hold, your own ticker retired, a fund or fund family renamed.
+    schedule.every().day.at("05:30").do(job(run_mf_scheme_poll))
+
+    # Feature 19 — portfolio manager changes. Hourly for the 497 supplements
+    # (the fast signal, filed within days of the change), daily for prospectus
+    # roster diffs, weekly for the backfill that gives every fund a baseline
+    # roster to diff its first change against.
+    schedule.every(60).minutes.do(job(run_mf_manager_events))
+    schedule.every().day.at("06:40").do(job(run_mf_manager_rosters))
+    schedule.every().sunday.at("02:30").do(job(run_mf_manager_backfill))
+
+    # Feature 20 — expense ratios from the prospectus fee table. The poll reads
+    # new prospectuses from registrants running a watched fund; the backfill
+    # gives share classes with no table a baseline, so a fund added to a
+    # watchlist today can alert on its next prospectus rather than its second.
+    schedule.every().day.at("05:50").do(job(run_mf_expense_poll))
+    schedule.every().day.at("06:00").do(job(run_mf_expense_backfill))
+
+    # Feature 21 — fund actions: liquidation, merger, adviser change, closing
+    # or reopening to investors, share class conversion. Hourly with a 2-day
+    # lookback; mf_fund_events.doc_key makes the overlap free. These are the
+    # time-critical ones, which is why they queue ahead of the news backlog in
+    # ai_pipeline.PRIORITY_SOURCES.
+    schedule.every(60).minutes.do(job(run_mf_fund_events_poller))
+
+    # Company data behind the holdings: sector, industry, market cap and
+    # exchange for what the funds own, so a portfolio alert can say "Nvidia
+    # (NVDA), large-cap Technology" instead of a bare line from a filing.
+    schedule.every().day.at("07:30").do(job(run_mf_company_data))
 
     logger.info("[SCHEDULER] %d jobs registered across %d features",
                 len(schedule.jobs), TOTAL_FEATURES)

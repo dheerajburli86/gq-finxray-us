@@ -69,7 +69,16 @@ REQUIRED = {
     "run_etf_signals": 17,
     # ETF scheme master upkeep: closures alert under 16; fee tables feed 14.
     "run_etf_listing_poller": 16, "run_expense_backfill": 14,
+    # Mutual fund features. Each has its own poller and its own schedule —
+    # mutual funds are a different product from ETFs (quarterly N-PORT, share
+    # classes, funds that close to new investors), so they do not share the
+    # Feature 14-17 jobs above.
     "refresh_mf_master": 18, "run_mf_holdings": 18,
+    "run_mf_manager_events": 19, "run_mf_manager_rosters": 19,
+    "run_mf_manager_backfill": 19,
+    "run_mf_expense_poll": 20, "run_mf_expense_backfill": 20,
+    "run_mf_fund_events_poller": 21,
+    "run_mf_scheme_poll": 22,
 }
 covered = set()
 for fn, fid in REQUIRED.items():
@@ -156,6 +165,18 @@ EMISSIONS = [
     ("MF_PORTFOLIO", "MF_HOLDINGS_ADDED"), ("MF_PORTFOLIO", "MF_HOLDINGS_REMOVED"),
     ("MF_PORTFOLIO", "MF_HOLDINGS_CHANGE"), ("MF_PORTFOLIO", "MF_WEIGHT_SHIFT"),
     ("MF_EXPENSE", "MF_EXPENSE_INCREASE"), ("MF_EXPENSE", "MF_EXPENSE_DECREASE"),
+    # Mutual fund pollers: 19 managers, 20 expense ratios, 21 fund actions,
+    # 22 the scheme and fund-family register. Separate sources from the ETF
+    # ones above, so a user can mute mutual fund news on its own.
+    ("MF_MANAGER", "MF_PM_ADDED"), ("MF_MANAGER", "MF_PM_REMOVED"),
+    ("MF_MANAGER", "MF_PM_CHANGE"),
+    ("MF_FEE", "MF_EXPENSE_INCREASE"), ("MF_FEE", "MF_EXPENSE_DECREASE"),
+    ("MF_EVENT", "MF_LIQUIDATION"), ("MF_EVENT", "MF_MERGER"),
+    ("MF_EVENT", "MF_ADVISER_CHANGE"), ("MF_EVENT", "MF_CLOSED"),
+    ("MF_EVENT", "MF_REOPENED"), ("MF_EVENT", "MF_SHARE_CLASS"),
+    ("MF_EVENT", "MF_STRATEGY_CHANGE"), ("MF_EVENT", "MF_FEE_CHANGE"),
+    ("MF_SCHEME", "MF_NEW_SHARE_CLASS"), ("MF_SCHEME", "MF_TICKER_RETIRED"),
+    ("MF_SCHEME", "MF_FUND_RENAMED"), ("MF_SCHEME", "MF_FAMILY_CHANGE"),
 ]
 tagged = set()
 for src, ft in EMISSIONS:

@@ -284,27 +284,43 @@ m2 = {"accession": "P2", "form": "497K", "filing_date": "2026-04-28", "url": "u2
 check("same fees next year: no alert", X.mf_fee_alerts(fdb, fees(0.04), m2, {"VFIAX"}) == 0)
 X.store(fdb, fees(0.04), m2)
 m3 = {"accession": "P3", "form": "497K", "filing_date": "2026-09-01", "url": "u3"}
+
+# Mutual fund fee ALERTS have moved out of this ETF module to their own poller
+# (mf_expense_poller, Feature 20, source MF_FEE) — see tests/test_mf_pollers.py.
+# This module still reads and stores the fee tables, which is what the ETF side
+# needs; only the mutual fund alert is off, behind one flag so the old path can
+# be restored without a code change.
+check("MF fee alerts are off in the ETF module by default", X.MF_FEE_ALERTS_ENABLED is False)
+check("so it writes no alert", X.mf_fee_alerts(fdb, fees(0.20), m3, {"VFIAX"}) == 0
+      and not fdb.rows("alerts"))
+
+X.MF_FEE_ALERTS_ENABLED = True                      # the kill switch is real, both ways
 n = X.mf_fee_alerts(fdb, fees(0.20), m3, {"VFIAX"})
 a = fdb.rows("alerts")
-check("fee rise alerts once, HIGH, Feature 18", n == 1 and a[0]["filing_type"] == "MF_EXPENSE_INCREASE"
+check("with the flag on, a fee rise alerts once, HIGH, Feature 18",
+      n == 1 and a[0]["filing_type"] == "MF_EXPENSE_INCREASE"
       and a[0]["impact"] == "HIGH" and a[0]["extra"]["feature_id"] == 18, a)
 check("text", "from 0.04% to 0.20%" in a[0]["summary"] and "Admiral Shares" in a[0]["summary"], a[0]["summary"])
 check("dedup on the same prospectus", X.mf_fee_alerts(fdb, fees(0.20), m3, {"VFIAX"}) == 0)
 check("unwatched class: nothing", X.mf_fee_alerts(fdb, fees(0.50), {"accession": "P4", "form": "497K",
                                                                     "filing_date": "2026-10-01"}, set()) == 0)
+X.MF_FEE_ALERTS_ENABLED = False                     # leave it as production has it
 edb = FakeDB()
 edb.tables["etf_master"] = [{"ticker": "AAA"}]
 X.store(edb, {"AAA": {"management_fee": 0.1, "series_id": "S1"}}, {"accession": "E1"})
 check("ETF-only store unchanged when no MF rows (no fund_type key)", "fund_type" not in edb.rows("etf_expense_breakdown")[0])
 
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n=== 7. FEATURES 15 / 16 COVER MUTUAL FUNDS ===")
-s15, _, _ = FM.build_alert("Vanguard 500 Index Fund", "MF", [{"manager": "Jane Doe"}], [], ["Jane Doe"], None,
+print("\n=== 7. MUTUAL FUNDS ARE OUT OF THE ETF POLLERS (Features 15 / 16) ===")
+# Manager changes and fund actions for mutual funds moved to their own pollers
+# (Features 19 and 21, tests/test_mf_pollers.py). The ETF pollers must now skip
+# them, or every change would alert twice — once in ETF wording, once in fund
+# wording. The ETF alert text itself is unchanged.
+s15, _, _ = FM.build_alert("SPDR S&P 500 ETF", "ETF", [{"manager": "Jane Doe"}], [], ["Jane Doe"], None,
                            {"form": "497", "filing_date": "2026-10-01"})
-check("Feature 15 names it a mutual fund", "(mutual fund)" in s15, s15)
+check("Feature 15 still words an ETF alert as an ETF", "(ETF)" in s15, s15)
 import etf_fund_events_poller as EV  # noqa: E402
-check("Feature 16 picks up watched mutual funds", "VFIAX" in EV.watched_funds())
-check("Feature 16 renamed for both", feature_map.FEATURES[16]["name"] == "Fund Actions (ETF & Mutual Fund)")
+check("Feature 16 no longer picks up watched mutual funds", "VFIAX" not in EV.watched_funds())
 for src, ft in [("MF_PORTFOLIO", "MF_WEIGHT_SHIFT"), ("MF_EXPENSE", "MF_EXPENSE_DECREASE")]:
     check(f"{src}/{ft} -> Feature 18, watchlist-only", feature_map.resolve_feature(src, ft)[0] == 18
           and src in delivery.COMPANY_ONLY_SOURCES and not feature_map.is_market_wide(src, ft))
