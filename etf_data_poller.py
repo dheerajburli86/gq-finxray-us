@@ -227,6 +227,71 @@ def is_alertable_line(change):
     return not _NON_SECURITY.search(name)
 
 
+# ── Ticker relabels, which are not trades ─────────────────────────────────────
+# A holding keyed on its symbol changes key when the ISSUER changes ticker, so
+# the diff reports one buy and one sale and the alert tells the holder the fund
+# repositioned when it did nothing at all. Seen live on 2026-10-15: PSP read
+# "Added: Blue Owl Capital Corp (ORCC) at 1.00%. Removed: Blue Owl Capital Corp
+# (OBDC), previously 0.98%." — one company, one position, a renamed symbol.
+_CORP_SUFFIX = re.compile(
+    r"\b(inc|incorporated|corp|corporation|co|company|companies|ltd|limited|plc|"
+    r"llc|lp|llp|nv|n v|sa|s a|ag|ab|as|oyj|spa|s p a|holding|holdings|group|"
+    # "and" is here so "JPMorgan Chase & Co" and "JPMorgan Chase and Co." reduce
+    # to the same issuer: "&" becomes a space during punctuation stripping, so
+    # without this the spelled-out form keeps a word the ampersand form lost.
+    r"and|trust|the|class|cl|a|b|c|ord|common|shares|share|stock)\b", re.I)
+
+# How far the weight may drift and still be the same position wearing a new
+# symbol. A relabel carries its weight across almost unchanged; a real swap out
+# of one holding into another of the same issuer usually does not.
+RELABEL_MAX_WEIGHT_DRIFT = float(os.getenv("GQ_RELABEL_MAX_DRIFT", "0.25"))
+
+
+def _issuer_key(change):
+    """The issuer, stripped of punctuation, corporate suffixes and share class."""
+    n = (change.get("security_name") or "").lower()
+    n = re.sub(r"[^a-z0-9 ]+", " ", n)
+    n = _CORP_SUFFIX.sub(" ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def pair_relabels(added, removed):
+    """
+    -> (added, removed, relabelled) with same-issuer add/remove pairs moved out.
+
+    A pair qualifies when the issuer name matches once punctuation, corporate
+    suffix and share-class words are removed, AND the weight carries across
+    within RELABEL_MAX_WEIGHT_DRIFT points (or a quarter of the old weight,
+    whichever is larger). Both sides must be present, so an ordinary buy or
+    sale is never touched.
+    """
+    if not added or not removed:
+        return added, removed, []
+    rem_by = {}
+    for c in removed:
+        k = _issuer_key(c)
+        if k:
+            rem_by.setdefault(k, []).append(c)
+    keep_add, relabelled, used = [], [], set()
+    for a in added:
+        match = None
+        for r in rem_by.get(_issuer_key(a)) or []:
+            if id(r) in used:
+                continue
+            wp = r.get("weight_prev") or 0.0
+            wn = a.get("weight_new") or 0.0
+            if abs(wn - wp) <= max(RELABEL_MAX_WEIGHT_DRIFT, 0.25 * wp):
+                match = r
+                break
+        if match is None:
+            keep_add.append(a)
+        else:
+            used.add(id(match))
+            relabelled.append((a, match))
+    keep_rem = [r for r in removed if id(r) not in used]
+    return keep_add, keep_rem, relabelled
+
+
 def class_alerts_holdings(asset_class):
     return (asset_class or "").strip().lower() not in SKIP_CLASSES
 
@@ -253,7 +318,8 @@ def _fmt_as_of(stamp):
         return str(stamp)[:10]
 
 
-def holdings_alert(fund, ticker, added, removed, n_small, n_positions, as_of):
+def holdings_alert(fund, ticker, added, removed, n_small, n_positions, as_of,
+                   relabelled=()):
     """-> (summary, impact, filing_type). added/removed are change dicts."""
     parts = [f"{fund} ({ticker}) changed its portfolio holdings."]
     if added:
@@ -264,6 +330,15 @@ def holdings_alert(fund, ticker, added, removed, n_small, n_positions, as_of):
         shown = "; ".join(f"{_label(c)}, previously {c['weight_prev']:.2f}%" for c in removed[:LIST_LIMIT])
         more = f"; and {len(removed) - LIST_LIMIT} more" if len(removed) > LIST_LIMIT else ""
         parts.append(f"Removed: {shown}{more}.")
+    if relabelled:
+        shown = "; ".join(
+            f"{(r.get('security_name') or '').strip() or _label(r)} "
+            f"{(r.get('security_symbol') or '?').strip()} -> "
+            f"{(a.get('security_symbol') or '?').strip()}"
+            for a, r in relabelled[:LIST_LIMIT])
+        more = (f"; and {len(relabelled) - LIST_LIMIT} more"
+                if len(relabelled) > LIST_LIMIT else "")
+        parts.append(f"Ticker change only, not a trade: {shown}{more}.")
     if n_small:
         parts.append(f"{n_small} smaller change{'s' if n_small != 1 else ''} under "
                      f"{ALERT_MIN_WEIGHT:.2f}% of the fund {'are' if n_small != 1 else 'is'} not listed.")
@@ -546,10 +621,16 @@ def handle_holdings(ctx, ticker, fund, asset_class, raw, state, website, res):
             sig_rem = sorted((c for c in changes if c["action"] == "REMOVED"
                               and c["weight_prev"] >= ALERT_MIN_WEIGHT and is_alertable_line(c)),
                              key=lambda c: -c["weight_prev"])
+            # A symbol change is not a portfolio decision. Pair those off before
+            # deciding there is anything to tell the holder: if the only
+            # "changes" were relabels, nothing was bought or sold and the alert
+            # is dropped entirely rather than reported as a reposition.
+            sig_add, sig_rem, relabelled = pair_relabels(sig_add, sig_rem)
             if sig_add or sig_rem:
-                n_small = len(changes) - len(sig_add) - len(sig_rem)
+                n_small = len(changes) - len(sig_add) - len(sig_rem) - 2 * len(relabelled)
                 summary, impact, ftype = holdings_alert(fund, ticker, sig_add, sig_rem, n_small,
-                                                        len(rows), as_of)
+                                                        len(rows), as_of,
+                                                        relabelled=relabelled)
                 extra = {
                     "dedup_key": f"{SOURCE_PORTFOLIO}:{ticker}:{version}",
                     "company_name": fund, "etf_ticker": ticker,

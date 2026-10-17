@@ -471,6 +471,55 @@ _g4 = {r["extra"].get("fanout_group")
 check("one event across two share classes shares one fanout_group",
       _g4 == {"evt-1"}, _g4)
 
+print("\n16. Backfills baseline WATCHED funds first")
+
+# Features 19 and 20 cannot alert on a fund until it has a baseline, so a
+# backfill that reaches watched funds last leaves exactly the funds somebody
+# follows dark. Both collectors ended with a plain newest-first date sort,
+# which threw away the caller's watched-first CIK ordering: a watched fund's
+# eleven-month-old prospectus lost its slot to newer filings from trusts nobody
+# follows. Observed live on 2026-10-16 as 0 of 20 watched funds with a roster.
+_FILINGS = {
+    # watched registrant, but its prospectus is old
+    "111": [{"accession": "a-1", "form": "485BPOS", "filing_date": "2025-11-20",
+             "primary_doc": "old.htm"}],
+    # unwatched registrants with brand-new prospectuses
+    "222": [{"accession": "a-2", "form": "485BPOS", "filing_date": "2026-10-15",
+             "primary_doc": "new1.htm"}],
+    "333": [{"accession": "a-3", "form": "485BPOS", "filing_date": "2026-10-14",
+             "primary_doc": "new2.htm"}],
+}
+_real_recent = mc.recent_filings
+mc.recent_filings = lambda cik, forms, days: list(_FILINGS.get(mc.cik_plain(cik), []))
+try:
+    for _mod, _fn, _name in ((MGR, MGR._roster_filings_for, "manager roster collector"),
+                             (FEE, FEE._prospectus_filings, "expense prospectus collector")):
+        _un = _fn(["111", "222", "333"], 460, 10)
+        check(f"{_name}: without a priority set it is pure newest-first",
+              [m["cik"] for m in _un] == ["222", "333", "111"],
+              [m["cik"] for m in _un])
+        _pri = _fn(["111", "222", "333"], 460, 10, priority={"111"})
+        check(f"{_name}: the watched registrant comes first despite an older filing",
+              _pri and _pri[0]["cik"] == "111", [m["cik"] for m in _pri])
+        check(f"{_name}: the rest stay newest-first behind it",
+              [m["cik"] for m in _pri] == ["111", "222", "333"],
+              [m["cik"] for m in _pri])
+        # A budget of 1 is the case that actually bit: the one slot must go to
+        # the watched fund, not to the newest unwatched filing.
+        _tight = _fn(["111", "222", "333"], 460, 1, priority={"111"})
+        check(f"{_name}: a single-document budget spends it on the watched fund",
+              [m["cik"] for m in _tight] == ["111"], [m["cik"] for m in _tight])
+finally:
+    mc.recent_filings = _real_recent
+
+check("the manager backfill sorts missing registrants watched-first",
+      "missing_ciks.sort(key=lambda c: c not in watched_ciks)"
+      in open(os.path.join(ROOT, "mf_manager_poller.py")).read())
+for _f, _call in (("mf_manager_poller.py", "priority=watched_ciks"),
+                  ("mf_expense_poller.py", "priority=watched_ciks")):
+    check(f"{_f} passes the watched registrants as the priority set",
+          _call in open(os.path.join(ROOT, _f)).read())
+
 print()
 if failures:
     print(f"FAILURES ({len(failures)}): " + ", ".join(failures))

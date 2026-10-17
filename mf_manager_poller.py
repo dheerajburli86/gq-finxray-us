@@ -424,8 +424,19 @@ def process_roster_filing(meta, watched, emit_diffs=True) -> dict:
     return {"series": n, "alerts": alerts}
 
 
-def _roster_filings_for(ciks, days_back, budget):
-    """Newest prospectuses from these registrants, newest first."""
+def _roster_filings_for(ciks, days_back, budget, priority=()):
+    """
+    Prospectuses from these registrants: a registrant in `priority` first, then
+    everything else, newest first inside each group.
+
+    `priority` exists because the date sort alone THREW AWAY the caller's
+    ordering. A caller that carefully put the registrants behind watched funds
+    at the front of `ciks` still had their documents re-sorted purely by filing
+    date, so a watched fund's eleven-month-old prospectus lost its slot to 150
+    newer ones from trusts nobody follows — and the funds that can actually
+    alert were the last to get a roster.
+    """
+    priority = {mc.cik_plain(c) for c in priority}
     out = []
     for cik in ciks:
         if len(out) >= budget:
@@ -441,7 +452,11 @@ def _roster_filings_for(ciks, days_back, budget):
                             "key": f"{f['accession']}:{name}"})
         except Exception as e:
             _err("roster_filings", e, {"cik": cik})
+    # Two stable passes: newest-first, then priority-first. Python's sort is
+    # stable, so the date order survives inside each group.
     out.sort(key=lambda m: m.get("filing_date") or "", reverse=True)
+    if priority:
+        out.sort(key=lambda m: m["cik"] not in priority)
     return out[:budget]
 
 
@@ -455,7 +470,8 @@ def run_mf_manager_rosters(days_back: int = 2):
         # reaching them.
         watched_ciks = {v["cik"] for t, v in u["by_ticker"].items() if t in watched}
         ciks = sorted(watched_ciks) + sorted(set(u["by_cik"]) - watched_ciks)
-        metas = _roster_filings_for(ciks, days_back, ROSTER_DOC_BUDGET)
+        metas = _roster_filings_for(ciks, days_back, ROSTER_DOC_BUDGET,
+                                    priority=watched_ciks)
         done = mc.processed_keys("MGR_ROSTER", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done]
         series = alerts = 0
@@ -492,9 +508,20 @@ def run_mf_manager_backfill(max_ciks: int | None = None,
                 .eq("is_current", True).order("series_id"))}
         except Exception as e:
             _err("backfill_coverage", e)
-        missing_ciks = sorted({v["cik"] for sid, v in u["by_series"].items() if sid not in have})
+        # WATCHED FUNDS FIRST. This walked the register in CIK order, so with
+        # ~6,000 funds missing a roster and 150 registrants a week, a fund
+        # somebody actually watches could wait months for the baseline that
+        # Feature 19 needs before it can alert at all — while the budget went
+        # on funds nobody follows. The watched registrants are a handful, so
+        # putting them at the front costs the rest almost nothing.
+        watched = mc.watched_tickers()
+        watched_ciks = {v["cik"] for t, v in u["by_ticker"].items() if t in watched}
+        missing_ciks = sorted({v["cik"] for sid, v in u["by_series"].items()
+                               if sid not in have})
+        missing_ciks.sort(key=lambda c: c not in watched_ciks)
         budget = max_ciks if max_ciks is not None else BACKFILL_CIK_BUDGET
-        metas = _roster_filings_for(missing_ciks[:budget * 3], lookback_days, budget * 4)
+        metas = _roster_filings_for(missing_ciks[:budget * 3], lookback_days,
+                                    budget * 4, priority=watched_ciks)
         done = mc.processed_keys("MGR_ROSTER", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done][:budget * 2]
         series = 0

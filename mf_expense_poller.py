@@ -247,7 +247,19 @@ def process_filing(meta, watched, alert=True) -> dict:
     return {"classes": n, "alerts": alerts}
 
 
-def _prospectus_filings(ciks, days_back, budget):
+def _prospectus_filings(ciks, days_back, budget, priority=()):
+    """
+    Prospectuses from these registrants: a registrant in `priority` first, then
+    everything else, newest first inside each group.
+
+    Without `priority` the final date sort silently undid the backfill's own
+    watched-first ordering: it ranked the registrants behind watched classes to
+    the front of `ciks`, then re-sorted every document by filing date, so a
+    watched class whose prospectus was filed eleven months ago lost its slot to
+    newer filings from trusts nobody follows. The classes that can actually
+    alert were baselined last.
+    """
+    priority = {mc.cik_plain(c) for c in priority}
     out = []
     for cik in ciks:
         if len(out) >= budget:
@@ -263,7 +275,11 @@ def _prospectus_filings(ciks, days_back, budget):
                             "key": f"{f['accession']}:{name}"})
         except Exception as e:
             _err("prospectus_filings", e, {"cik": cik})
+    # Two stable passes: newest-first, then priority-first. Python's sort is
+    # stable, so the date order survives inside each group.
     out.sort(key=lambda m: m.get("filing_date") or "", reverse=True)
+    if priority:
+        out.sort(key=lambda m: m["cik"] not in priority)
     return out[:budget]
 
 
@@ -279,7 +295,8 @@ def run_mf_expense_poll(days_back: int = DAYS_BACK):
         if not watched_ciks:
             log("no watched mutual funds — nothing to poll")
             return 0
-        metas = _prospectus_filings(watched_ciks, days_back, POLL_DOC_BUDGET)
+        metas = _prospectus_filings(watched_ciks, days_back, POLL_DOC_BUDGET,
+                                    priority=watched_ciks)
         done = mc.processed_keys("FEE", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done]
         classes = alerts = 0
@@ -323,7 +340,9 @@ def run_mf_expense_backfill(max_docs: int | None = None):
                 seen.add(c)
                 ciks.append(c)
         budget = max_docs if max_docs is not None else BACKFILL_DOCS
-        metas = _prospectus_filings(ciks[:budget * 2], BACKFILL_LOOKBACK_DAYS, budget * 2)
+        watched_ciks = {u["by_ticker"][t]["cik"] for t in watched if t in u["by_ticker"]}
+        metas = _prospectus_filings(ciks[:budget * 2], BACKFILL_LOOKBACK_DAYS,
+                                    budget * 2, priority=watched_ciks)
         done = mc.processed_keys("FEE", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done][:budget]
         classes = 0

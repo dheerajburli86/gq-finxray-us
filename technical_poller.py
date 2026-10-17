@@ -45,7 +45,7 @@ Telegram — delivery.py fans each row out to the users watching that ticker.
 
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -96,6 +96,28 @@ MAX_INDICATOR_TICKERS_PER_RUN = 150
 # 52-week levels are cached per trading day, so this cap only bites on the first
 # run of the day (or when the watchlist grows mid-session).
 MAX_YEAR_RANGE_REFRESH_PER_RUN = 250
+
+# ── Deadbands ─────────────────────────────────────────────────────────────────
+# A "golden cross" is a trend signal, so the price has to actually CLEAR the
+# average. Without a deadband the test fired on any price that happened to sit
+# a hair past the line: live on 2026-10-15/16 that produced SCHA up +0.1% then
+# down -0.1% the next morning, VB up +0.3% then down -0.4%, and VGK up +0.2% —
+# six HIGH-impact "trend reversals" in two days from a price oscillating around
+# its own 200-day average. The margin is what separates a crossover from chop.
+SMA200_MIN_DISTANCE_PCT = float(os.getenv("GQ_SMA200_MIN_DISTANCE_PCT", "0.5"))
+
+# How long one direction of a crossover stays spent for a ticker. The dedup is
+# otherwise per-day, so EEM alerted SMA200_CROSSOVER_DOWN on both Oct 15 and
+# Oct 16 — the same death cross, announced twice, because it closed back above
+# the average in between. A trend reversal is not a daily event.
+SMA200_REPEAT_DAYS = int(os.getenv("GQ_SMA200_REPEAT_DAYS", "10"))
+
+# A 52-week breakout must exceed the prior high, not equal it. FMP folds the
+# current session into `yearHigh`, so `session_high >= year_high` was
+# tautologically true for any ticker sitting at its high and the alert printed
+# its own premise back: XLE on 2026-10-16 read "hit a new 52-week high: $67.90
+# (up 0.0% from previous high of $67.90)".
+YEAR_BREAKOUT_MIN_PCT = float(os.getenv("GQ_YEAR_BREAKOUT_MIN_PCT", "0.05"))
 
 ALERT_IMPACT = {
     "RSI_OVERBOUGHT": "MEDIUM",
@@ -239,6 +261,31 @@ def load_sent_today():
     except Exception as e:
         log_poller_error(POLLER, "load_sent_today", e)
         logger.error("[TECHNICAL] Dedup ledger unreadable (%s) — emitting nothing this run", e)
+        return None
+    return {((r.get("ticker") or "").upper(), r.get("filing_type")) for r in rows}
+
+
+# Crossovers are the one alert type whose per-day dedup is not enough: a trend
+# reversal is a multi-week event, so the SAME direction repeating days later is
+# the same signal, not a new one. Fails CLOSED (returns everything as spent) so
+# an unreadable ledger cannot produce a duplicate storm.
+_CROSSOVER_TYPES = ("SMA200_CROSSOVER_UP", "SMA200_CROSSOVER_DOWN")
+
+
+def load_recent_crossovers(days=SMA200_REPEAT_DAYS):
+    """{(ticker, filing_type)} crossovers alerted in the last `days` days."""
+    since = (datetime.now(ET) - timedelta(days=days)).isoformat()
+    try:
+        rows = (supabase.table("alerts")
+                .select("ticker, filing_type")
+                .eq("source", SOURCE)
+                .in_("filing_type", list(_CROSSOVER_TYPES))
+                .gte("created_at", since)
+                .execute()).data or []
+    except Exception as e:
+        log_poller_error(POLLER, "load_recent_crossovers", e)
+        logger.error("[TECHNICAL] Crossover history unreadable (%s) — suppressing "
+                     "crossovers this run rather than risking a repeat", e)
         return None
     return {((r.get("ticker") or "").upper(), r.get("filing_type")) for r in rows}
 
@@ -414,8 +461,14 @@ def check_52_week(index, sent):
         session_high = d["day_high"] or price
         session_low = d["day_low"] or price
 
-        if year_high and session_high >= year_high and (ticker, "52W_HIGH") not in sent:
-            above = _pct(session_high, year_high)
+        # STRICTLY above, by a real margin. FMP folds the current session into
+        # `yearHigh`, so `>=` was tautologically true for any ticker sitting at
+        # its own high and the alert printed its premise back at the reader
+        # ("hit a new 52-week high: $67.90, up 0.0% from previous high of
+        # $67.90"). A breakout the reader can act on has cleared the old level.
+        above = _pct(session_high, year_high) if year_high else None
+        if (year_high and above is not None and above >= YEAR_BREAKOUT_MIN_PCT
+                and (ticker, "52W_HIGH") not in sent):
             summary = (
                 f"{ticker} hit a new 52-week high: ${session_high:,.2f} (up {above:.1f}% from "
                 f"previous high of ${year_high:,.2f}). Current price: ${price:,.2f}, "
@@ -434,8 +487,12 @@ def check_52_week(index, sent):
         # can print both a new 52-week low and a new 52-week high, and the second
         # signal is exactly the one worth knowing about. The `elif` silently
         # dropped it.
-        if year_low and session_low <= year_low and (ticker, "52W_LOW") not in sent:
-            below = _pct(year_low, session_low)
+        # Same tautology on the low side: FMP's `yearLow` already includes this
+        # session, so `<=` fired on any ticker merely sitting at its low and
+        # printed "down 0.0% from previous low of $X" where X was the same number.
+        below = _pct(year_low, session_low) if year_low else None
+        if (year_low and below is not None and below >= YEAR_BREAKOUT_MIN_PCT
+                and (ticker, "52W_LOW") not in sent):
             summary = (
                 f"{ticker} dropped to a new 52-week low: ${session_low:,.2f} (down {below:.1f}% from "
                 f"previous low of ${year_low:,.2f}). Current price: ${price:,.2f}, "
@@ -453,9 +510,18 @@ def check_52_week(index, sent):
 
 
 # ── Check 3 & 4: RSI and SMA200 (the only per-ticker API calls) ───────────────
-def check_indicators(tickers, index, sent):
-    """RSI overbought/oversold and 200-SMA crossovers for one rotation window."""
+def check_indicators(tickers, index, sent, recent_crossovers=None):
+    """
+    RSI overbought/oversold and 200-SMA crossovers for one rotation window.
+
+    `recent_crossovers` is the multi-day crossover ledger. None means it could
+    not be read, in which case crossovers are suppressed for this run — the RSI
+    half still works, and a missed crossover is recoverable while a duplicate
+    one is not.
+    """
     alerts = []
+    crossovers_ok = recent_crossovers is not None
+    spent = set(recent_crossovers or ())
     for ticker in tickers:
         d = index.get(ticker)
         if not d or not d["price"]:
@@ -513,7 +579,18 @@ def check_indicators(tickers, index, sent):
             continue
         distance = _pct(price, sma200)
 
-        if prev_close < sma200 <= price and (ticker, "SMA200_CROSSOVER_UP") not in sent:
+        # The price must CLEAR the average, not graze it. Both branches below
+        # already require the previous close on the other side; the deadband is
+        # what stops a price hovering on the line from printing a fresh "trend
+        # reversal" every session.
+        if distance is None or abs(distance) < SMA200_MIN_DISTANCE_PCT:
+            continue
+        if not crossovers_ok:
+            continue
+
+        if (prev_close < sma200 <= price
+                and (ticker, "SMA200_CROSSOVER_UP") not in sent
+                and (ticker, "SMA200_CROSSOVER_UP") not in spent):
             summary = (
                 f"{ticker} bullish crossover: price crossed above 200-day MA (${sma200:,.2f}). "
                 f"Current: ${price:,.2f}, +{abs(distance):.1f}% above MA. "
@@ -526,8 +603,11 @@ def check_indicators(tickers, index, sent):
                  "pct_from_sma": round(distance, 2) if distance is not None else None},
             ))
             sent.add((ticker, "SMA200_CROSSOVER_UP"))
+            spent.add((ticker, "SMA200_CROSSOVER_UP"))
 
-        elif prev_close > sma200 >= price and (ticker, "SMA200_CROSSOVER_DOWN") not in sent:
+        elif (prev_close > sma200 >= price
+              and (ticker, "SMA200_CROSSOVER_DOWN") not in sent
+              and (ticker, "SMA200_CROSSOVER_DOWN") not in spent):
             summary = (
                 f"{ticker} bearish crossover: price crossed below 200-day MA (${sma200:,.2f}). "
                 f"Current: ${price:,.2f}, -{abs(distance):.1f}% below MA. "
@@ -540,6 +620,7 @@ def check_indicators(tickers, index, sent):
                  "pct_from_sma": round(distance, 2) if distance is not None else None},
             ))
             sent.add((ticker, "SMA200_CROSSOVER_DOWN"))
+            spent.add((ticker, "SMA200_CROSSOVER_DOWN"))
 
     return alerts
 
@@ -591,7 +672,8 @@ def run_technical_poller():
         window, deferred = _rotating_slice(index.keys(), MAX_INDICATOR_TICKERS_PER_RUN)
         logger.info("[TECHNICAL] Indicator pass: %d tickers covered this run, %d deferred to "
                     "later runs (cap=%d).", len(window), deferred, MAX_INDICATOR_TICKERS_PER_RUN)
-        alerts += check_indicators(window, index, sent)
+        alerts += check_indicators(window, index, sent,
+                                   recent_crossovers=load_recent_crossovers())
 
         written = _write_alerts(alerts) if alerts else 0
         api_calls = 1 + (2 * len(window)) + refreshed
