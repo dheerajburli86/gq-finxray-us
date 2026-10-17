@@ -82,7 +82,24 @@ def diagnose(ticker, universe, n_filings=1):
         return
     filings.sort(key=lambda f: f.get("filing_date") or "", reverse=True)
 
-    for f in filings[:n_filings]:
+    # The newest of EACH form, not just the newest overall. 497/497K stickers
+    # are filed many times a year and a 485BPOS once, so a plain newest-first
+    # list is all stickers — which is exactly what the poller was reading. The
+    # question this answers is whether the annual 485BPOS carries the XBRL the
+    # stickers lack.
+    by_form, counts = {}, {}
+    for f in filings:
+        counts[f["form"]] = counts.get(f["form"], 0) + 1
+        by_form.setdefault(f["form"], []).append(f)
+    print("    filings in window by form: "
+          + ", ".join(f"{k} x{v}" for k, v in sorted(counts.items())))
+    picked = []
+    for form in ("485BPOS", "497K", "497"):
+        picked.extend((by_form.get(form) or [])[:n_filings])
+    if not picked:
+        picked = filings[:n_filings]
+
+    for f in picked:
         adsh, form, fdate = f["accession"], f["form"], f["filing_date"]
         primary = (f.get("primary_doc") or "").rsplit("/", 1)[-1]
         print(f"  {form} filed {fdate}  {adsh}")
@@ -165,12 +182,13 @@ def main(argv):
             print(f"    ERROR on {t}: {e}")
 
     print("\nWhat the output means")
-    print("  'FEE TABLE IS IN ANOTHER DOCUMENT'  -> cause A: the poller reads the wrong")
-    print("     file in the filing. Fix is to choose the document, not trust primaryDocument.")
-    print("  'NO inline XBRL at all' + a separate XBRL instance -> cause B: the fee data is")
-    print("     in a sibling .xml exhibit. Fix is to parse that exhibit.")
-    print("  'NO PROSPECTUS in the last 460 days' -> neither; the fund files on a cycle")
-    print("     longer than the lookback, or under a form the poller does not collect.")
+    print("  The question is whether 485BPOS carries fee facts where 497/497K does not.")
+    print("  485BPOS has fee facts, 497/497K has none -> the poller is reading stickers")
+    print("     instead of the annual prospectus. Fix is to rank 485BPOS first.")
+    print("  485BPOS also has none -> the fee data is not inline XBRL for these filers")
+    print("     at all, and the parser needs a different source entirely.")
+    print("  'NO PROSPECTUS in the last 460 days' -> the fund files on a longer cycle")
+    print("     than the lookback, or under a form the poller does not collect.")
     return 0
 
 
