@@ -50,7 +50,12 @@ POLLER = "mf_expense_poller"
 TAG = "MF_FEE"
 SOURCE = "MF_FEE"
 
-PROSPECTUS_FORMS = ("485BPOS", "497K")
+# 485BPOS only. The fee table is inline XBRL and only the annual prospectus
+# carries it: 2026-10-17 diagnostics on watched funds showed 497/497K stickers
+# with ZERO inline facts while the same fund's 485BPOS had 32-448. Reading
+# stickers filled the document budget and baselined nothing.
+PROSPECTUS_FORMS = ("485BPOS",)
+BACKFILL_PER_CIK = 2          # newest N annual prospectuses per registrant
 DAYS_BACK = int(os.getenv("MF_FEE_DAYS_BACK", "3"))
 POLL_DOC_BUDGET = int(os.getenv("MF_FEE_POLL_DOCS", "300"))
 BACKFILL_DOCS = int(os.getenv("MF_FEE_BACKFILL_DOCS", "150"))
@@ -252,7 +257,7 @@ def process_filing(meta, watched, alert=True) -> dict:
     return {"classes": n, "alerts": alerts}
 
 
-def _prospectus_filings(ciks, days_back, budget, priority=()):
+def _prospectus_filings(ciks, days_back, budget, priority=(), per_cik=None):
     """
     Prospectuses from these registrants: a registrant in `priority` first, then
     everything else, newest first inside each group.
@@ -270,7 +275,9 @@ def _prospectus_filings(ciks, days_back, budget, priority=()):
         if len(out) >= budget:
             break
         try:
-            for f in mc.recent_filings(cik, PROSPECTUS_FORMS, days_back):
+            fl = sorted(mc.recent_filings(cik, PROSPECTUS_FORMS, days_back),
+                        key=lambda f: f.get("filing_date") or "", reverse=True)
+            for f in (fl[:per_cik] if per_cik else fl):
                 name = (f.get("primary_doc") or "").rsplit("/", 1)[-1]
                 if not name:
                     continue
@@ -357,7 +364,8 @@ def run_mf_expense_backfill(max_docs: int | None = None):
             f"searching {min(len(ciks), budget * 2)} registrants for prospectuses "
             f"(one SEC call each, ~{min(len(ciks), budget * 2) / 3:.0f}s)")
         metas = _prospectus_filings(ciks[:budget * 2], BACKFILL_LOOKBACK_DAYS,
-                                    budget * 2, priority=watched_ciks)
+                                    budget * 2, priority=watched_ciks,
+                                    per_cik=BACKFILL_PER_CIK)
         done = mc.processed_keys("FEE", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done][:budget]
         log(f"expense backfill: {len(todo)} prospectuses to read "
