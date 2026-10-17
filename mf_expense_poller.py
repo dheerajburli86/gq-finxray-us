@@ -55,7 +55,7 @@ SOURCE = "MF_FEE"
 # with ZERO inline facts while the same fund's 485BPOS had 32-448. Reading
 # stickers filled the document budget and baselined nothing.
 PROSPECTUS_FORMS = ("485BPOS",)
-BACKFILL_PER_CIK = 2          # newest N annual prospectuses per registrant
+BACKFILL_PER_CIK = int(os.getenv("MF_BACKFILL_PER_CIK", "2"))  # newest N annual prospectuses per registrant
 DAYS_BACK = int(os.getenv("MF_FEE_DAYS_BACK", "3"))
 POLL_DOC_BUDGET = int(os.getenv("MF_FEE_POLL_DOCS", "300"))
 BACKFILL_DOCS = int(os.getenv("MF_FEE_BACKFILL_DOCS", "150"))
