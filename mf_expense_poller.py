@@ -61,6 +61,11 @@ BACKFILL_LOOKBACK_DAYS = int(os.getenv("MF_FEE_BACKFILL_DAYS", "460"))
 MIN_DELTA = float(os.getenv("MF_FEE_MIN_DELTA", "0.005"))      # percentage points
 HIGH_DELTA = float(os.getenv("MF_FEE_HIGH_DELTA", "0.10"))     # an increase this big is HIGH
 
+# How often a long run says where it is. A backfill reads up to 150 large
+# prospectuses at 3 SEC requests a second, so without this the only output is
+# the summary line at the very end and the run is indistinguishable from hung.
+PROGRESS_EVERY = int(os.getenv("MF_PROGRESS_EVERY", "10"))
+
 
 def log(msg):
     mc.log(TAG, msg)
@@ -300,7 +305,7 @@ def run_mf_expense_poll(days_back: int = DAYS_BACK):
         done = mc.processed_keys("FEE", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done]
         classes = alerts = 0
-        for m in todo:
+        for i, m in enumerate(todo, 1):
             try:
                 r = process_filing(m, watched, alert=True)
                 classes += r["classes"]
@@ -308,6 +313,9 @@ def run_mf_expense_poll(days_back: int = DAYS_BACK):
             except Exception as e:
                 _err("process_filing", e, {"accession": m["accession"]})
                 mc.mark_processed(m["key"], "FEE", m, "ERROR")
+            if i % PROGRESS_EVERY == 0 or i == len(todo):
+                log(f"expense poll: {i}/{len(todo)} prospectuses read, "
+                    f"{classes} share classes, {alerts} alerts")
         log(f"expense poll: {len(todo)} prospectuses, {classes} share classes, {alerts} alerts")
         return alerts
     except Exception as e:
@@ -341,17 +349,29 @@ def run_mf_expense_backfill(max_docs: int | None = None):
                 ciks.append(c)
         budget = max_docs if max_docs is not None else BACKFILL_DOCS
         watched_ciks = {u["by_ticker"][t]["cik"] for t in watched if t in u["by_ticker"]}
+        # Say so BEFORE the slow part. Finding the prospectuses costs one SEC
+        # submissions call per registrant, so a 150-document run spends a
+        # couple of minutes here before it opens anything — and with the only
+        # log line at the end, the run looked hung.
+        log(f"expense backfill: {len(missing)} share classes without a fee table; "
+            f"searching {min(len(ciks), budget * 2)} registrants for prospectuses "
+            f"(one SEC call each, ~{min(len(ciks), budget * 2) / 3:.0f}s)")
         metas = _prospectus_filings(ciks[:budget * 2], BACKFILL_LOOKBACK_DAYS,
                                     budget * 2, priority=watched_ciks)
         done = mc.processed_keys("FEE", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done][:budget]
+        log(f"expense backfill: {len(todo)} prospectuses to read "
+            f"({len(metas) - len(todo)} already done)")
         classes = 0
-        for m in todo:
+        for i, m in enumerate(todo, 1):
             try:
                 classes += process_filing(m, set(), alert=False)["classes"]
             except Exception as e:
                 _err("backfill_filing", e, {"accession": m["accession"]})
                 mc.mark_processed(m["key"], "FEE", m, "ERROR")
+            if i % PROGRESS_EVERY == 0 or i == len(todo):
+                log(f"expense backfill: {i}/{len(todo)} prospectuses read, "
+                    f"{classes} share classes baselined")
         log(f"expense backfill: {len(todo)} prospectuses, {classes} share classes baselined, "
             f"{len(missing) - classes} still without a fee table")
         return classes

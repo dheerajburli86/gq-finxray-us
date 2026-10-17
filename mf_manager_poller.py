@@ -76,6 +76,11 @@ BACKFILL_CIK_BUDGET = int(os.getenv("MF_MGR_BACKFILL_CIKS", "150"))
 BACKFILL_LOOKBACK_DAYS = int(os.getenv("MF_MGR_BACKFILL_DAYS", "460"))
 EVENT_MEMORY_DAYS = int(os.getenv("MF_MGR_EVENT_MEMORY_DAYS", "180"))
 
+# How often a long run says where it is. A backfill reads hundreds of large
+# prospectuses at 3 SEC requests a second; without this the only output is the
+# summary line at the very end and the run is indistinguishable from hung.
+PROGRESS_EVERY = int(os.getenv("MF_PROGRESS_EVERY", "10"))
+
 
 def log(msg):
     mc.log(TAG, msg)
@@ -475,7 +480,7 @@ def run_mf_manager_rosters(days_back: int = 2):
         done = mc.processed_keys("MGR_ROSTER", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done]
         series = alerts = 0
-        for m in todo:
+        for i, m in enumerate(todo, 1):
             try:
                 r = process_roster_filing(m, watched, emit_diffs=True)
                 series += r["series"]
@@ -483,6 +488,9 @@ def run_mf_manager_rosters(days_back: int = 2):
             except Exception as e:
                 _err("process_roster_filing", e, {"accession": m["accession"]})
                 mc.mark_processed(m["key"], "MGR_ROSTER", m, "ERROR")
+            if i % PROGRESS_EVERY == 0 or i == len(todo):
+                log(f"manager rosters: {i}/{len(todo)} documents read, "
+                    f"{series} funds, {alerts} alerts")
         log(f"manager rosters: {len(todo)} documents, {series} funds, {alerts} alerts")
         return alerts
     except Exception as e:
@@ -520,17 +528,30 @@ def run_mf_manager_backfill(max_ciks: int | None = None,
                                if sid not in have})
         missing_ciks.sort(key=lambda c: c not in watched_ciks)
         budget = max_ciks if max_ciks is not None else BACKFILL_CIK_BUDGET
+        # Announced before the slow part: finding the prospectuses is one SEC
+        # submissions call per registrant, so the run is busy for minutes
+        # before it opens a document. With only an end-of-run log line it
+        # looked hung.
+        n_search = min(len(missing_ciks), budget * 3)
+        log(f"manager backfill: {len(u['by_series']) - len(have)} funds without a roster; "
+            f"searching {n_search} registrants for prospectuses "
+            f"(one SEC call each, ~{n_search / 3:.0f}s)")
         metas = _roster_filings_for(missing_ciks[:budget * 3], lookback_days,
                                     budget * 4, priority=watched_ciks)
         done = mc.processed_keys("MGR_ROSTER", {m["key"] for m in metas})
         todo = [m for m in metas if m["key"] not in done][:budget * 2]
+        log(f"manager backfill: {len(todo)} documents to read "
+            f"({len(metas) - len(todo)} already done)")
         series = 0
-        for m in todo:
+        for i, m in enumerate(todo, 1):
             try:
                 series += process_roster_filing(m, set(), emit_diffs=False)["series"]
             except Exception as e:
                 _err("backfill_roster", e, {"accession": m["accession"]})
                 mc.mark_processed(m["key"], "MGR_ROSTER", m, "ERROR")
+            if i % PROGRESS_EVERY == 0 or i == len(todo):
+                log(f"manager backfill: {i}/{len(todo)} documents read, "
+                    f"{series} funds baselined")
         log(f"manager backfill: {len(todo)} documents, {series} funds baselined, "
             f"{len(u['by_series']) - len(have)} still without a roster")
         return series
