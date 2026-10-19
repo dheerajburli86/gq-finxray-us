@@ -128,7 +128,14 @@ LIST_LIMIT = 8
 # Holding lines that are not a security position. Stored, never alerted.
 _NON_SECURITY = re.compile(
     r"\b(CASH|CURRENCY|U\.?\s?S\.? DOLLARS?|USD|FUTURES?|FUT|SWAPS?|FORWARDS?|REPO|"
-    r"MONEY MARKET|OTHER ASSETS|NET OTHER|MARGIN|COLLATERAL)\b", re.I)
+    r"MONEY MARKET|OTHER ASSETS|NET OTHER|MARGIN|COLLATERAL)\b"
+    # Money-market sweep funds, which rarely say "money market" in the name.
+    # 2026-10-19: ARKK "Increased: GOLDMAN FS TRSY OBLIG INST 468 0.17% ->
+    # 1.72% (shares +908%)" -- the fund parking cash, not a position.
+    r"|\b(TRE?A?S(U?RY)?|TRSY|GOVT?|GOVERNMENT|PRIME|TAX[- ]?FREE)\.?\s+(OBLIG\w*|CASH|MM|MMF|"
+    r"MONEY|INSTRUMENTS?|RESERVES?|LIQUIDITY)\b"
+    r"|\bLIQUIDITY\s+FUNDS?\b|\bFIN(ANCIAL)?\s+SQUARE\b|\bFS\s+(TRSY|TREAS\w*|GOVT?|GOVERNMENT|PRIME)\b"
+    r"|\b(MMF|TEMPFUND|FEDFUND|T-FUND|TREASURY\s+PORTFOLIO\s+INST\w*)\b", re.I)
 
 
 # ── Supabase (one client per worker thread) ───────────────────────────────────
@@ -436,6 +443,28 @@ def expense_alert(fund, ticker, old, new):
     return summary, impact, ("ETF_EXPENSE_INCREASE" if up else "ETF_EXPENSE_DECREASE")
 
 
+FEE_AGREE_TOLERANCE = float(os.getenv("ETF_FEE_AGREE_TOLERANCE", "0.015"))  # percentage points
+
+
+def fee_disagreement_note(new, fees):
+    """
+    '' when the prospectus agrees with the vendor's new ratio, else one honest
+    sentence. 2026-10-19: TQQQ "lowered its expense ratio from 0.97% to 0.94%"
+    while the attached fee table read "total 0.94%, fee waiver -0.16%, net
+    0.78%" -- the vendor figure was the pre-waiver total, so the dollar line
+    overstated what a holder pays and the alert never said so.
+    """
+    net = fmp.num((fees or {}).get("net_expense_ratio"))
+    gross = fmp.num((fees or {}).get("gross_expense_ratio"))
+    if net is None or abs(net - new) <= FEE_AGREE_TOLERANCE:
+        return ""
+    if gross is not None and abs(gross - new) <= FEE_AGREE_TOLERANCE:
+        return (f" Note: {_pct_str(new)} is the ratio before the fund's fee waiver; after the waiver "
+                f"the prospectus shows holders paying {_pct_str(net)} (${net * 100:,.2f} a year on $10,000).")
+    return (f" Note: the prospectus net ratio of {_pct_str(net)} does not match the {_pct_str(new)} "
+            f"reported by the data vendor; check the prospectus before relying on either figure.")
+
+
 def step_expense(state, er, today):
     """
     Advance the expense-ratio state machine for one observation.
@@ -686,6 +715,7 @@ def handle_expense(ctx, ticker, fund, info, state, website, res):
         if fee_line:
             summary += (f" Latest prospectus fee table ({fees.get('form') or 'SEC'}, filed "
                         f"{fees.get('filing_date')}): {fee_line}.")
+            summary += fee_disagreement_note(new, fees)
         # No date in the key: a crash between alert and state flush must not
         # let the same change re-confirm and alert again tomorrow. The 30-day
         # window still lets a genuine repeat of the same move alert later.
@@ -709,7 +739,10 @@ def process_etf(ctx, ticker, name):
     state = dict(ctx.states.get(ticker) or {"ticker": ticker})
     try:
         info = fmp.raw_info(ticker)
-        fund = (info or {}).get("name") or name or ticker
+        # etf_master's name first: it is the curated one, and every other ETF
+        # feature uses it. FMP's profile name differs in punctuation ("ProShares
+        # - UltraPro Short QQQ"), so the same fund read two ways on one day.
+        fund = name or (info or {}).get("name") or ticker
         website = (info or {}).get("website")
         asset_class = (info or {}).get("assetClass")
 

@@ -457,7 +457,15 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
         z_e = excess / base["resid_sigma"]
         rel_ft = "ETF_OUTPERFORM" if excess > 0 else "ETF_UNDERPERFORM"
         rel_key = dedup_key(ticker, rel_ft, session_iso)
-        if abs(z_e) >= REL_Z and abs(excess) * 100 >= REL_MIN_GAP_PCT and rel_key not in sent:
+        # Heavy buying/selling already told the holder about this move today.
+        # On 2026-10-19 UVXY got "Heavy Selling" at 10:07 and "Underperforming
+        # the Market" at 10:22 -- one drop, two messages. Only a gap in the
+        # SAME direction as the price move is a repeat; an ETF rising on heavy
+        # buying yet lagging its beta is a different story and still goes out.
+        same_dir_momo = (excess > 0) == up and dedup_key(
+            ticker, "ETF_MOMENTUM_UP" if up else "ETF_MOMENTUM_DOWN", session_iso) in sent
+        if (abs(z_e) >= REL_Z and abs(excess) * 100 >= REL_MIN_GAP_PCT and rel_key not in sent
+                and not same_dir_momo):
             rstats = dict(stats, beta=_r(base["beta"], 3), r_squared=_r(base["r2"], 3),
                           excess_pct=_r(excess * 100, 3), typical_gap_pct=_r(base["resid_sigma"] * 100, 3),
                           gap_multiple=_r(abs(z_e), 2))
@@ -557,7 +565,36 @@ def evaluate_session(ticker, name, sessions, sent, idx=None):
                                        "threshold_pct": t}))
                     sent.add(key)
                 break
-    return out
+    return merge_session_alerts(out)
+
+
+_IMPACT_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+
+def merge_session_alerts(rows):
+    """
+    One message per ETF per session close. On 2026-10-19 TQQQ received "Enters
+    Bear Market Territory" and "5-Day Losing Streak" as two separate messages
+    in the same minute, about the same Friday close; QQQ did the same with a
+    pullback and a streak. They describe one move, so they go out as one alert
+    led by the most severe signal. Every merged dedup key is kept in
+    extra.merged_dedup_keys, and load_sent() reads those back, so no merged
+    signal can fire again on its own later.
+    """
+    if len(rows) < 2:
+        return rows
+    rows = sorted(rows, key=lambda r: -_IMPACT_RANK.get(r["impact"], 0))
+    lead = dict(rows[0])
+    extra = dict(lead["extra"])
+    extra["headline"] = " · ".join(r["extra"]["headline"] for r in rows)
+    extra["merged_dedup_keys"] = [r["extra"]["dedup_key"] for r in rows[1:]]
+    extra["merged_filing_types"] = [r["filing_type"] for r in rows[1:]]
+    extra["merged_signals"] = [{k: v for k, v in r["extra"].items()
+                                if k not in ("headline", "company_name", "etf_ticker", "engine")}
+                               for r in rows[1:]]
+    lead["summary"] = " ".join(r["summary"] for r in rows)
+    lead["extra"] = extra
+    return [lead]
 
 
 # ── I/O: who is opted in, what they watch, what was already sent ──────────────
@@ -629,7 +666,12 @@ def load_sent(days=None):
         log_poller_error(POLLER, "load_sent", e)
         logger.error("[ETF-SIG] Dedup ledger unreadable (%s) -- emitting nothing this run", e)
         return None
-    return {(r.get("extra") or {}).get("dedup_key") for r in rows} - {None}
+    keys = set()
+    for r in rows:
+        ex = r.get("extra") or {}
+        keys.add(ex.get("dedup_key"))
+        keys.update(ex.get("merged_dedup_keys") or ())
+    return keys - {None}
 
 
 def write_alerts(rows):

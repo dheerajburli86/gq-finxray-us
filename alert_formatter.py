@@ -212,11 +212,30 @@ def _cached_quote(ticker):
     return q
 
 
-def _price_line(ticker):
+# Sources whose alert carries the price snapshot its body was computed from.
+# For these the header must show THAT price, not a fresh quote: on 2026-10-19
+# TQQQ's header read "$71.68 +5.09%" over a body saying "up 5.30% at $71.83",
+# because the quote was fetched minutes after the signal fired. Two prices in
+# one message reads as an error.
+SNAPSHOT_PRICE_SOURCES = {"ETF_SIGNAL"}
+
+
+def _snapshot_quote(alert):
+    if not alert or alert.get("source") not in SNAPSHOT_PRICE_SOURCES:
+        return None
+    extra = alert.get("extra") or {}
+    try:
+        p, c = float(extra["price"]), float(extra["change_pct"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"price": p, "changePercentage": c} if p > 0 else None
+
+
+def _price_line(ticker, alert=None):
     """'📈 $214.29  🟢 +1.24%' or '' when the price is unavailable."""
     if not ticker or ticker.upper() in ("MARKET", "UNKNOWN", ""):
         return ""
-    q = _cached_quote(ticker)
+    q = _snapshot_quote(alert) or _cached_quote(ticker)
     if not q or q.get("price") in (None, ""):
         return ""
     try:
@@ -372,7 +391,7 @@ def build_message(alert, reason=None):
         if company and company.upper() != ticker:
             head += f" — {esc(company)}"
         lines.append(head)
-        price = _price_line(ticker)
+        price = _price_line(ticker, alert)
         if price:
             lines.append(price)
 
