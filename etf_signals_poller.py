@@ -392,7 +392,7 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
     live_tape = volume >= 1000 and (expected <= 0 or volume >= MIN_TAPE_SHARE * expected)
     stats = {
         "session_date": session_iso, "price": _r(price, 4), "prev_close": _r(prev_close, 4),
-        "change_pct": _r(r * 100, 3), "typical_move_pct": _r(typical, 3), "move_multiple": _r(abs(z), 2),
+        "change_pct": _r(r * 100, 6), "typical_move_pct": _r(typical, 3), "move_multiple": _r(abs(z), 2),
         "day_volume": int(volume), "expected_volume_so_far": int(expected),
         "avg_volume_20d": int(base["adv"]), "volume_ratio": _r(ratio, 2),
         "session_elapsed_fraction": _r(elapsed, 3),
