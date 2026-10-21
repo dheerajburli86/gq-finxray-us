@@ -121,6 +121,19 @@ line = AF._price_line("XLI", {"ticker": "XLI", "source": "TECHNICAL",
 check("XLI header = body", "$166.45" in line and "-0.13%" in line, line)
 AF._quote_cache.pop("XLI", None)
 
+print("7. A watched mutual fund is re-checked every daily run, not every other one")
+import mf_poller as MP                    # noqa: E402
+from datetime import timezone, timedelta  # noqa: E402
+now = datetime(2026, 10, 21, 1, 40, 0, tzinfo=timezone.utc)
+st = {"checked_at": "2026-10-20T01:40:07.788892+00:00", "last_error": None}
+check("OAKMX checked 23h59m53s ago is due", MP._due(st, True, now))
+check("not due again at the 12:40 run (11h later)",
+      not MP._due({"checked_at": now.isoformat()}, True, now + timedelta(hours=11)))
+check("unwatched fund still waits ~3 days",
+      not MP._due({"checked_at": now.isoformat()}, False, now + timedelta(days=2)))
+check("errored fund still waits ~7 days",
+      not MP._due({"checked_at": now.isoformat(), "last_error": "x"}, True, now + timedelta(days=5)))
+
 print()
 print("ALL PASS" if not failures else f"{len(failures)} FAILED: {failures}")
 sys.exit(1 if failures else 0)

@@ -49,6 +49,7 @@ DOC_BUDGET = 1500                     # N-PORT documents downloaded per run
 RUN_SECONDS = 90 * 60                 # stop a run after this long, resume next run
 RECHECK_WATCHED_DAYS = 1              # how often a registrant with a watched fund is re-listed
 RECHECK_DAYS = 3                      # ... and any other registrant
+DUE_SLACK = timedelta(hours=3)        # absorbs run-start jitter in _due()
 ERROR_RETRY_DAYS = 7                  # a fund whose filing could not be read waits this long
 MAX_STORED = 500                      # heaviest positions kept per fund
 ALERT_MIN_WEIGHT = 0.5                # percent of net assets
@@ -595,7 +596,12 @@ def _due(state, watched, now):
     if t.tzinfo is None:
         t = t.replace(tzinfo=timezone.utc)
     days = ERROR_RETRY_DAYS if (state or {}).get("last_error") else (RECHECK_WATCHED_DAYS if watched else RECHECK_DAYS)
-    return now - t >= timedelta(days=days)
+    # Slack, because the schedule is fixed but the touch time is not. A run at
+    # 01:40:00 sees "checked 01:40:07 yesterday" as 23h59m old and skips the
+    # fund; with runs at 12:40 and 01:40 UTC a "daily" watched fund then waits
+    # 35 hours. Seen 2026-10-21: OAKMX and PRGFX last checked Oct 20 while the
+    # other 38 watched funds were checked that morning.
+    return now - t >= timedelta(days=days) - DUE_SLACK
 
 
 def _load_states():
