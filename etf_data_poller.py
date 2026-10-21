@@ -135,7 +135,12 @@ _NON_SECURITY = re.compile(
     r"|\b(TRE?A?S(U?RY)?|TRSY|GOVT?|GOVERNMENT|PRIME|TAX[- ]?FREE)\.?\s+(OBLIG\w*|CASH|MM|MMF|"
     r"MONEY|INSTRUMENTS?|RESERVES?|LIQUIDITY)\b"
     r"|\bLIQUIDITY\s+FUNDS?\b|\bFIN(ANCIAL)?\s+SQUARE\b|\bFS\s+(TRSY|TREAS\w*|GOVT?|GOVERNMENT|PRIME)\b"
-    r"|\b(MMF|TEMPFUND|FEDFUND|T-FUND|TREASURY\s+PORTFOLIO\s+INST\w*)\b", re.I)
+    r"|\b(MMF|TEMPFUND|FEDFUND|T-FUND|TREASURY\s+PORTFOLIO\s+INST\w*)\b"
+    # Treasury bills are the collateral commodity funds hold against futures.
+    # 2026-10-20: USO "Removed: TREASURY BILL 0 10/20/2026, previously 2.97%"
+    # -- a bill maturing on its due date, not a sale. Notes and bonds stay
+    # alertable (bond funds are skipped by asset class anyway).
+    r"|\b(U\.?S\.?\s+|UNITED\s+STATES\s+)?(TREASURY|TREAS)\s+BILLS?\b|\bT-?BILLS?\b|\bTBILLS?\b", re.I)
 
 
 # ── Supabase (one client per worker thread) ───────────────────────────────────

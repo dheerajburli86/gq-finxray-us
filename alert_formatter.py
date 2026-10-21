@@ -217,7 +217,9 @@ def _cached_quote(ticker):
 # TQQQ's header read "$71.68 +5.09%" over a body saying "up 5.30% at $71.83",
 # because the quote was fetched minutes after the signal fired. Two prices in
 # one message reads as an error.
-SNAPSHOT_PRICE_SOURCES = {"ETF_SIGNAL"}
+# TECHNICAL added 2026-10-21: XLI's header read "-0.01%" over a body saying
+# "down 0.1% on the session" at $166.45 vs $166.67.
+SNAPSHOT_PRICE_SOURCES = {"ETF_SIGNAL", "TECHNICAL"}
 
 
 def _snapshot_quote(alert):

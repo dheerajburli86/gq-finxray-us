@@ -135,7 +135,7 @@ ALERT_IMPACT = {
 _run_counter = 0
 
 # {"date": <ET date>, "levels": {ticker: (year_high, year_low)}}
-_year_range_cache = {"date": None, "levels": {}}
+_year_range_cache = {"date": None, "levels": {}, "avg_volume": {}, "set_today": {}}
 
 
 # ── Session clock ─────────────────────────────────────────────────────────────
@@ -243,6 +243,10 @@ def _rotating_slice(items, size):
 
 
 # ── Dedup ledger ──────────────────────────────────────────────────────────────
+_ETF_VOLUME_SIGNALS = {"ETF_MOMENTUM_UP", "ETF_MOMENTUM_DOWN",
+                       "ETF_BIG_MOVE_UP", "ETF_BIG_MOVE_DOWN"}
+
+
 def load_sent_today():
     """
     {(ticker, filing_type)} already alerted today, measured from ET midnight.
@@ -254,15 +258,26 @@ def load_sent_today():
     midnight_et = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
     try:
         rows = (supabase.table("alerts")
-                .select("ticker, filing_type")
-                .eq("source", SOURCE)
+                .select("ticker, filing_type, source")
+                .in_("source", [SOURCE, "ETF_SIGNAL"])
                 .gte("created_at", midnight_et.isoformat())
                 .execute()).data or []
     except Exception as e:
         log_poller_error(POLLER, "load_sent_today", e)
         logger.error("[TECHNICAL] Dedup ledger unreadable (%s) — emitting nothing this run", e)
         return None
-    return {((r.get("ticker") or "").upper(), r.get("filing_type")) for r in rows}
+    sent = set()
+    for r in rows:
+        t = (r.get("ticker") or "").upper()
+        ft = r.get("filing_type")
+        if r.get("source", SOURCE) == SOURCE:
+            sent.add((t, ft))
+        elif ft in _ETF_VOLUME_SIGNALS:
+            # 2026-10-20: XLV "Heavy Buying" (Feature 7, 10:04) then "Trading
+            # Volume Far Above Normal Pace" (Feature 6, 10:21) -- the same
+            # surge twice. The ETF signal already carries the volume.
+            sent.add((t, "VOLUME_SPIKE"))
+    return sent
 
 
 # Crossovers are the one alert type whose per-day dedup is not enough: a trend
@@ -288,6 +303,31 @@ def load_recent_crossovers(days=SMA200_REPEAT_DAYS):
                      "crossovers this run rather than risking a repeat", e)
         return None
     return {((r.get("ticker") or "").upper(), r.get("filing_type")) for r in rows}
+
+
+def load_names(tickers):
+    """{ticker: name} from stocks / etf_master / mf_master. Feature 6 alerts went
+    out headed "$MGK" with no fund name while every other feature named it.
+    Best effort: a failed read just leaves the header as it was."""
+    tickers = sorted({t.upper() for t in tickers if t})
+    out = {}
+    if not tickers:
+        return out
+    for table, cols, key in (("stocks", "*", None), ("etf_master", "ticker, name", "name"),
+                             ("mf_master", "ticker, series_name", "series_name")):
+        todo = [t for t in tickers if t not in out]
+        if not todo:
+            break
+        try:
+            rows = supabase.table(table).select(cols).in_("ticker", todo).execute().data or []
+        except Exception as e:
+            log_poller_error(POLLER, f"load_names_{table}", e)
+            continue
+        for r in rows:
+            n = r.get(key) if key else (r.get("name") or r.get("company_name") or r.get("companyName"))
+            if r.get("ticker") and n:
+                out[r["ticker"].upper()] = n
+    return out
 
 
 def _write_alerts(rows):
@@ -382,7 +422,13 @@ def check_volume_spikes(index, sent, elapsed_fraction):
         if price < MIN_PRICE or prev_volume < MIN_PREV_VOLUME or volume < MIN_DAY_VOLUME:
             continue
 
-        expected = prev_volume * elapsed_fraction
+        # One prior session is a noisy baseline: on 2026-10-20 XLV "2.5x" was
+        # measured against Monday's 5.9M shares while its 20-day average is
+        # 8.4M -- against the average it was 1.75x, below the threshold. Use
+        # FMP's average daily volume when the day cache has it.
+        avg = (_year_range_cache.get("avg_volume") or {}).get(ticker)
+        baseline = avg or prev_volume
+        expected = baseline * elapsed_fraction
         if expected <= 0:
             continue
         ratio = volume / expected
@@ -392,9 +438,9 @@ def check_volume_spikes(index, sent, elapsed_fraction):
         change_pct = d["change_pct"]
         summary = (
             f"{ticker} trading surge: {int(volume):,} shares traded today — "
-            f"{ratio:.1f}x the {int(expected):,} expected by this time of day. "
-            f"Price: ${price:,.2f}, {_move_phrase(change_pct)}. "
-            f"Unusual volume at this level often accompanies major news or institutional positioning."
+            f"{ratio:.1f}x the {int(expected):,} expected by this time of day "
+            f"({'average daily volume' if avg else 'previous session'} {int(baseline):,}). "
+            f"Price: ${price:,.2f}, {_move_phrase(change_pct)}."
         )
         alerts.append(_build_alert(
             ticker, "VOLUME_SPIKE", summary,
@@ -403,6 +449,8 @@ def check_volume_spikes(index, sent, elapsed_fraction):
                 "price": price,
                 "day_volume": int(volume),
                 "prev_volume": int(prev_volume),
+                "baseline_volume": int(baseline),
+                "baseline": "avg_volume" if avg else "prev_day",
                 "expected_volume_so_far": int(expected),
                 "volume_ratio": round(ratio, 2),
                 "session_elapsed_fraction": round(elapsed_fraction, 3),
@@ -423,6 +471,8 @@ def refresh_year_ranges(watched):
     if _year_range_cache["date"] != today:
         _year_range_cache["date"] = today
         _year_range_cache["levels"] = {}
+        _year_range_cache["avg_volume"] = {}
+        _year_range_cache["set_today"] = {}
 
     levels = _year_range_cache["levels"]
     missing = sorted(t for t in watched if t not in levels)
@@ -442,6 +492,23 @@ def refresh_year_ranges(watched):
         low = _num(q.get("yearLow"))
         if high or low:
             levels[ticker] = (high, low)
+        avg = _num(q.get("avgVolume"))
+        if avg:
+            _year_range_cache.setdefault("avg_volume", {})[ticker] = avg
+        # FMP folds today's session into yearHigh/yearLow. When the quote's day
+        # high IS the year high, today already made the new 52-week high before
+        # this cache was filled, so "session high > cached year high" can only
+        # fire later, against today's own morning high, and the alert names that
+        # morning high as the "previous high". Remember it so check_52_week can
+        # report the breakout itself instead.
+        dh, dl = _num(q.get("dayHigh")), _num(q.get("dayLow"))
+        flags = {}
+        if high and dh and dh >= high * (1 - 1e-9):
+            flags["high"] = dh
+        if low and dl and dl <= low * (1 + 1e-9):
+            flags["low"] = dl
+        if flags:
+            _year_range_cache.setdefault("set_today", {})[ticker] = flags
 
     return len(batch), max(0, len(missing) - len(batch))
 
@@ -466,14 +533,28 @@ def check_52_week(index, sent):
         # its own high and the alert printed its premise back at the reader
         # ("hit a new 52-week high: $67.90, up 0.0% from previous high of
         # $67.90"). A breakout the reader can act on has cleared the old level.
+        today_set = (_year_range_cache.get("set_today") or {}).get(ticker) or {}
         above = _pct(session_high, year_high) if year_high else None
+        if ("high" in today_set and (ticker, "52W_HIGH") not in sent
+                and not (above is not None and above >= YEAR_BREAKOUT_MIN_PCT)):
+            summary = (
+                f"{ticker} set a new 52-week high today at ${max(session_high, today_set['high']):,.2f}. "
+                f"Current price: ${price:,.2f}, {_move_phrase(d['change_pct'])}."
+            )
+            alerts.append(_build_alert(
+                ticker, "52W_HIGH", summary, "Breaks Out To New 52-Week High",
+                {"price": price, "session_high": session_high, "year_high": year_high,
+                 "set_before_first_check": True,
+                 "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
+            ))
+            sent.add((ticker, "52W_HIGH"))
         if (year_high and above is not None and above >= YEAR_BREAKOUT_MIN_PCT
                 and (ticker, "52W_HIGH") not in sent):
+            prior = ("today's earlier high" if "high" in today_set else "previous high")
             summary = (
                 f"{ticker} hit a new 52-week high: ${session_high:,.2f} (up {above:.1f}% from "
-                f"previous high of ${year_high:,.2f}). Current price: ${price:,.2f}, "
-                f"{_move_phrase(d['change_pct'])}. Breakout moves often trigger breakup momentum "
-                f"as stop-losses get cleared and technical traders enter long positions."
+                f"{prior} of ${year_high:,.2f}). Current price: ${price:,.2f}, "
+                f"{_move_phrase(d['change_pct'])}."
             )
             alerts.append(_build_alert(
                 ticker, "52W_HIGH", summary, "Breaks Out To New 52-Week High",
@@ -491,13 +572,26 @@ def check_52_week(index, sent):
         # session, so `<=` fired on any ticker merely sitting at its low and
         # printed "down 0.0% from previous low of $X" where X was the same number.
         below = _pct(year_low, session_low) if year_low else None
+        if ("low" in today_set and (ticker, "52W_LOW") not in sent
+                and not (below is not None and below >= YEAR_BREAKOUT_MIN_PCT)):
+            summary = (
+                f"{ticker} set a new 52-week low today at ${min(session_low, today_set['low']):,.2f}. "
+                f"Current price: ${price:,.2f}, {_move_phrase(d['change_pct'])}."
+            )
+            alerts.append(_build_alert(
+                ticker, "52W_LOW", summary, "Breaks Down To New 52-Week Low",
+                {"price": price, "session_low": session_low, "year_low": year_low,
+                 "set_before_first_check": True,
+                 "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
+            ))
+            sent.add((ticker, "52W_LOW"))
         if (year_low and below is not None and below >= YEAR_BREAKOUT_MIN_PCT
                 and (ticker, "52W_LOW") not in sent):
+            prior = ("today's earlier low" if "low" in today_set else "previous low")
             summary = (
                 f"{ticker} dropped to a new 52-week low: ${session_low:,.2f} (down {below:.1f}% from "
-                f"previous low of ${year_low:,.2f}). Current price: ${price:,.2f}, "
-                f"{_move_phrase(d['change_pct'])}. Breakdown below key support levels can accelerate selling "
-                f"as long-term holders cut losses and short sellers add to positions."
+                f"{prior} of ${year_low:,.2f}). Current price: ${price:,.2f}, "
+                f"{_move_phrase(d['change_pct'])}."
             )
             alerts.append(_build_alert(
                 ticker, "52W_LOW", summary, "Breaks Down To New 52-Week Low",
@@ -542,8 +636,8 @@ def check_indicators(tickers, index, sent, recent_crossovers=None):
                 summary = (
                     f"{ticker} overbought alert: RSI(14) = {rsi:.1f} (threshold: {RSI_OVERBOUGHT:.0f}). "
                     f"Price: ${price:,.2f}, {_move_phrase(d['change_pct'])}. "
-                    f"Overbought conditions (RSI > 70) typically precede mean reversion within 3-5 days as "
-                    f"buyers exhaust and profit-taking sets in."
+                    f"An RSI above 70 means gains have outweighed losses over the last 14 sessions; it "
+                    f"describes recent momentum and does not on its own predict a reversal."
                 )
                 alerts.append(_build_alert(
                     ticker, "RSI_OVERBOUGHT", summary, "RSI Moves Into Overbought Territory",
@@ -555,8 +649,8 @@ def check_indicators(tickers, index, sent, recent_crossovers=None):
                 summary = (
                     f"{ticker} oversold alert: RSI(14) = {rsi:.1f} (threshold: {RSI_OVERSOLD:.0f}). "
                     f"Price: ${price:,.2f}, {_move_phrase(d['change_pct'])}. "
-                    f"Oversold conditions (RSI < 30) often precede reversals as forced selling exhausts and "
-                    f"bargain hunters step in."
+                    f"An RSI below 30 means losses have outweighed gains over the last 14 sessions; it "
+                    f"describes recent momentum and does not on its own predict a rebound."
                 )
                 alerts.append(_build_alert(
                     ticker, "RSI_OVERSOLD", summary, "RSI Moves Into Oversold Territory",
@@ -594,8 +688,8 @@ def check_indicators(tickers, index, sent, recent_crossovers=None):
             summary = (
                 f"{ticker} bullish crossover: price crossed above 200-day MA (${sma200:,.2f}). "
                 f"Current: ${price:,.2f}, +{abs(distance):.1f}% above MA. "
-                f"This golden cross is a classic trend-reversal signal — stocks crossing above their 200-day MA "
-                f"often see sustained uptrend as long-term momentum turns positive."
+                f"The 200-day average is a widely watched long-term trend line; a single cross does not "
+                f"confirm a change in trend."
             )
             alerts.append(_build_alert(
                 ticker, "SMA200_CROSSOVER_UP", summary, "Price Crosses Above 200-Day Average",
@@ -611,8 +705,8 @@ def check_indicators(tickers, index, sent, recent_crossovers=None):
             summary = (
                 f"{ticker} bearish crossover: price crossed below 200-day MA (${sma200:,.2f}). "
                 f"Current: ${price:,.2f}, -{abs(distance):.1f}% below MA. "
-                f"This death cross is a classic trend-reversal signal — stocks crossing below their 200-day MA "
-                f"often trigger downtrend as long-term momentum turns negative."
+                f"The 200-day average is a widely watched long-term trend line; a single cross does not "
+                f"confirm a change in trend."
             )
             alerts.append(_build_alert(
                 ticker, "SMA200_CROSSOVER_DOWN", summary, "Price Crosses Below 200-Day Average",
@@ -661,12 +755,13 @@ def run_technical_poller():
         _run_counter += 1
 
         alerts = []
-        alerts += check_volume_spikes(index, sent, elapsed)
-
+        # Day cache first: it now also carries the average volume the spike
+        # check is measured against.
         refreshed, still_missing = refresh_year_ranges(set(index.keys()))
         if refreshed:
             logger.info("[TECHNICAL] Refreshed 52-week levels for %d tickers (%d still pending, "
                         "will be picked up on the next run).", refreshed, still_missing)
+        alerts += check_volume_spikes(index, sent, elapsed)
         alerts += check_52_week(index, sent)
 
         window, deferred = _rotating_slice(index.keys(), MAX_INDICATOR_TICKERS_PER_RUN)
@@ -675,6 +770,11 @@ def run_technical_poller():
         alerts += check_indicators(window, index, sent,
                                    recent_crossovers=load_recent_crossovers())
 
+        if alerts:
+            names = load_names({a["ticker"] for a in alerts})
+            for a in alerts:
+                if names.get(a["ticker"]):
+                    a["extra"]["company_name"] = names[a["ticker"]]
         written = _write_alerts(alerts) if alerts else 0
         api_calls = 1 + (2 * len(window)) + refreshed
         logger.info("[TECHNICAL] Done. %d watched / %d priced, %d alerts written, "
