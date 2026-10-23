@@ -674,6 +674,49 @@ def load_sent(days=None):
     return keys - {None}
 
 
+_MOMO_TYPES = ("ETF_MOMENTUM_UP", "ETF_MOMENTUM_DOWN")
+
+
+def technical_volume_tickers(session, tickers):
+    """Tickers that already got a Feature 6 volume spike this session. Empty on
+    any failure: the cost of a failed read is one possible repeat, not silence."""
+    if not tickers:
+        return set()
+    midnight = datetime(session.year, session.month, session.day, tzinfo=ET)
+    try:
+        rows = (sb().table("alerts").select("ticker")
+                .eq("source", "TECHNICAL").eq("filing_type", "VOLUME_SPIKE")
+                .gte("created_at", midnight.isoformat())
+                .in_("ticker", sorted(tickers)).execute()).data or []
+    except Exception as e:
+        log_poller_error(POLLER, "technical_volume_tickers", e)
+        return set()
+    return {(r.get("ticker") or "").upper() for r in rows}
+
+
+def drop_momentum_covered_by_technical(alerts, session):
+    """
+    Heavy buying/selling is a volume surge with a direction. When Feature 6 has
+    already told the holder about the surge today, the momentum alert repeats
+    it: on 2026-10-22 GDX, TQQQ, SQQQ, XLI, XLE, ARKK and GLD each got a Feature
+    6 volume spike and then a Feature 7 momentum alert 15 minutes to 2.5 hours
+    later. Checked just before writing (not at the start of the pass) so a spike
+    written while this pass was fetching bars is still seen. Big-move and
+    relative signals are untouched -- they say something the spike did not.
+    """
+    momo = {a["ticker"] for a in alerts if a.get("filing_type") in _MOMO_TYPES}
+    if not momo:
+        return alerts
+    covered = technical_volume_tickers(session, momo)
+    if not covered:
+        return alerts
+    kept = [a for a in alerts
+            if not (a.get("filing_type") in _MOMO_TYPES and a["ticker"] in covered)]
+    logger.info("[ETF-SIG] %d momentum alert(s) skipped -- Feature 6 already reported the "
+                "volume surge today: %s", len(alerts) - len(kept), ", ".join(sorted(covered & momo)))
+    return kept
+
+
 def write_alerts(rows):
     """-> (rows written, tickers whose rows failed). A failed row is simply
     re-detected next run, because dedup is read back from the table."""
@@ -853,6 +896,7 @@ def intraday_pass(universe, now, sent, force=False, dry_run=False):
         alerts += evaluate_intraday(t, universe[t], base, m, elapsed, session_iso, sent,
                                     bench=bench, div=get_div_today(t, session))
 
+    alerts = drop_momentum_covered_by_technical(alerts, session)
     written = 0 if dry_run else (write_alerts(alerts)[0] if alerts else 0)
     logger.info("[ETF-SIG] Intraday %s (%.0f%% of session volume): %d ETFs priced, %d skipped, "
                 "%d alert(s)%s%s", session_iso, elapsed * 100, priced, len(skipped), len(alerts),

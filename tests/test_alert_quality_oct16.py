@@ -42,7 +42,7 @@ def _run_sma(price, prev_close, sma200, sent=None, recent=None):
                       "day_high": price, "day_low": price,
                       "day_volume": 1e6, "prev_volume": 1e6}}
     real_rsi, real_sma = TP.massive_client.get_rsi, TP.massive_client.get_sma
-    TP.massive_client.get_rsi = lambda t, window=14: [{"value": 50}]
+    TP.massive_client.get_rsi = lambda t, window=14, **kw: [{"value": 50}]
     TP.massive_client.get_sma = lambda t, window=200: [{"value": sma200}]
     try:
         return TP.check_indicators(["TEST"], index, sent if sent is not None else set(),

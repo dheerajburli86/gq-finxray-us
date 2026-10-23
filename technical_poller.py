@@ -97,6 +97,16 @@ MAX_INDICATOR_TICKERS_PER_RUN = 150
 # run of the day (or when the watchlist grows mid-session).
 MAX_YEAR_RANGE_REFRESH_PER_RUN = 250
 
+# Sessions behind "average daily volume" for the spike baseline -- the same
+# 20-day window Feature 7 uses, so both features mean the same "normal".
+ADV_SESSIONS = 20
+ADV_MIN_SESSIONS = 10
+
+# A 52-week high/low alert that has already reversed this far by the time it is
+# sent says so, rather than reading as a breakout still in progress (XLE on
+# 2026-10-22: high of $68.78 at the open, alert at 10:00 with the fund down 1%).
+REVERSAL_NOTE_PCT = 1.0
+
 # ── Deadbands ─────────────────────────────────────────────────────────────────
 # A "golden cross" is a trend signal, so the price has to actually CLEAR the
 # average. Without a deadband the test fired on any price that happened to sit
@@ -462,6 +472,32 @@ def check_volume_spikes(index, sent, elapsed_fraction):
 
 
 # ── Check 2: 52-week high / low (day-cached FMP quotes) ───────────────────────
+def _avg_daily_volume(ticker, today):
+    """Mean volume of the last ADV_SESSIONS complete sessions, from Massive daily
+    bars. FMP's /stable/quote has no avgVolume field, so the Oct 20 fix that read
+    it never took effect: every Feature 6 spike from Oct 21-22 still said
+    "(previous session ...)" and was measured against one day."""
+    frm = (today - timedelta(days=45)).isoformat()
+    to = (today - timedelta(days=1)).isoformat()
+    try:
+        bars = massive_client.get_aggregates(ticker, 1, "day", frm, to)
+    except Exception as e:
+        log_poller_error(POLLER, "avg_daily_volume", e, {"ticker": ticker})
+        return None
+    by_day = {}
+    for b in bars or []:
+        t, v = b.get("t"), _num(b.get("v"))
+        if t is None or not v:
+            continue
+        d = datetime.fromtimestamp(float(t) / 1000.0, tz=ET).date()
+        if d < today:
+            by_day[d] = v
+    recent = [by_day[d] for d in sorted(by_day)][-ADV_SESSIONS:]
+    if len(recent) < ADV_MIN_SESSIONS:
+        return None
+    return sum(recent) / len(recent)
+
+
 def refresh_year_ranges(watched):
     """
     Ensure `_year_range_cache` holds today's yearHigh/yearLow for as much of the
@@ -492,9 +528,11 @@ def refresh_year_ranges(watched):
         low = _num(q.get("yearLow"))
         if high or low:
             levels[ticker] = (high, low)
-        avg = _num(q.get("avgVolume"))
-        if avg:
-            _year_range_cache.setdefault("avg_volume", {})[ticker] = avg
+        avg_cache = _year_range_cache.setdefault("avg_volume", {})
+        if ticker not in avg_cache:
+            avg = _num(q.get("avgVolume")) or _avg_daily_volume(ticker, today)
+            if avg:
+                avg_cache[ticker] = avg
         # FMP folds today's session into yearHigh/yearLow. When the quote's day
         # high IS the year high, today already made the new 52-week high before
         # this cache was filled, so "session high > cached year high" can only
@@ -511,6 +549,21 @@ def refresh_year_ranges(watched):
             _year_range_cache.setdefault("set_today", {})[ticker] = flags
 
     return len(batch), max(0, len(missing) - len(batch))
+
+
+def _reversal(price, level, high_side):
+    """(headline, sentence) when price has moved REVERSAL_NOTE_PCT or more back
+    from the level it just set; (None, "") otherwise."""
+    if not price or not level:
+        return None, ""
+    gap = (level - price) / level * 100 if high_side else (price - level) / level * 100
+    if gap < REVERSAL_NOTE_PCT:
+        return None, ""
+    if high_side:
+        return ("Hits New 52-Week High, Then Pulls Back",
+                f" It has since pulled back {gap:.1f}% from that high.")
+    return ("Hits New 52-Week Low, Then Rebounds",
+            f" It has since rebounded {gap:.1f}% from that low.")
 
 
 def check_52_week(index, sent):
@@ -537,12 +590,14 @@ def check_52_week(index, sent):
         above = _pct(session_high, year_high) if year_high else None
         if ("high" in today_set and (ticker, "52W_HIGH") not in sent
                 and not (above is not None and above >= YEAR_BREAKOUT_MIN_PCT)):
+            level = max(session_high, today_set['high'])
+            rev_head, rev_text = _reversal(price, level, True)
             summary = (
-                f"{ticker} set a new 52-week high today at ${max(session_high, today_set['high']):,.2f}. "
-                f"Current price: ${price:,.2f}, {_move_phrase(d['change_pct'])}."
+                f"{ticker} set a new 52-week high today at ${level:,.2f}. "
+                f"Current price: ${price:,.2f}, {_move_phrase(d['change_pct'])}.{rev_text}"
             )
             alerts.append(_build_alert(
-                ticker, "52W_HIGH", summary, "Breaks Out To New 52-Week High",
+                ticker, "52W_HIGH", summary, rev_head or "Breaks Out To New 52-Week High",
                 {"price": price, "session_high": session_high, "year_high": year_high,
                  "set_before_first_check": True,
                  "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
@@ -551,13 +606,14 @@ def check_52_week(index, sent):
         if (year_high and above is not None and above >= YEAR_BREAKOUT_MIN_PCT
                 and (ticker, "52W_HIGH") not in sent):
             prior = ("today's earlier high" if "high" in today_set else "previous high")
+            rev_head, rev_text = _reversal(price, session_high, True)
             summary = (
                 f"{ticker} hit a new 52-week high: ${session_high:,.2f} (up {above:.1f}% from "
                 f"{prior} of ${year_high:,.2f}). Current price: ${price:,.2f}, "
-                f"{_move_phrase(d['change_pct'])}."
+                f"{_move_phrase(d['change_pct'])}.{rev_text}"
             )
             alerts.append(_build_alert(
-                ticker, "52W_HIGH", summary, "Breaks Out To New 52-Week High",
+                ticker, "52W_HIGH", summary, rev_head or "Breaks Out To New 52-Week High",
                 {"price": price, "session_high": session_high, "year_high": year_high,
                  "pct_above_prior_high": round(above, 2) if above is not None else None,
                  "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
@@ -574,12 +630,14 @@ def check_52_week(index, sent):
         below = _pct(year_low, session_low) if year_low else None
         if ("low" in today_set and (ticker, "52W_LOW") not in sent
                 and not (below is not None and below >= YEAR_BREAKOUT_MIN_PCT)):
+            level = min(session_low, today_set['low'])
+            rev_head, rev_text = _reversal(price, level, False)
             summary = (
-                f"{ticker} set a new 52-week low today at ${min(session_low, today_set['low']):,.2f}. "
-                f"Current price: ${price:,.2f}, {_move_phrase(d['change_pct'])}."
+                f"{ticker} set a new 52-week low today at ${level:,.2f}. "
+                f"Current price: ${price:,.2f}, {_move_phrase(d['change_pct'])}.{rev_text}"
             )
             alerts.append(_build_alert(
-                ticker, "52W_LOW", summary, "Breaks Down To New 52-Week Low",
+                ticker, "52W_LOW", summary, rev_head or "Breaks Down To New 52-Week Low",
                 {"price": price, "session_low": session_low, "year_low": year_low,
                  "set_before_first_check": True,
                  "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
@@ -588,13 +646,14 @@ def check_52_week(index, sent):
         if (year_low and below is not None and below >= YEAR_BREAKOUT_MIN_PCT
                 and (ticker, "52W_LOW") not in sent):
             prior = ("today's earlier low" if "low" in today_set else "previous low")
+            rev_head, rev_text = _reversal(price, session_low, False)
             summary = (
                 f"{ticker} dropped to a new 52-week low: ${session_low:,.2f} (down {below:.1f}% from "
                 f"{prior} of ${year_low:,.2f}). Current price: ${price:,.2f}, "
-                f"{_move_phrase(d['change_pct'])}."
+                f"{_move_phrase(d['change_pct'])}.{rev_text}"
             )
             alerts.append(_build_alert(
-                ticker, "52W_LOW", summary, "Breaks Down To New 52-Week Low",
+                ticker, "52W_LOW", summary, rev_head or "Breaks Down To New 52-Week Low",
                 {"price": price, "session_low": session_low, "year_low": year_low,
                  "pct_below_prior_low": round(below, 2) if below is not None else None,
                  "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
@@ -604,6 +663,29 @@ def check_52_week(index, sent):
 
 
 # ── Check 3 & 4: RSI and SMA200 (the only per-ticker API calls) ───────────────
+def _rnd(x, n=2):
+    return None if x is None else round(x, n)
+
+
+def _rsi_and_prior(values):
+    """(latest RSI, RSI at the session before it) from Massive's newest-first
+    values. The prior is the first value dated before the latest one, so this
+    works whether or not Massive includes today's partial session."""
+    pts = []
+    for v in values or []:
+        val = _num((v or {}).get("value"))
+        if val is None:
+            continue
+        ts = _num(v.get("timestamp"))
+        d = datetime.fromtimestamp(ts / 1000.0, tz=ET).date() if ts else None
+        pts.append((d, val))
+    if not pts:
+        return None, None
+    d0, rsi = pts[0]
+    for d, val in pts[1:]:
+        if d0 is None or d is None or d < d0:
+            return rsi, val
+    return rsi, None
 def check_indicators(tickers, index, sent, recent_crossovers=None):
     """
     RSI overbought/oversold and 200-SMA crossovers for one rotation window.
@@ -625,36 +707,44 @@ def check_indicators(tickers, index, sent, recent_crossovers=None):
 
         # ── RSI ──
         try:
-            values = massive_client.get_rsi(ticker, window=14)
-            rsi = _num((values or [{}])[0].get("value")) if values else None
+            values = massive_client.get_rsi(ticker, window=14, limit=5)
         except Exception as e:
             log_poller_error(POLLER, "get_rsi", e, {"ticker": ticker})
-            rsi = None
+            values = None
+        rsi, prev_rsi = _rsi_and_prior(values)
+
+        # "Moves Into" overbought/oversold means a crossing. The dedup is per
+        # day, so a fund that STAYED above 70 re-alerted every session it was
+        # in the window (XLP: Oct 20 at 70.3, Oct 22 at 70.8). Only alert when
+        # the previous session's RSI was on the other side of the line.
+        crossed_up = prev_rsi is None or prev_rsi < RSI_OVERBOUGHT
+        crossed_dn = prev_rsi is None or prev_rsi > RSI_OVERSOLD
+        prior_txt = (f", from {prev_rsi:.1f} at the previous close" if prev_rsi is not None else "")
 
         if rsi is not None:
-            if rsi >= RSI_OVERBOUGHT and (ticker, "RSI_OVERBOUGHT") not in sent:
+            if rsi >= RSI_OVERBOUGHT and crossed_up and (ticker, "RSI_OVERBOUGHT") not in sent:
                 summary = (
-                    f"{ticker} overbought alert: RSI(14) = {rsi:.1f} (threshold: {RSI_OVERBOUGHT:.0f}). "
+                    f"{ticker} overbought alert: RSI(14) = {rsi:.1f}{prior_txt} (threshold: {RSI_OVERBOUGHT:.0f}). "
                     f"Price: ${price:,.2f}, {_move_phrase(d['change_pct'])}. "
                     f"An RSI above 70 means gains have outweighed losses over the last 14 sessions; it "
                     f"describes recent momentum and does not on its own predict a reversal."
                 )
                 alerts.append(_build_alert(
                     ticker, "RSI_OVERBOUGHT", summary, "RSI Moves Into Overbought Territory",
-                    {"rsi": round(rsi, 2), "threshold": RSI_OVERBOUGHT, "price": price,
+                    {"rsi": round(rsi, 2), "prev_rsi": _rnd(prev_rsi), "threshold": RSI_OVERBOUGHT, "price": price,
                      "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
                 ))
                 sent.add((ticker, "RSI_OVERBOUGHT"))
-            elif rsi <= RSI_OVERSOLD and (ticker, "RSI_OVERSOLD") not in sent:
+            elif rsi <= RSI_OVERSOLD and crossed_dn and (ticker, "RSI_OVERSOLD") not in sent:
                 summary = (
-                    f"{ticker} oversold alert: RSI(14) = {rsi:.1f} (threshold: {RSI_OVERSOLD:.0f}). "
+                    f"{ticker} oversold alert: RSI(14) = {rsi:.1f}{prior_txt} (threshold: {RSI_OVERSOLD:.0f}). "
                     f"Price: ${price:,.2f}, {_move_phrase(d['change_pct'])}. "
                     f"An RSI below 30 means losses have outweighed gains over the last 14 sessions; it "
                     f"describes recent momentum and does not on its own predict a rebound."
                 )
                 alerts.append(_build_alert(
                     ticker, "RSI_OVERSOLD", summary, "RSI Moves Into Oversold Territory",
-                    {"rsi": round(rsi, 2), "threshold": RSI_OVERSOLD, "price": price,
+                    {"rsi": round(rsi, 2), "prev_rsi": _rnd(prev_rsi), "threshold": RSI_OVERSOLD, "price": price,
                      "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
                 ))
                 sent.add((ticker, "RSI_OVERSOLD"))
@@ -694,6 +784,7 @@ def check_indicators(tickers, index, sent, recent_crossovers=None):
             alerts.append(_build_alert(
                 ticker, "SMA200_CROSSOVER_UP", summary, "Price Crosses Above 200-Day Average",
                 {"price": price, "prev_close": prev_close, "sma200": sma200,
+                 "change_pct": d["change_pct"],
                  "pct_from_sma": round(distance, 2) if distance is not None else None},
             ))
             sent.add((ticker, "SMA200_CROSSOVER_UP"))
@@ -711,6 +802,7 @@ def check_indicators(tickers, index, sent, recent_crossovers=None):
             alerts.append(_build_alert(
                 ticker, "SMA200_CROSSOVER_DOWN", summary, "Price Crosses Below 200-Day Average",
                 {"price": price, "prev_close": prev_close, "sma200": sma200,
+                 "change_pct": d["change_pct"],
                  "pct_from_sma": round(distance, 2) if distance is not None else None},
             ))
             sent.add((ticker, "SMA200_CROSSOVER_DOWN"))
@@ -769,6 +861,17 @@ def run_technical_poller():
                     "later runs (cap=%d).", len(window), deferred, MAX_INDICATOR_TICKERS_PER_RUN)
         alerts += check_indicators(window, index, sent,
                                    recent_crossovers=load_recent_crossovers())
+
+        # Re-read the ledger right before writing. Feature 7's first pass of the
+        # day fetches bars for every fund and writes ~a minute after it starts,
+        # so on 2026-10-22 XLP "Heavy Buying" (9:59) and this run's XLP volume
+        # spike (10:00) each missed the other in a ledger read at the start.
+        if any(a["filing_type"] == "VOLUME_SPIKE" for a in alerts):
+            fresh = load_sent_today()
+            if fresh:
+                alerts = [a for a in alerts if not (
+                    a["filing_type"] == "VOLUME_SPIKE"
+                    and (a["ticker"].upper(), "VOLUME_SPIKE") in fresh)]
 
         if alerts:
             names = load_names({a["ticker"] for a in alerts})
