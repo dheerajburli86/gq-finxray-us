@@ -124,6 +124,12 @@ REL_MIN_GAP_PCT = _f("ETF_SIG_REL_MIN_GAP_PCT", 1.0)
 # "gap" vs SPY is tracking noise.
 REL_MIN_R2 = _f("ETF_SIG_REL_MIN_R2", 0.30)
 REL_MAX_R2 = _f("ETF_SIG_REL_MAX_R2", 0.95)
+# Leveraged and inverse funds are a multiple of another index, so their "gap"
+# vs SPY is that index's gap times the leverage: on 2026-10-23 QQQ, TQQQ (beta
+# 4.78) and SQQQ (beta -4.80) each sent an out/under-performance alert for the
+# one fact "Nasdaq beat the S&P". Relative signals need a positive beta no
+# larger than this; the leveraged fund's own big moves still alert.
+REL_MAX_BETA = _f("ETF_SIG_REL_MAX_BETA", 2.5)
 STREAKS = _ints("ETF_SIG_STREAKS", "5,7,10")
 # Each depth is its own filing type, so only depths feature_map knows about are
 # allowed -- anything else would land as an unmapped, unmutable feature 0.
@@ -452,6 +458,7 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
                or dedup_key(ticker, "ETF_BIG_MOVE_DOWN", session_iso) in sent)
     if (bench is not None and ticker != BENCHMARK and not any_big and live_tape
             and elapsed >= REL_MIN_ELAPSED and base.get("beta") is not None
+            and 0 < base["beta"] <= REL_MAX_BETA
             and REL_MIN_R2 <= base["r2"] < REL_MAX_R2):
         excess = r - base["beta"] * bench["r"]
         z_e = excess / base["resid_sigma"]

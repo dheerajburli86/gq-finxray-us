@@ -60,18 +60,16 @@ try:
 finally:
     TP.massive_client.get_aggregates = real
 
-# refresh_year_ranges fills the average even though the FMP quote lacks it.
-TP._year_range_cache.update(date=None, levels={}, avg_volume={}, set_today={})
-real_q, real_adv = TP.fmp_client.get_quotes, TP._avg_daily_volume
-TP.fmp_client.get_quotes = lambda b: {t: {"yearHigh": 70, "yearLow": 50, "dayHigh": 68,
-                                          "dayLow": 67} for t in b}
-TP._avg_daily_volume = lambda t, d: 31.9e6
+# refresh_year_ranges fills the average from the same bars as the levels.
+TP._year_range_cache.update(date=None, levels={}, avg_volume={}, level_dates={})
+TP.massive_client.get_aggregates = lambda *a, **k: [dict(b, h=70, l=50) for b in bars[:-1]]
 try:
     TP.refresh_year_ranges({"XLE"})
 finally:
-    TP.fmp_client.get_quotes, TP._avg_daily_volume = real_q, real_adv
-check("average cached from bars", TP._year_range_cache["avg_volume"].get("XLE") == 31.9e6,
+    TP.massive_client.get_aggregates = real
+check("average cached from bars", TP._year_range_cache["avg_volume"].get("XLE") == 2e6,
       TP._year_range_cache["avg_volume"])
+TP._year_range_cache["avg_volume"]["XLE"] = 31.9e6
 # XLE Oct 22 10:00: 6.80M on the tape at ~12.4% elapsed. Previous session 26.5M -> 2.07x;
 # against its 31.9M average it is 1.72x -- not a spike.
 got = TP.check_volume_spikes({"XLE": {"price": 67.48, "prev_close": 68.16, "day_volume": 6.797e6,
@@ -107,8 +105,8 @@ check("text names the prior reading", cross and "from 68.4 at the previous close
       cross and cross[0]["summary"])
 
 print("3. A 52-week high that has already reversed says so")
-TP._year_range_cache.update(date=datetime.now(ET).date(), levels={"XLE": (68.78, 50.0)},
-                            avg_volume={}, set_today={"XLE": {"high": 68.78}})
+TP._year_range_cache.update(date=datetime.now(ET).date(), levels={"XLE": (68.64, 50.0)},
+                            avg_volume={}, level_dates={"XLE": (date(2026, 10, 21), None)})
 got = TP.check_52_week({"XLE": snap(67.48, 68.16, hi=68.78)}, set())
 check("one alert", len(got) == 1, got)
 check("headline is not 'Breaks Out' on a fund down 1%",
@@ -116,7 +114,9 @@ check("headline is not 'Breaks Out' on a fund down 1%",
       got and got[0]["extra"]["headline"])
 check("summary gives the pull-back", got and "pulled back 1.9% from that high" in got[0]["summary"],
       got and got[0]["summary"])
-TP._year_range_cache.update(levels={"XLE": (68.51, 50.0)}, set_today={})
+check("summary dates the previous high", got and "$68.64 on Oct 21, 2026" in got[0]["summary"],
+      got and got[0]["summary"])
+TP._year_range_cache.update(levels={"XLE": (68.51, 50.0)}, level_dates={})
 got = TP.check_52_week({"XLE": snap(68.49, 67.97, hi=68.64)}, set())
 check("a breakout still near its high keeps the breakout headline (XLE Oct 21)",
       got and got[0]["extra"]["headline"] == "Breaks Out To New 52-Week High"

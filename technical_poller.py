@@ -30,12 +30,11 @@ THE REARCHITECTURE
   watchlist exceeds the cap the poller rotates deterministically through it
   across runs and logs exactly how many names were covered and how many were
   deferred. Nothing is silently dropped.
-* 52-week high/low comes from `fmp_client.get_quotes()` (yearHigh/yearLow), and
-  the levels are cached for the trading day — a 52-week extreme moves at most
-  once per session, so re-fetching it every 30 minutes buys nothing. Comparing
-  today's price against the start-of-day level is also the more correct
-  breakout test: FMP folds today's move into yearHigh, so a same-call comparison
-  degenerates to `price >= price`.
+* 52-week high/low and the 20-day average volume come from one Massive daily-
+  bars call per ticker per day, over COMPLETED sessions only, cached for the
+  trading day. Today's session high/low is compared against those levels.
+  (FMP's quote was used until 2026-10-23; its yearHigh already contains today's
+  prints, pre-market included, so it could not say what the previous high was.)
 * Dedup is one batched query at the top of the run, and it fails CLOSED: if the
   ledger cannot be read the run emits nothing rather than risk re-sending.
 
@@ -145,7 +144,7 @@ ALERT_IMPACT = {
 _run_counter = 0
 
 # {"date": <ET date>, "levels": {ticker: (year_high, year_low)}}
-_year_range_cache = {"date": None, "levels": {}, "avg_volume": {}, "set_today": {}}
+_year_range_cache = {"date": None, "levels": {}, "avg_volume": {}, "level_dates": {}}
 
 
 # ── Session clock ─────────────────────────────────────────────────────────────
@@ -472,43 +471,68 @@ def check_volume_spikes(index, sent, elapsed_fraction):
 
 
 # ── Check 2: 52-week high / low (day-cached FMP quotes) ───────────────────────
-def _avg_daily_volume(ticker, today):
-    """Mean volume of the last ADV_SESSIONS complete sessions, from Massive daily
-    bars. FMP's /stable/quote has no avgVolume field, so the Oct 20 fix that read
-    it never took effect: every Feature 6 spike from Oct 21-22 still said
-    "(previous session ...)" and was measured against one day."""
-    frm = (today - timedelta(days=45)).isoformat()
+YEAR_SESSIONS = 252
+
+
+def _daily_history(ticker, today):
+    """Complete sessions strictly before `today` from Massive daily bars,
+    oldest first: [(date, high, low, volume)]. None when the fetch failed."""
+    frm = (today - timedelta(days=372)).isoformat()
     to = (today - timedelta(days=1)).isoformat()
     try:
         bars = massive_client.get_aggregates(ticker, 1, "day", frm, to)
     except Exception as e:
-        log_poller_error(POLLER, "avg_daily_volume", e, {"ticker": ticker})
+        log_poller_error(POLLER, "daily_history", e, {"ticker": ticker})
         return None
     by_day = {}
     for b in bars or []:
-        t, v = b.get("t"), _num(b.get("v"))
-        if t is None or not v:
+        t = b.get("t")
+        if t is None:
             continue
         d = datetime.fromtimestamp(float(t) / 1000.0, tz=ET).date()
         if d < today:
-            by_day[d] = v
-    recent = [by_day[d] for d in sorted(by_day)][-ADV_SESSIONS:]
+            by_day[d] = (_num(b.get("h")), _num(b.get("l")), _num(b.get("v")))
+    return [(d,) + by_day[d] for d in sorted(by_day)]
+
+
+def _avg_daily_volume(ticker, today, history=None):
+    """Mean volume of the last ADV_SESSIONS complete sessions. FMP's
+    /stable/quote has no avgVolume field, so Feature 6 used to measure spikes
+    against one prior session."""
+    history = _daily_history(ticker, today) if history is None else history
+    recent = [v for (_, _, _, v) in (history or []) if v][-ADV_SESSIONS:]
     if len(recent) < ADV_MIN_SESSIONS:
         return None
     return sum(recent) / len(recent)
 
 
+def _year_levels(history):
+    """((high, high_date), (low, low_date)) over the last YEAR_SESSIONS complete
+    sessions, or None."""
+    year = [r for r in (history or [])[-YEAR_SESSIONS:] if r[1] and r[2]]
+    if len(year) < 20:
+        return None
+    hi = max(year, key=lambda r: (r[1], r[0]))
+    lo = min(year, key=lambda r: (r[2], -r[0].toordinal()))
+    return (hi[1], hi[0]), (lo[2], lo[0])
+
+
 def refresh_year_ranges(watched):
     """
-    Ensure `_year_range_cache` holds today's yearHigh/yearLow for as much of the
-    watchlist as the per-run cap allows. Returns (refreshed, still_missing).
+    Fill the day cache with each ticker's 52-week high/low and 20-day average
+    volume, all from COMPLETED sessions (Massive daily bars). Returns
+    (refreshed, still_missing).
+
+    2026-10-23: the levels used to come from FMP's quote, whose yearHigh already
+    contains today's prints -- including pre-market ones the regular-session
+    day high does not. USO's pre-market $167.90 became its "52-week high"
+    before the open, so the real breakout above Thursday's $163.66 was never
+    reported at 10:07, and the 12:21 alert called today's own $167.90 the
+    "previous high". Prior sessions only, so "previous" means previous.
     """
     today = datetime.now(ET).date()
     if _year_range_cache["date"] != today:
-        _year_range_cache["date"] = today
-        _year_range_cache["levels"] = {}
-        _year_range_cache["avg_volume"] = {}
-        _year_range_cache["set_today"] = {}
+        _year_range_cache.update(date=today, levels={}, avg_volume={}, level_dates={})
 
     levels = _year_range_cache["levels"]
     missing = sorted(t for t in watched if t not in levels)
@@ -516,39 +540,22 @@ def refresh_year_ranges(watched):
         return 0, 0
 
     batch = missing[:MAX_YEAR_RANGE_REFRESH_PER_RUN]
-    try:
-        quotes = fmp_client.get_quotes(batch)
-    except Exception as e:
-        log_poller_error(POLLER, "refresh_year_ranges", e, {"count": len(batch)})
-        return 0, len(missing)
-
+    done = 0
     for ticker in batch:
-        q = (quotes or {}).get(ticker) or {}
-        high = _num(q.get("yearHigh"))
-        low = _num(q.get("yearLow"))
-        if high or low:
+        history = _daily_history(ticker, today)
+        if not history:
+            continue          # retried next run
+        lv = _year_levels(history)
+        if lv:
+            (high, hd), (low, ld) = lv
             levels[ticker] = (high, low)
-        avg_cache = _year_range_cache.setdefault("avg_volume", {})
-        if ticker not in avg_cache:
-            avg = _num(q.get("avgVolume")) or _avg_daily_volume(ticker, today)
-            if avg:
-                avg_cache[ticker] = avg
-        # FMP folds today's session into yearHigh/yearLow. When the quote's day
-        # high IS the year high, today already made the new 52-week high before
-        # this cache was filled, so "session high > cached year high" can only
-        # fire later, against today's own morning high, and the alert names that
-        # morning high as the "previous high". Remember it so check_52_week can
-        # report the breakout itself instead.
-        dh, dl = _num(q.get("dayHigh")), _num(q.get("dayLow"))
-        flags = {}
-        if high and dh and dh >= high * (1 - 1e-9):
-            flags["high"] = dh
-        if low and dl and dl <= low * (1 + 1e-9):
-            flags["low"] = dl
-        if flags:
-            _year_range_cache.setdefault("set_today", {})[ticker] = flags
+            _year_range_cache.setdefault("level_dates", {})[ticker] = (hd, ld)
+        avg = _avg_daily_volume(ticker, today, history)
+        if avg:
+            _year_range_cache.setdefault("avg_volume", {})[ticker] = avg
+        done += 1
 
-    return len(batch), max(0, len(missing) - len(batch))
+    return done, max(0, len(missing) - done)
 
 
 def _reversal(price, level, high_side):
@@ -566,14 +573,20 @@ def _reversal(price, level, high_side):
             f" It has since rebounded {gap:.1f}% from that low.")
 
 
+def _on(d):
+    return f" on {d.strftime('%b')} {d.day}, {d.year}" if d else ""
+
+
 def check_52_week(index, sent):
     levels = _year_range_cache["levels"]
+    dates = _year_range_cache.get("level_dates") or {}
     alerts = []
     for ticker, d in index.items():
         price = d["price"]
         if not price or price < MIN_PRICE:
             continue
         year_high, year_low = levels.get(ticker, (None, None))
+        high_date, low_date = dates.get(ticker, (None, None))
 
         # day_high/day_low catch a breakout that has already faded by the time
         # this run reads the snapshot; price alone would miss an intraday poke
@@ -581,82 +594,44 @@ def check_52_week(index, sent):
         session_high = d["day_high"] or price
         session_low = d["day_low"] or price
 
-        # STRICTLY above, by a real margin. FMP folds the current session into
-        # `yearHigh`, so `>=` was tautologically true for any ticker sitting at
-        # its own high and the alert printed its premise back at the reader
-        # ("hit a new 52-week high: $67.90, up 0.0% from previous high of
-        # $67.90"). A breakout the reader can act on has cleared the old level.
-        today_set = (_year_range_cache.get("set_today") or {}).get(ticker) or {}
+        # The levels are from completed sessions only, so a breakout must clear
+        # the old high by a real margin (YEAR_BREAKOUT_MIN_PCT) -- a session
+        # that merely touches it is not a new high.
         above = _pct(session_high, year_high) if year_high else None
-        if ("high" in today_set and (ticker, "52W_HIGH") not in sent
-                and not (above is not None and above >= YEAR_BREAKOUT_MIN_PCT)):
-            level = max(session_high, today_set['high'])
-            rev_head, rev_text = _reversal(price, level, True)
-            summary = (
-                f"{ticker} set a new 52-week high today at ${level:,.2f}. "
-                f"Current price: ${price:,.2f}, {_move_phrase(d['change_pct'])}.{rev_text}"
-            )
-            alerts.append(_build_alert(
-                ticker, "52W_HIGH", summary, rev_head or "Breaks Out To New 52-Week High",
-                {"price": price, "session_high": session_high, "year_high": year_high,
-                 "set_before_first_check": True,
-                 "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
-            ))
-            sent.add((ticker, "52W_HIGH"))
-        if (year_high and above is not None and above >= YEAR_BREAKOUT_MIN_PCT
+        if (above is not None and above >= YEAR_BREAKOUT_MIN_PCT
                 and (ticker, "52W_HIGH") not in sent):
-            prior = ("today's earlier high" if "high" in today_set else "previous high")
             rev_head, rev_text = _reversal(price, session_high, True)
             summary = (
-                f"{ticker} hit a new 52-week high: ${session_high:,.2f} (up {above:.1f}% from "
-                f"{prior} of ${year_high:,.2f}). Current price: ${price:,.2f}, "
+                f"{ticker} hit a new 52-week high: ${session_high:,.2f} (up {above:.1f}% from the "
+                f"previous high of ${year_high:,.2f}{_on(high_date)}). Current price: ${price:,.2f}, "
                 f"{_move_phrase(d['change_pct'])}.{rev_text}"
             )
             alerts.append(_build_alert(
                 ticker, "52W_HIGH", summary, rev_head or "Breaks Out To New 52-Week High",
                 {"price": price, "session_high": session_high, "year_high": year_high,
-                 "pct_above_prior_high": round(above, 2) if above is not None else None,
-                 "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
+                 "year_high_date": high_date.isoformat() if high_date else None,
+                 "pct_above_prior_high": round(above, 2),
+                 "change_pct": d["change_pct"]},
             ))
             sent.add((ticker, "52W_HIGH"))
 
-        # Independent `if`, not `elif`: a session that gaps down and then reverses
-        # can print both a new 52-week low and a new 52-week high, and the second
-        # signal is exactly the one worth knowing about. The `elif` silently
-        # dropped it.
-        # Same tautology on the low side: FMP's `yearLow` already includes this
-        # session, so `<=` fired on any ticker merely sitting at its low and
-        # printed "down 0.0% from previous low of $X" where X was the same number.
+        # Independent `if`, not `elif`: a session that gaps down and then
+        # reverses can print both a new 52-week low and a new 52-week high.
         below = _pct(year_low, session_low) if year_low else None
-        if ("low" in today_set and (ticker, "52W_LOW") not in sent
-                and not (below is not None and below >= YEAR_BREAKOUT_MIN_PCT)):
-            level = min(session_low, today_set['low'])
-            rev_head, rev_text = _reversal(price, level, False)
-            summary = (
-                f"{ticker} set a new 52-week low today at ${level:,.2f}. "
-                f"Current price: ${price:,.2f}, {_move_phrase(d['change_pct'])}.{rev_text}"
-            )
-            alerts.append(_build_alert(
-                ticker, "52W_LOW", summary, rev_head or "Breaks Down To New 52-Week Low",
-                {"price": price, "session_low": session_low, "year_low": year_low,
-                 "set_before_first_check": True,
-                 "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
-            ))
-            sent.add((ticker, "52W_LOW"))
-        if (year_low and below is not None and below >= YEAR_BREAKOUT_MIN_PCT
+        if (below is not None and below >= YEAR_BREAKOUT_MIN_PCT
                 and (ticker, "52W_LOW") not in sent):
-            prior = ("today's earlier low" if "low" in today_set else "previous low")
             rev_head, rev_text = _reversal(price, session_low, False)
             summary = (
-                f"{ticker} dropped to a new 52-week low: ${session_low:,.2f} (down {below:.1f}% from "
-                f"{prior} of ${year_low:,.2f}). Current price: ${price:,.2f}, "
+                f"{ticker} dropped to a new 52-week low: ${session_low:,.2f} (down {below:.1f}% from the "
+                f"previous low of ${year_low:,.2f}{_on(low_date)}). Current price: ${price:,.2f}, "
                 f"{_move_phrase(d['change_pct'])}.{rev_text}"
             )
             alerts.append(_build_alert(
                 ticker, "52W_LOW", summary, rev_head or "Breaks Down To New 52-Week Low",
                 {"price": price, "session_low": session_low, "year_low": year_low,
-                 "pct_below_prior_low": round(below, 2) if below is not None else None,
-                 "change_pct": round(d["change_pct"], 2) if d["change_pct"] is not None else None},
+                 "year_low_date": low_date.isoformat() if low_date else None,
+                 "pct_below_prior_low": round(below, 2),
+                 "change_pct": d["change_pct"]},
             ))
             sent.add((ticker, "52W_LOW"))
     return alerts

@@ -102,7 +102,11 @@ s = {ESP.dedup_key("UVXY", "ETF_MOMENTUM_DOWN", day.isoformat())}
 got = [a["filing_type"] for a in ev(-0.0843, 9.3e6 * 0.4 * 1.0, s)]
 check("later run, same direction: still suppressed", got == [], got)
 got = [a["filing_type"] for a in ev(-0.0843, 9.3e6 * 0.4 * 1.0, set())]
+check("UVXY (beta -3.46) never gets a relative signal (Oct 23 rule)", got == [], got)
+base["beta"] = 1.2
+got = [a["filing_type"] for a in ev(-0.0843, 9.3e6 * 0.4 * 1.0, set())]
 check("control: no momentum today -> underperform goes out", got == ["ETF_UNDERPERFORM"], got)
+base["beta"] = -3.46
 
 print("5. Header price is the price the body was computed from")
 alert = {"ticker": "TQQQ", "source": "ETF_SIGNAL", "extra": {"price": 71.83, "change_pct": 5.30}}

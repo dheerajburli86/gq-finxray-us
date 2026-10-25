@@ -30,9 +30,9 @@ import etf_data_poller as EDP        # noqa: E402
 import alert_formatter as AF         # noqa: E402
 
 
-def fresh_cache(levels=None, avg=None, set_today=None):
+def fresh_cache(levels=None, avg=None):
     TP._year_range_cache.update(date=datetime.now(TP.ET).date(), levels=levels or {},
-                                avg_volume=avg or {}, set_today=set_today or {})
+                                avg_volume=avg or {}, level_dates={})
 
 
 def snap(price, prev_close, vol, prev_vol, hi=None, lo=None):
@@ -91,19 +91,13 @@ check("XLV heavy buying blocks its volume spike", ("XLV", "VOLUME_SPIKE") in sen
 check("relative-performance signal does not", ("IWM", "VOLUME_SPIKE") not in sent, sent)
 check("own ledger still read", ("XLP", "RSI_OVERBOUGHT") in sent, sent)
 
-print("4. 52-week high made before the day cache filled")
-# Cache read at 09:50: yearHigh 179.81 == dayHigh 179.81 -> today already set it.
-fresh_cache(levels={"XLV": (179.81, 140.0)}, set_today={"XLV": {"high": 179.81}})
+print("4. 52-week high made before the first check is reported at the first check")
+# Levels now come from completed sessions, so a high set at the open is a
+# breakout on the first run, measured against the real previous high.
+fresh_cache(levels={"XLV": (178.86, 140.0)})
 got = TP.check_52_week({"XLV": snap(179.40, 175.65, 1e6, 1e6, hi=179.81)}, set())
-check("breakout reported on the next run, not hours later", len(got) == 1, got)
-check("no fake 'previous high' quoted", got and "previous high" not in got[0]["summary"], got)
-s2 = set()
-got = TP.check_52_week({"XLV": snap(179.75, 175.65, 1e6, 1e6, hi=180.06)}, s2)
-check("a later push above the morning high says so",
-      got and "today's earlier high" in got[0]["summary"], got and got[0]["summary"])
-fresh_cache(levels={"XLF": (58.56, 40.0)})
-got = TP.check_52_week({"XLF": snap(58.70, 58.0, 1e6, 1e6, hi=58.70)}, set())
-check("ordinary breakout still names the previous high", got and "previous high" in got[0]["summary"], got)
+check("breakout reported on the first run", len(got) == 1, got)
+check("names the real previous high", got and "previous high of $178.86" in got[0]["summary"], got)
 
 print("5. Technical alerts describe, they do not predict")
 import inspect   # noqa: E402
