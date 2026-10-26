@@ -406,12 +406,14 @@ def _etf_master_tickers(tickers):
 
 
 def collect_candidates(funds, start, end):
-    """Run every EFTS query; keep only hits filed by a CIK that owns a watched fund."""
+    """Run every EFTS query; keep only hits filed by a CIK that owns a watched
+    fund. -> (candidates, phrases whose search failed)"""
     watched_ciks = {v["cik"] for v in funds.values()}
-    cands = {}
+    cands, failed = {}, []
     for event_type, _floor, forms, queries in RULES:
         for q in queries:
-            for h in fm.efts_hits(q, forms, start, end, max_pages=MAX_PAGES):
+            for h in fm.efts_hits_safe(q, forms, start, end, max_pages=MAX_PAGES,
+                                       failed=failed):
                 src = h.get("_source") or {}
                 ciks = {str(c).zfill(10) for c in (src.get("ciks") or [])}
                 own = ciks & watched_ciks
@@ -425,7 +427,7 @@ def collect_candidates(funds, start, end):
                 c["rules"].setdefault(event_type, [])
                 if q not in c["rules"][event_type]:
                     c["rules"][event_type].append(q)
-    return cands
+    return cands, failed
 
 
 def process_document(meta, funds):
@@ -534,9 +536,11 @@ def run_etf_fund_events_poller(days_back=None):
             return 0
         end = date.today()
         start = end - timedelta(days=days_back)
-        cands = collect_candidates(funds, start.isoformat(), end.isoformat())
+        cands, failed = collect_candidates(funds, start.isoformat(), end.isoformat())
+        miss = f", {len(failed)} phrase search(es) FAILED" if failed else ""
         if not cands:
-            log(f"{start}..{end}: no candidate filings from {len({v['cik'] for v in funds.values()})} watched trust(s)")
+            log(f"{start}..{end}: no candidate filings from "
+                f"{len({v['cik'] for v in funds.values()})} watched trust(s){miss}")
             return 0
         seen = _seen_keys(cands)
         fresh = {k: v for k, v in cands.items() if k not in seen}
@@ -547,7 +551,7 @@ def run_etf_fund_events_poller(days_back=None):
             except Exception as e:
                 _log_error("process_document", e, {"doc_key": key})
                 _record(meta, "ERROR")
-        log(f"{start}..{end}: {len(cands)} candidate(s), {len(fresh)} new, {queued} queued")
+        log(f"{start}..{end}: {len(cands)} candidate(s), {len(fresh)} new, {queued} queued{miss}")
         return queued
     except Exception as e:
         _log_error("run_etf_fund_events_poller", e)
@@ -562,7 +566,7 @@ if __name__ == "__main__":
         print(f"watched SEC-registered funds: {sorted(f)}")
         e = date.today()
         lookback = int(sys.argv[2]) if len(sys.argv) > 2 else 30
-        c = collect_candidates(f, (e - timedelta(days=lookback)).isoformat(), e.isoformat())
+        c, _failed = collect_candidates(f, (e - timedelta(days=lookback)).isoformat(), e.isoformat())
         for k, v in c.items():
             print(f"  {v.get('filing_date')} {(v.get('form') or ''):8} {(v.get('filer') or '')[:50]:50} "
                   f"{sorted(v['rules'])}  {v['url']}")

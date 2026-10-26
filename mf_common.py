@@ -268,6 +268,30 @@ def efts_hits(query, forms, start, end, max_pages=10):
             return
 
 
+def efts_hits_safe(query, forms, start, end, max_pages=10, failed=None):
+    """
+    efts_hits, but ONE failed query loses that query instead of the whole sweep.
+
+    Every caller runs this inside a loop over dozens of phrases, and a bare
+    `for h in efts_hits(...)` let a single transient network failure propagate
+    out of that loop and abort the entire run -- discarding every candidate
+    already collected. Seen 2026-10-26: one connection reset killed
+    run_mf_fund_events_poller AND run_mf_manager_events in the same second
+    (4 times in 3 days each), throwing away ~60 phrase searches between them.
+    A sweep that loses a phrase still reports the rest; `failed` collects the
+    phrases that dropped so the run can say so rather than looking clean.
+    """
+    try:
+        for h in efts_hits(query, forms, start, end, max_pages=max_pages):
+            yield h
+    except GeneratorExit:
+        raise
+    except Exception as e:
+        log_poller_error("mf_common", "efts_hits", e, {"query": query, "forms": forms})
+        if failed is not None:
+            failed.append(query)
+
+
 def hit_meta(h):
     src = h.get("_source") or {}
     hid = h.get("_id") or ""

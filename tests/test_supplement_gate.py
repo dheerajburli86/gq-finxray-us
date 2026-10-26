@@ -116,6 +116,45 @@ for row, want in (
     label = row["title"] or row["security_name"]
     check(f"{'position' if want else 'cash'}: {label[:40]!r}", MP._alertable(row) is want)
 
+print("8. One failed phrase search does not abort the whole sweep")
+# 2026-10-26: a single connection reset killed run_mf_fund_events_poller and
+# run_mf_manager_events in the same second, 4 times in 3 days each, discarding
+# every candidate already collected by ~60 phrase searches.
+import mf_common as mc            # noqa: E402
+import etf_fund_events_poller as EFE2  # noqa: E402
+
+real_hits, real_log = mc.efts_hits, mc.log_poller_error
+calls = []
+
+
+def _flaky(query, forms, start, end, max_pages=10):
+    calls.append(query)
+    if "boom" in query:
+        raise RuntimeError("ConnectionTerminated error_code:1")
+    yield {"_source": {"ciks": ["0000000001"], "form": "497", "file_date": "2026-10-26",
+                       "display_names": ["Acme Trust"]},
+           "_id": f"0000000001-26-00000{len(calls)}:d.htm"}
+
+
+mc.efts_hits, mc.log_poller_error = _flaky, (lambda *a, **k: None)
+try:
+    failed = []
+    got = [list(mc.efts_hits_safe(q, "497", "a", "b", failed=failed))
+           for q in ('"good one"', '"boom"', '"good two"')]
+finally:
+    mc.efts_hits, mc.log_poller_error = real_hits, real_log
+check("the failing phrase yields nothing", got[1] == [], got[1])
+check("phrases after it still run", len(got[0]) == 1 and len(got[2]) == 1, got)
+check("the failure is reported, not swallowed", failed == ['"boom"'], failed)
+
+check("Feature 21 collect_candidates returns (candidates, failed)",
+      len(inspect.signature(MEV.collect_candidates).parameters) == 3
+      and "return cands, failed" in inspect.getsource(MEV.collect_candidates))
+check("Feature 16 collect_candidates returns (candidates, failed)",
+      "return cands, failed" in inspect.getsource(EFE2.collect_candidates))
+for mod in (MEV, MMG, EFE2, FMP):
+    check(f"{mod.__name__} uses the safe sweep", "efts_hits_safe" in inspect.getsource(mod))
+
 print()
 print("ALL PASS" if not failures else f"{len(failures)} FAILED: {failures}")
 sys.exit(1 if failures else 0)

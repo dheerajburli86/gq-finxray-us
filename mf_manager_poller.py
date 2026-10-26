@@ -347,10 +347,10 @@ def run_mf_manager_events(days_back: int = DAYS_BACK):
             return 0
         end = date.today()
         start = end - timedelta(days=days_back)
-        cands = {}
+        cands, failed = {}, []
         for q in EVENT_QUERIES:
-            for h in mc.efts_hits(q, EVENT_FORMS, start.isoformat(), end.isoformat(),
-                                  max_pages=MAX_PAGES):
+            for h in mc.efts_hits_safe(q, EVENT_FORMS, start.isoformat(), end.isoformat(),
+                                       max_pages=MAX_PAGES, failed=failed):
                 src = h.get("_source") or {}
                 own = {mc.cik_plain(c) for c in (src.get("ciks") or [])} & ciks
                 if not own:
@@ -368,7 +368,8 @@ def run_mf_manager_events(days_back: int = DAYS_BACK):
             except Exception as e:
                 _err("process_event_filing", e, {"accession": m["accession"]})
                 mc.mark_processed(m["key"], "MGR_EVENT", m, "ERROR")
-        log(f"manager events: {len(cands)} hits, {len(todo)} new documents, {alerts} alerts")
+        log(f"manager events: {len(cands)} hits, {len(todo)} new documents, {alerts} alerts"
+            + (f", {len(failed)} phrase search(es) FAILED" if failed else ""))
         return alerts
     except Exception as e:
         _err("run_mf_manager_events", e)

@@ -614,6 +614,24 @@ def efts_hits(query, forms, start, end, max_pages=20):
             return
 
 
+def efts_hits_safe(query, forms, start, end, max_pages=20, failed=None):
+    """
+    efts_hits, but ONE failed query loses that query instead of the whole sweep.
+    See mf_common.efts_hits_safe -- same bug, same fix: a bare `for h in
+    efts_hits(...)` inside a phrase loop let one transient network failure
+    abort an entire run and discard every candidate already collected.
+    """
+    try:
+        for h in efts_hits(query, forms, start, end, max_pages=max_pages):
+            yield h
+    except GeneratorExit:
+        raise
+    except Exception as e:
+        log_poller_error("efts_hits", e, {"query": query, "forms": forms})
+        if failed is not None:
+            failed.append(query)
+
+
 def _hit_meta(h):
     src = h.get("_source") or {}
     hid = h.get("_id") or ""
@@ -696,13 +714,15 @@ def run_event_poll(days_back: int = 2):
     try:
         load_universe()
         watched = watched_tickers()
-        seen = {}
+        seen, failed = {}, []
         for q in EVENT_QUERIES:
-            for h in efts_hits(q, EVENT_FORMS, start.isoformat(), end.isoformat()):
+            for h in efts_hits_safe(q, EVENT_FORMS, start.isoformat(), end.isoformat(),
+                                    failed=failed):
                 m = _hit_meta(h)
                 if m and m["key"] not in seen:
                     seen[m["key"]] = m
-        log(f"{len(seen)} candidate documents")
+        log(f"{len(seen)} candidate documents"
+            + (f", {len(failed)} phrase search(es) FAILED" if failed else ""))
         alerts = 0
         for key, m in seen.items():
             if already_processed(key, "EVENT"):

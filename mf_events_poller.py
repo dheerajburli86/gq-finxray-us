@@ -366,12 +366,13 @@ def watched_funds():
 
 
 def collect_candidates(funds, start, end):
-    """Run every phrase; keep only hits filed by a CIK that runs a watched fund."""
+    """Run every phrase; keep only hits filed by a CIK that runs a watched fund.
+    -> (candidates, phrases whose search failed)"""
     watched_ciks = {v["cik"] for v in funds.values()}
-    cands = {}
+    cands, failed = {}, []
     for event_type, _floor, forms, queries in RULES:
         for q in queries:
-            for h in mc.efts_hits(q, forms, start, end, max_pages=MAX_PAGES):
+            for h in mc.efts_hits_safe(q, forms, start, end, max_pages=MAX_PAGES, failed=failed):
                 src = h.get("_source") or {}
                 own = {mc.cik_plain(c) for c in (src.get("ciks") or [])} & watched_ciks
                 if not own:
@@ -384,7 +385,7 @@ def collect_candidates(funds, start, end):
                 c["rules"].setdefault(event_type, [])
                 if q not in c["rules"][event_type]:
                     c["rules"][event_type].append(q)
-    return cands
+    return cands, failed
 
 
 def process_document(meta, funds) -> int:
@@ -497,9 +498,10 @@ def run_mf_fund_events_poller(days_back: int = DAYS_BACK):
             return 0
         end = date.today()
         start = end - timedelta(days=days_back)
-        cands = collect_candidates(funds, start.isoformat(), end.isoformat())
+        cands, failed = collect_candidates(funds, start.isoformat(), end.isoformat())
+        miss = f", {len(failed)} phrase search(es) FAILED" if failed else ""
         if not cands:
-            log(f"{len(funds)} watched funds, no candidate filings")
+            log(f"{len(funds)} watched funds, no candidate filings{miss}")
             return 0
         seen = _seen_keys(cands)
         todo = [m for k, m in cands.items() if k not in seen]
@@ -511,7 +513,7 @@ def run_mf_fund_events_poller(days_back: int = DAYS_BACK):
                 _err("process_document", e, {"doc_key": m.get("key")})
                 _record(m, "ERROR", error=str(e)[:500])
         log(f"fund actions: {len(funds)} watched funds, {len(cands)} candidates, "
-            f"{len(todo)} new documents, {queued} queued for summary")
+            f"{len(todo)} new documents, {queued} queued for summary{miss}")
         return queued
     except Exception as e:
         _err("run_mf_fund_events_poller", e)
