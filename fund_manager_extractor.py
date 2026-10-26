@@ -38,6 +38,7 @@ Stdlib only (html.parser) — no new dependencies.
 from __future__ import annotations
 
 import html as html_lib
+import os
 import re
 from datetime import date, datetime
 from html.parser import HTMLParser
@@ -387,17 +388,51 @@ def _sgml_field(block: str, tag: str) -> str | None:
 # Fund as co-portfolio manager in 2021") that read like change events.
 _SUPPLEMENT_HEAD = re.compile(
     r"\bsupplement\s+(?:no\.?\s*\d+\s+)?(?:dated|to)\b"
-    r"|\b(?:prospectus|sai|statement\s+of\s+additional\s+information)\s+supplement\b")
+    r"|\b(?:prospectus|sai|statement\s+of\s+additional\s+information)\s+supplement\b"
+    # A notice to shareholders is an announcement, never a prospectus: it is how
+    # most liquidations, mergers and fund closings actually reach holders, and
+    # none of those documents carries the word "supplement" at all.
+    r"|\bnotice\s+to\s+(?:the\s+)?(?:share|unit)holders\b"
+    # "Amendment No. 1 to the Prospectus" is a sticker under another name.
+    r"|\bamendment\s+(?:no\.?\s*\d+\s+)?to\s+the\s+(?:summary\s+)?"
+    r"(?:prospectus|statement\s+of\s+additional\s+information)\b")
 SUPPLEMENT_HEAD_CHARS = 4000
+
+# A sticker is a page or two; a full prospectus runs to hundreds of kilobytes.
+# When the opening words do not say "supplement" -- the word is often only
+# inside a header image, or sits past the cover page of a trust that lists
+# fifty funds before it says anything -- length is what still separates an
+# announcement from a prospectus re-filing. Measured 2026-10-26: 39 of the 63
+# manager-change candidates examined in a week were rejected here, and the
+# features that depend on this gate (15, 16, 19, 21) had produced no alerts.
+SUPPLEMENT_MAX_CHARS = int(os.getenv("GQ_SUPPLEMENT_MAX_CHARS", "25000"))
+
+# 497K IS a summary prospectus: short AND carrying the manager bios this gate
+# exists to reject ("joined the Fund as co-portfolio manager in 2021"), so it
+# never qualifies on length alone -- it still has to say it is a supplement.
+_SHORT_FORM_EXEMPT = ("497K",)
+
+# A document whose opening calls itself a prospectus is a prospectus, however
+# short the filed excerpt happens to be. Checked only AFTER _SUPPLEMENT_HEAD,
+# so "Supplement to the Prospectus dated..." is still a supplement -- this only
+# decides whether the length escape below may apply.
+_PROSPECTUS_HEAD = re.compile(
+    r"\b(?:summary\s+)?prospectus\b|\bstatement\s+of\s+additional\s+information\b")
 
 
 def is_supplement(text: str, form: str | None = None) -> bool:
-    """True if the document opens as a prospectus supplement. N-14 (merger
-    registration) is always in scope — the form itself is the event."""
-    if (form or "").upper().startswith("N-14"):
+    """True if the document is an ANNOUNCEMENT (a sticker) rather than a full
+    prospectus re-filing. N-14 (merger registration) is always in scope — the
+    form itself is the event."""
+    f = (form or "").upper()
+    if f.startswith("N-14"):
         return True
     head = re.sub(r"\s+", " ", _norm_for_search((text or "")[:SUPPLEMENT_HEAD_CHARS]))
-    return bool(_SUPPLEMENT_HEAD.search(head))
+    if _SUPPLEMENT_HEAD.search(head):
+        return True
+    if f in _SHORT_FORM_EXEMPT or _PROSPECTUS_HEAD.search(head):
+        return False
+    return 0 < len(text or "") <= SUPPLEMENT_MAX_CHARS
 
 
 def _norm_for_search(s: str) -> str:

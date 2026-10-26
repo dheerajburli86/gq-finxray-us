@@ -359,6 +359,21 @@ def diff_snapshot(old, new):
     return {"added": added, "removed": removed, "resized": resized, "kept": kept, "rebaseline": None}
 
 
+def _alertable(c) -> bool:
+    """Is this line a real position rather than cash, collateral or a sweep?
+
+    etf_data_poller's version reads only `security_name` and `security_key`.
+    An N-PORT line carries a THIRD field, `title`, and for many funds that is
+    where the instrument is actually named -- "Goldman Sachs FS Treasury
+    Obligations" sits in `title` while `name` holds the issuer. Checking the
+    ETF version alone would let a fund's cash sweep through as a position the
+    moment these alerts start arriving.
+    """
+    c = dict(c)
+    c["security_name"] = f"{c.get('security_name') or ''} {c.get('title') or ''}".strip()
+    return edp.is_alertable_line(c)
+
+
 def is_debt_fund(holdings):
     tot = sum((h.get("portfolio_pct") or 0) for h in holdings.values()) or 1.0
     debt = sum((h.get("portfolio_pct") or 0) for h in holdings.values()
@@ -367,9 +382,9 @@ def is_debt_fund(holdings):
 
 
 def build_alert(fund, ticker, d, rep_date, filing_date, debt):
-    adds = sorted((c for c in d["added"] if c["weight_new"] >= ALERT_MIN_WEIGHT and edp.is_alertable_line(c)),
+    adds = sorted((c for c in d["added"] if c["weight_new"] >= ALERT_MIN_WEIGHT and _alertable(c)),
                   key=lambda c: -c["weight_new"])
-    rems = sorted((c for c in d["removed"] if c["weight_prev"] >= ALERT_MIN_WEIGHT and edp.is_alertable_line(c)),
+    rems = sorted((c for c in d["removed"] if c["weight_prev"] >= ALERT_MIN_WEIGHT and _alertable(c)),
                   key=lambda c: -c["weight_prev"])
     if debt:
         adds, rems = [], []                        # bond books turn over constantly
