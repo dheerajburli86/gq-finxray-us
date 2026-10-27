@@ -335,9 +335,19 @@ def parse_nport(xml_text):
 
 
 # ── Diff (pure) ──────────────────────────────────────────────────────────────
+# N-PORT's <ticker> identifier is free text: internal codes ("2653800D") and
+# local exchange numbers ("2330") land there too. Only an exchange-style symbol
+# is shown to readers; the stored security_key is unchanged.
+_TICKER_OK = re.compile(r"^[A-Z]{1,5}(?:[./-][A-Z]{1,2})?$")
+
+
 def _as_etf_rows(h):
     """Shape for etf_data_poller's diff helpers: shares = balance, symbol = ticker."""
-    return {k: dict(v, security_symbol=v.get("ticker"), shares=v.get("balance")) for k, v in h.items()}
+    out = {}
+    for k, v in h.items():
+        t = (v.get("ticker") or "").strip().upper()
+        out[k] = dict(v, security_symbol=t if _TICKER_OK.match(t) else None, shares=v.get("balance"))
+    return out
 
 
 def diff_snapshot(old, new):
@@ -374,6 +384,61 @@ def _alertable(c) -> bool:
     return edp.is_alertable_line(c)
 
 
+TOKEN_WEIGHT = 0.1                    # % of fund: below this a line is a placeholder
+
+
+def _issuer_key(c):
+    n = re.sub(r"[^A-Z0-9]+", " ", (c.get("security_name") or "").upper()).strip()
+    return n or None
+
+
+def net_rekeyed(added, removed):
+    """
+    One issuer, several security lines. A private company's preferred series,
+    a stock that changed CUSIP at an IPO or reorganisation, an ADR swapped for
+    the local share: the filing shows an "exit" of one key and an "add" of
+    another, and the alert read "Added: SPACE EXPLORATION TECHNOLOGIES 1.16%;
+    ... 0.84%. Exited: SPACE EXPLORATION TECHNOLOGIES 1.23%; ... 1.15%"
+    (FDGRX, Oct 26) for a stake that barely moved.
+
+    Lines are merged per issuer name; an issuer on both sides becomes one
+    resize when its total weight moved materially, and disappears otherwise.
+    -> (added, removed, moved)
+    """
+    def merge(rows, wkey):
+        out, loose = {}, []
+        for c in rows:
+            k = _issuer_key(c)
+            if not k:
+                loose.append(c)
+            elif k in out:
+                out[k][wkey] = round((out[k][wkey] or 0) + (c[wkey] or 0), 4)
+            else:
+                out[k] = dict(c)
+        return out, loose
+
+    a, a_loose = merge(added, "weight_new")
+    r, r_loose = merge(removed, "weight_prev")
+    moved = []
+    for k in [k for k in a if k in r]:
+        ca, cr = a.pop(k), r.pop(k)
+        wp, wn = cr["weight_prev"] or 0, ca["weight_new"] or 0
+        if max(wp, wn) >= edp.SHIFT_MIN_WEIGHT and abs(wn - wp) >= edp.SHIFT_MIN_PTS:
+            moved.append(dict(ca, weight_prev=wp, weight_new=wn, shares_vs_flow_pct=None))
+    return list(a.values()) + a_loose, list(r.values()) + r_loose, moved
+
+
+def _shift_note(c):
+    p = c.get("shares_vs_flow_pct")
+    if (c.get("weight_prev") or 0) < TOKEN_WEIGHT:
+        return "built up from a token position"
+    if (c.get("weight_new") or 0) < TOKEN_WEIGHT:
+        return "cut to a token position"
+    if p is None:
+        return "now held through a different security line"
+    return f"position {'+' if p > 0 else ''}{p:.0f}% beyond fund flows"
+
+
 def is_debt_fund(holdings):
     tot = sum((h.get("portfolio_pct") or 0) for h in holdings.values()) or 1.0
     debt = sum((h.get("portfolio_pct") or 0) for h in holdings.values()
@@ -382,13 +447,15 @@ def is_debt_fund(holdings):
 
 
 def build_alert(fund, ticker, d, rep_date, filing_date, debt):
-    adds = sorted((c for c in d["added"] if c["weight_new"] >= ALERT_MIN_WEIGHT and _alertable(c)),
+    added, removed, moved = net_rekeyed(d["added"], d["removed"])
+    adds = sorted((c for c in added if c["weight_new"] >= ALERT_MIN_WEIGHT and _alertable(c)),
                   key=lambda c: -c["weight_new"])
-    rems = sorted((c for c in d["removed"] if c["weight_prev"] >= ALERT_MIN_WEIGHT and _alertable(c)),
+    rems = sorted((c for c in removed if c["weight_prev"] >= ALERT_MIN_WEIGHT and _alertable(c)),
                   key=lambda c: -c["weight_prev"])
     if debt:
-        adds, rems = [], []                        # bond books turn over constantly
-    resz = d["resized"]
+        adds, rems, moved = [], [], []             # bond books turn over constantly
+    resz = sorted(list(d["resized"]) + [c for c in moved if _alertable(c)],
+                  key=lambda c: -abs(c["weight_new"] - c["weight_prev"]))
     if not (adds or rems or resz):
         return None
 
@@ -416,8 +483,7 @@ def build_alert(fund, ticker, d, rep_date, filing_date, debt):
                      + (f"; and {len(rems) - LIST_LIMIT} more" if len(rems) > LIST_LIMIT else "") + ".")
     if resz:
         parts.append("Resized: " + "; ".join(
-            f"{lbl(c)} {c['weight_prev']:.2f}% -> {c['weight_new']:.2f}% "
-            f"(position {'+' if c['shares_vs_flow_pct'] > 0 else ''}{c['shares_vs_flow_pct']:.0f}% beyond fund flows)"
+            f"{lbl(c)} {c['weight_prev']:.2f}% -> {c['weight_new']:.2f}% ({_shift_note(c)})"
             for c in resz[:LIST_LIMIT]) + (f"; and {len(resz) - LIST_LIMIT} more" if len(resz) > LIST_LIMIT else "") + ".")
     parts.append("Mutual funds disclose full holdings once a quarter, up to 60 days after quarter-end.")
     top = max([c["weight_new"] for c in adds] + [c["weight_prev"] for c in rems] + [0])

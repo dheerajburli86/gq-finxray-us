@@ -188,7 +188,7 @@ check("added / exited / resized found", [c["security_key"] for c in d["added"]] 
       and [c["security_key"] for c in d["resized"]] == ["US0000000001"], d)
 s, imp, ft, lists = MF.build_alert("Vanguard 500 Index Fund", "VFIAX", d, "2026-06-30", "2026-08-28", False)
 check("combined alert", ft == "MF_HOLDINGS_CHANGE" and "Added: NEWCO (NEW) at 2.50%" in s and "Exited: CO11" in s
-      and "Resized: CO1 (T1) 8.50% -> 12.00%" in s and "SEC Form N-PORT" in s, s)
+      and "Resized: CO1 8.50% -> 12.00%" in s and "SEC Form N-PORT" in s, s)  # "T1" is not an exchange symbol: not shown (Oct 26)
 check("resize of 3.5 pts is HIGH", imp == "HIGH")
 check("bond fund: adds/exits suppressed", MF.build_alert("Bond", "B", dict(d, resized=[]), "x", "y", True) is None)
 check("partial filing ignored", MF.diff_snapshot(old, dict(list(new.items())[:3]))["rebaseline"])
