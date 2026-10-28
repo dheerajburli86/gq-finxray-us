@@ -53,6 +53,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
+# httpx logs every request URL at INFO, and Telegram puts the bot token in the
+# URL: the getUpdates poll wrote the token to the Railway log every 10 seconds.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 
