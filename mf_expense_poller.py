@@ -155,7 +155,7 @@ def build_alert(fund_name, family, ticker, class_name, prev, new, field, meta):
     a, b = float(prev[field]), float(new[field])
     up = b > a
     kind = "net" if field == "net_expense_ratio" else "total"
-    cls = f" {class_name}" if class_name else ""
+    cls = mc.class_suffix(fund_name, class_name)
     parts = [
         # `{b - a:+.2f}` already carries the sign. A second literal "+" in front
         # of it rendered every increase as "(++0.07 points)" in the live alert.

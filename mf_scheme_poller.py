@@ -185,7 +185,7 @@ def _new_class_alert(new_row, sibling_tickers, watched):
         return 0
     fund = new_row.get("series_name") or new_row.get("series_id")
     cls = new_row.get("class_name")
-    cls_txt = f" {cls}" if cls else ""
+    cls_txt = mc.class_suffix(fund, cls)
     summary = (
         f"{fund} has registered a new share class with SEC: {new_row['ticker']}{cls_txt}. "
         f"It holds the same portfolio as the class you follow ({', '.join(hits)}), "
@@ -214,7 +214,7 @@ def _retired_alert(old_row, watched):
     fund = old_row.get("series_name") or old_row.get("series_id")
     cls = old_row.get("class_name")
     summary = (
-        f"{t}{(' ' + cls) if cls else ''} ({fund}) is no longer in SEC's live register of fund "
+        f"{t}{mc.class_suffix(fund, cls)} ({fund}) is no longer in SEC's live register of fund "
         f"share classes. A share class leaves that register when it is liquidated, merged into "
         f"another class of the same fund, or converted — so this ticker is on its way to not "
         f"quoting. Your money is not lost: in a conversion or merger the shares become shares of "

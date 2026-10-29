@@ -617,3 +617,20 @@ def weight_shifts(old, new_rows):
             out.append(c)
     out.sort(key=lambda c: -abs(c["weight_new"] - c["weight_prev"]))
     return out
+
+
+def class_suffix(fund_name, class_name):
+    """" " + class_name, or "" when the class name only repeats the fund name.
+
+    Fidelity and others name a fund's retail class after the fund itself, so
+    "{fund} {class}" read "Fidelity Balanced Fund Fidelity Balanced Fund (FBALX)"
+    in the Oct 28 expense alert. "Class K" or "Investor Class" is still shown.
+    """
+    cls = (class_name or "").strip()
+    if not cls:
+        return ""
+    norm = lambda x: re.sub(r"[^a-z0-9]+", " ", (x or "").lower()).strip()
+    c, f = norm(cls), norm(fund_name)
+    if f and (c == f or c in f):
+        return ""
+    return f" {cls}"
