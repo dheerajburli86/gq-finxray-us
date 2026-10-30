@@ -634,3 +634,12 @@ def class_suffix(fund_name, class_name):
     if f and (c == f or c in f):
         return ""
     return f" {cls}"
+
+
+def family_text(name):
+    """Fund family name for 'Fund family: {x}.' without a doubled full stop.
+
+    SEC entity names often end in "INC." / "CO.", which read
+    "AB CAP FUND, INC.." in the Oct 29 expense alert.
+    """
+    return (name or "").strip().rstrip(".").strip()

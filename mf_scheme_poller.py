@@ -195,7 +195,7 @@ def _new_class_alert(new_row, sibling_tickers, watched):
         f"and ask the fund whether an exchange between classes is available to you."
     )
     if new_row.get("entity_name"):
-        summary += f" Fund family: {new_row['entity_name']}."
+        summary += f" Fund family: {mc.family_text(new_row['entity_name'])}."
     summary += " Source: SEC investment company series and class register."
     return mc.emit_alerts(
         SOURCE, hits, summary, "MEDIUM", "MF_NEW_SHARE_CLASS",
@@ -222,7 +222,7 @@ def _retired_alert(old_row, watched):
         f"will hold and from what date."
     )
     if old_row.get("entity_name"):
-        summary += f" Fund family: {old_row['entity_name']}."
+        summary += f" Fund family: {mc.family_text(old_row['entity_name'])}."
     summary += " Source: SEC investment company series and class register."
     return mc.emit_alerts(
         SOURCE, [t], summary, "HIGH", "MF_TICKER_RETIRED",
@@ -246,7 +246,7 @@ def _renamed_alert(old_row, new_row, watched):
         f"reading if the new name points at a different kind of portfolio."
     )
     if new_row.get("entity_name"):
-        summary += f" Fund family: {new_row['entity_name']}."
+        summary += f" Fund family: {mc.family_text(new_row['entity_name'])}."
     summary += " Source: SEC investment company series and class register."
     return mc.emit_alerts(
         SOURCE, [t], summary, "MEDIUM", "MF_FUND_RENAMED",

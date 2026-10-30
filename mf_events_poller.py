@@ -451,7 +451,7 @@ def process_document(meta, funds) -> int:
     excerpt = build_excerpt(text, verified[event_type], hit_names)
     funds_line = "; ".join(f"{name_of[t]} ({t})" for t in tickers)
     header = (f"{'Mutual fund' if len(tickers) == 1 else 'Mutual funds'}: {funds_line}. "
-              f"Fund family: {family}. "
+              f"Fund family: {mc.family_text(family)}. "
               f"SEC Form {meta.get('form')} filed {meta.get('filing_date')}. "
               f"This filing concerns a {LABEL[event_type]}.\n\n")
 
