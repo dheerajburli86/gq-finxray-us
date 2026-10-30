@@ -604,6 +604,20 @@ def merge_session_alerts(rows):
     return [lead]
 
 
+def merge_alerts_by_ticker(alerts):
+    """
+    One message per ETF per intraday run. On 2026-10-29 XLV got heavy buying,
+    an RSI overbought and a 52-week high in the same 10:21 run, and SCHD the
+    same three; each went out as its own message. Signals on the same ETF in
+    one run are merged with merge_session_alerts (lead = most severe, every
+    key kept so none re-fires alone). Later runs are not merged into earlier ones.
+    """
+    groups = {}
+    for a in alerts:
+        groups.setdefault(a["ticker"], []).append(a)
+    return [m for t in sorted(groups) for m in merge_session_alerts(groups[t])]
+
+
 # ── I/O: who is opted in, what they watch, what was already sent ──────────────
 def load_beta_users():
     """User ids with user_preferences.etf_signals_beta = true. Empty when the
@@ -904,6 +918,7 @@ def intraday_pass(universe, now, sent, force=False, dry_run=False):
                                     bench=bench, div=get_div_today(t, session))
 
     alerts = drop_momentum_covered_by_technical(alerts, session)
+    alerts = merge_alerts_by_ticker(alerts)
     written = 0 if dry_run else (write_alerts(alerts)[0] if alerts else 0)
     logger.info("[ETF-SIG] Intraday %s (%.0f%% of session volume): %d ETFs priced, %d skipped, "
                 "%d alert(s)%s%s", session_iso, elapsed * 100, priced, len(skipped), len(alerts),
