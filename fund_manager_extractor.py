@@ -193,6 +193,12 @@ _STOP = {
     "nuveen", "pimco", "spdr", "jpmorgan", "allspring", "mfs", "guggenheim",
     "proshares", "direxion", "wisdomtree", "vaneck", "dimensional",
     "threadneedle", "columbia", "americas",
+    # titles glued to a name in a table cell: American Funds prints
+    # "Christopher D. Buchbinder Co-President" (2026-10-30 AGTHX)
+    "co-president", "co-presidents", "co-chair", "co-chairman", "co-chairperson",
+    "co-ceo", "co-cio", "co-head", "co-founder", "co-portfolio", "co-manager",
+    "co-lead", "vice-president", "vice-chair", "vice-chairman", "chair",
+    "chairman", "chairperson", "ceo", "cio", "cfo", "coo", "directors",
 }
 # Firm names that look exactly like "Firstname Surname". Matched as whole phrases
 # so real managers called Price, Morgan, Wells, Henderson, Cox... still pass.
@@ -509,9 +515,22 @@ _SECTION_END = re.compile(
     r"buying\s+and\s+selling|financial\s+intermediary\s+compensation|"
     r"summary\s+of\s+other\s+important|additional\s+information\s+about|"
     r"how\s+to\s+(?:buy|purchase)|investment\s+objectives?|fees\s+and\s+expenses|"
-    r"principal\s+(?:investment\s+)?(?:strategies|risks)|performance\b)",
+    r"principal\s+(?:investment\s+)?(?:strategies|risks)|performance\b|"
+    # the SAI's board table follows the PM section in a 485BPOS; on 2026-10-30
+    # AGTHX directors Vanessa C. L. Chang and Yvonne L. Greenstreet were read
+    # as new portfolio managers
+    r"(?:independent|interested|non-interested)\s+(?:directors?|trustees?)|"
+    r"(?:board\s+of\s+)?(?:directors|trustees)\s+and\s+officers|"
+    r"board\s+of\s+(?:directors|trustees)|(?:fund\s+)?officers\b|"
+    r"name,?\s+(?:year\s+of\s+birth|age|address))",
     re.I,
 )
+# A plain "Director" cell is NOT a board role: iShares/BlackRock PMs carry the
+# title "Director". Only unmistakable board wording counts.
+_BOARD_CELL = re.compile(
+    r"(?:independent|interested|non-interested)\s+(?:director|trustee)s?|trustees?|"
+    r"(?:vice\s+)?chair(?:man|person)?(?:\s+of\s+the\s+board)?(?:\s+and\s+(?:director|trustee))?",
+    re.I)
 _HEADER_ROW = re.compile(r"(?:since|title|experience|tenure|position)", re.I)
 _SINCE_CELL = re.compile(rf"(?:inception|{_YEAR_RE}|\d{{1,2}}\s+years?|less than (?:one|1) year|since)", re.I)
 
@@ -577,6 +596,12 @@ def _parse_table_row(line: str, asof_year: int | None) -> dict | None:
     if not people:
         return None
     name = people[0]
+    # a board table row, not a PM row: a board role as a cell, or a birth year
+    # after the name ("Vanessa C. L. Chang, 1952")
+    if any(_BOARD_CELL.fullmatch(c) for c in cells[1:]) or re.search(
+            r"(?:year\s+of\s+birth|\bborn\b)", line, re.I) or re.search(
+            re.escape(name) + r"\s*,?\s*\(?(?:b\.\s*)?19[2-8]\d\)?(?:\s|$|,)", first):
+        return None
     since_cell = next((c for c in cells[1:] if _SINCE_CELL.search(c)), None)
     if since_cell is None:
         return None
@@ -913,10 +938,17 @@ def extract_change_events(doc_html: str, series: list[dict], filing_date: str | 
     return {"events": list(by_key.values()), "replacement_rosters": replacement}
 
 
+def canonical_key(name: str) -> str:
+    """normalize_name of the person inside a name that may carry a glued title.
+    Rosters stored before the 2026-10-31 fix hold "Alan J. Wilson Co-President";
+    keying on this keeps him the same person as "Alan J. Wilson"."""
+    return normalize_name(_best_person(name or "") or name or "")
+
+
 def diff_rosters(old: list[dict], new: list[dict]) -> dict:
-    """Compare two rosters by normalised name."""
-    o = {normalize_name(m["name"]): m for m in old or []}
-    n = {normalize_name(m["name"]): m for m in new or []}
+    """Compare two rosters by canonical name."""
+    o = {canonical_key(m.get("manager_name") or m["name"]): m for m in old or []}
+    n = {canonical_key(m.get("manager_name") or m["name"]): m for m in new or []}
     return {
         "added": [n[k] for k in n.keys() - o.keys()],
         "removed": [o[k] for k in o.keys() - n.keys()],

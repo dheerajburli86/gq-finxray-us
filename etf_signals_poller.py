@@ -709,10 +709,19 @@ def technical_volume_tickers(session, tickers):
                 .eq("source", "TECHNICAL").eq("filing_type", "VOLUME_SPIKE")
                 .gte("created_at", midnight.isoformat())
                 .in_("ticker", sorted(tickers)).execute()).data or []
+        # A spike can also ride under another lead (technical_poller
+        # merge_alerts_by_ticker), e.g. XLV's 52-week high on 2026-10-30.
+        merged = (sb().table("alerts").select("ticker, extra")
+                  .eq("source", "TECHNICAL")
+                  .gte("created_at", midnight.isoformat())
+                  .in_("ticker", sorted(tickers)).execute()).data or []
     except Exception as e:
         log_poller_error(POLLER, "technical_volume_tickers", e)
         return set()
-    return {(r.get("ticker") or "").upper() for r in rows}
+    out = {(r.get("ticker") or "").upper() for r in rows}
+    out |= {(r.get("ticker") or "").upper() for r in merged
+            if "VOLUME_SPIKE" in ((r.get("extra") or {}).get("merged_filing_types") or [])}
+    return out
 
 
 def drop_momentum_covered_by_technical(alerts, session):

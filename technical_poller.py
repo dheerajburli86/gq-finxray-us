@@ -256,6 +256,12 @@ _ETF_VOLUME_SIGNALS = {"ETF_MOMENTUM_UP", "ETF_MOMENTUM_DOWN",
                        "ETF_BIG_MOVE_UP", "ETF_BIG_MOVE_DOWN"}
 
 
+def alert_types(row):
+    """filing_type plus any signal merged into the row (merge_alerts_by_ticker)."""
+    ex = row.get("extra") or {}
+    return [row.get("filing_type")] + list(ex.get("merged_filing_types") or [])
+
+
 def load_sent_today():
     """
     {(ticker, filing_type)} already alerted today, measured from ET midnight.
@@ -267,7 +273,7 @@ def load_sent_today():
     midnight_et = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
     try:
         rows = (supabase.table("alerts")
-                .select("ticker, filing_type, source")
+                .select("ticker, filing_type, source, extra")
                 .in_("source", [SOURCE, "ETF_SIGNAL"])
                 .gte("created_at", midnight_et.isoformat())
                 .execute()).data or []
@@ -278,14 +284,14 @@ def load_sent_today():
     sent = set()
     for r in rows:
         t = (r.get("ticker") or "").upper()
-        ft = r.get("filing_type")
-        if r.get("source", SOURCE) == SOURCE:
-            sent.add((t, ft))
-        elif ft in _ETF_VOLUME_SIGNALS:
-            # 2026-10-20: XLV "Heavy Buying" (Feature 7, 10:04) then "Trading
-            # Volume Far Above Normal Pace" (Feature 6, 10:21) -- the same
-            # surge twice. The ETF signal already carries the volume.
-            sent.add((t, "VOLUME_SPIKE"))
+        for ft in alert_types(r):
+            if r.get("source", SOURCE) == SOURCE:
+                sent.add((t, ft))
+            elif ft in _ETF_VOLUME_SIGNALS:
+                # 2026-10-20: XLV "Heavy Buying" (Feature 7, 10:04) then "Trading
+                # Volume Far Above Normal Pace" (Feature 6, 10:21) -- the same
+                # surge twice. The ETF signal already carries the volume.
+                sent.add((t, "VOLUME_SPIKE"))
     return sent
 
 
@@ -300,10 +306,11 @@ def load_recent_crossovers(days=SMA200_REPEAT_DAYS):
     """{(ticker, filing_type)} crossovers alerted in the last `days` days."""
     since = (datetime.now(ET) - timedelta(days=days)).isoformat()
     try:
+        # No filing_type filter: a crossover merged under a 52-week-high lead
+        # is stored with filing_type 52W_HIGH and must still count.
         rows = (supabase.table("alerts")
-                .select("ticker, filing_type")
+                .select("ticker, filing_type, extra")
                 .eq("source", SOURCE)
-                .in_("filing_type", list(_CROSSOVER_TYPES))
                 .gte("created_at", since)
                 .execute()).data or []
     except Exception as e:
@@ -311,7 +318,8 @@ def load_recent_crossovers(days=SMA200_REPEAT_DAYS):
         logger.error("[TECHNICAL] Crossover history unreadable (%s) — suppressing "
                      "crossovers this run rather than risking a repeat", e)
         return None
-    return {((r.get("ticker") or "").upper(), r.get("filing_type")) for r in rows}
+    return {((r.get("ticker") or "").upper(), ft) for r in rows
+            for ft in alert_types(r) if ft in _CROSSOVER_TYPES}
 
 
 def load_names(tickers):
@@ -351,6 +359,40 @@ def _write_alerts(rows):
             log_poller_error(POLLER, "write_alerts", e,
                              {"tickers": [r["ticker"] for r in chunk]})
     return written
+
+
+_IMPACT_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+
+def merge_alerts_by_ticker(alerts):
+    """
+    One message per ticker per run. On 2026-10-30 XLV got "New 52-Week High"
+    and "Trading Volume Far Above Normal Pace" from the same 10:27 run as two
+    messages (and on 10-29 XLV and SCHD each got RSI + 52-week high). Lead =
+    most severe signal; the others go in extra.merged_filing_types, which
+    load_sent_today, load_recent_crossovers and the ETF engine's volume check
+    all read, so a merged signal can't fire again on its own.
+    """
+    groups = {}
+    for a in alerts:
+        groups.setdefault(a["ticker"].upper(), []).append(a)
+    out = []
+    for rows in groups.values():
+        if len(rows) == 1:
+            out.append(rows[0])
+            continue
+        rows = sorted(rows, key=lambda r: -_IMPACT_RANK.get(r.get("impact"), 0))
+        lead = dict(rows[0])
+        extra = dict(lead["extra"])
+        extra["headline"] = " · ".join((r["extra"].get("headline") or r["filing_type"]) for r in rows)
+        extra["merged_filing_types"] = [r["filing_type"] for r in rows[1:]]
+        extra["merged_signals"] = [dict({k: v for k, v in r["extra"].items()
+                                         if k not in ("headline", "company_name")},
+                                        filing_type=r["filing_type"]) for r in rows[1:]]
+        lead["summary"] = " ".join(r["summary"] for r in rows)
+        lead["extra"] = extra
+        out.append(lead)
+    return out
 
 
 def _build_alert(ticker, alert_type, summary, headline, extra):
@@ -853,6 +895,7 @@ def run_technical_poller():
             for a in alerts:
                 if names.get(a["ticker"]):
                     a["extra"]["company_name"] = names[a["ticker"]]
+        alerts = merge_alerts_by_ticker(alerts)
         written = _write_alerts(alerts) if alerts else 0
         api_calls = 1 + (2 * len(window)) + refreshed
         logger.info("[TECHNICAL] Done. %d watched / %d priced, %d alerts written, "

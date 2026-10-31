@@ -202,7 +202,7 @@ def build_alert(fund_name, family, added, removed, remaining, eff, meta):
     if added:
         parts.append(f"{', '.join(e['manager'] for e in added)} "
                      f"{'joins' if len(added) == 1 else 'join'} the portfolio management team")
-    who = f" at {family}" if family else ""
+    who = f" at {family}" if family and not mc.same_name(family, fund_name) else ""
     summary = f"Portfolio manager change at {fund_name}, a mutual fund{who}: " + "; ".join(parts) + "."
     if eff:
         summary += f" Effective {mc.fmt_date(eff)}."

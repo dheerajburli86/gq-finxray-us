@@ -636,6 +636,13 @@ def class_suffix(fund_name, class_name):
     return f" {cls}"
 
 
+def same_name(a, b):
+    """True when two fund/registrant names are the same words ("GROWTH FUND OF
+    AMERICA" the fund and the registrant). Used to skip "a mutual fund at X"."""
+    norm = lambda x: re.sub(r"[^a-z0-9]+", " ", (x or "").lower()).strip()
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
 def family_text(name):
     """Fund family name for 'Fund family: {x}.' without a doubled full stop.
 

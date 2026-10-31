@@ -169,7 +169,7 @@ def build_alert(fund_name, family, ticker, class_name, prev, new, field, meta):
     waiver_gone = (prev.get("fee_waiver") or 0) < 0 and not (new.get("fee_waiver") or 0) < 0
     if waiver_gone:
         parts.append("The fee waiver that was in force at the last prospectus is not in this one.")
-    if family:
+    if family and not mc.same_name(family, fund_name):
         parts.append(f"Fund family: {mc.family_text(family)}.")
     parts.append(f"Source: SEC Form {meta.get('form')} filed {mc.fmt_date(meta.get('filing_date'))}; "
                  f"the previous fee table was filed {mc.fmt_date(prev.get('filing_date'))}.")
