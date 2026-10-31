@@ -116,6 +116,10 @@ MOMO_VOL_RATIO = _f("ETF_SIG_MOMO_VOL_RATIO", 1.5)     # x 20-day average pace
 MOMO_Z = _f("ETF_SIG_MOMO_Z", 1.5)                     # x typical daily move
 MOMO_MIN_MOVE_PCT = _f("ETF_SIG_MOMO_MIN_MOVE_PCT", 0.4)
 BIG_Z = _f("ETF_SIG_BIG_Z", 2.5)
+# A second alert on the same ETF, same direction, same day must report a move
+# at least this much bigger (in multiples of the typical move) than the
+# largest one already sent: 2.5x sent -> 3.0x goes out, 2.6x does not.
+ESCALATE_STEP = _f("ETF_SIG_ESCALATE_STEP", 0.5)
 BIG_MIN_MOVE_PCT = _f("ETF_SIG_BIG_MIN_MOVE_PCT", 0.75)
 REL_Z = _f("ETF_SIG_REL_Z", 2.0)
 REL_MIN_GAP_PCT = _f("ETF_SIG_REL_MIN_GAP_PCT", 1.0)
@@ -376,13 +380,15 @@ def _r(x, n=4):
 
 # ── Intraday evaluation (pure: no I/O) ────────────────────────────────────────
 def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
-                      bench=None, div=0.0):
+                      bench=None, div=0.0, levels=None):
     """
     m       {"price", "prev_close", "volume"} from the live snapshot
     elapsed share of a normal session's volume expected by now (1.0 at close)
     sent    set of dedup keys already written (updated in place)
     bench   {"r": SPY's return today} or None
     div     cash distribution going ex today, added back to the move
+    levels  {(ticker, "UP"/"DOWN"): largest move multiple already sent today}
+            (updated in place). None = legacy rule: momentum then one big move.
     -> list of alert rows
     """
     out = []
@@ -413,16 +419,36 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
 
     big_ft = "ETF_BIG_MOVE_UP" if up else "ETF_BIG_MOVE_DOWN"
     big_key = dedup_key(ticker, big_ft, session_iso)
+    momo_ft = "ETF_MOMENTUM_UP" if up else "ETF_MOMENTUM_DOWN"
+    momo_key = dedup_key(ticker, momo_ft, session_iso)
     big_now = live_tape and abs(z) >= BIG_Z and abs(r) * 100 >= BIG_MIN_MOVE_PCT
-    if big_now and big_key not in sent:
+    lvl_key = (ticker, "UP" if up else "DOWN")
+    prior = big_key in sent or momo_key in sent
+    prev = None if levels is None else levels.get(lvl_key)
+    if levels is None:
+        send_big = big_now and big_key not in sent
+    elif not prior:
+        send_big = big_now
+    else:
+        # 2026-10-30: QQQ "Heavy Selling" at 2.5x, then "Unusually Large Drop"
+        # at 2.6x 15 minutes later -- the same move twice. A repeat must be
+        # clearly bigger than anything already sent. An unknown earlier size
+        # (unreadable ledger) blocks the repeat rather than risking a duplicate.
+        send_big = big_now and prev is not None and abs(z) >= prev + ESCALATE_STEP
+    if send_big:
+        key = f"{big_key}:x{abs(z):.2f}" if big_key in sent else big_key
         vol_line = (f" Volume is running {ratio:.1f}x {pace}." if ratio else "")
+        grew = (f" That is bigger than the {prev:.1f}x move already reported today."
+                if prior and prev is not None else "")
         summary = (f"{ticker} is {'up' if up else 'down'} {abs(r) * 100:.2f}% today at ${price:,.2f}, "
                    f"about {abs(z):.1f} times its typical daily move of +/-{typical:.2f}% and "
-                   f"{largest_since(base, r)}.{vol_line}{bench_line}{div_line}")
+                   f"{largest_since(base, r)}.{grew}{vol_line}{bench_line}{div_line}")
         out.append(_alert(ticker, name, big_ft, "HIGH" if abs(z) >= 3.0 else "MEDIUM",
                           "Unusually Large Gain" if up else "Unusually Large Drop",
-                          summary, big_key, stats))
-        sent.add(big_key)
+                          summary, key, stats))
+        sent.update({big_key, key})
+        if levels is not None:
+            levels[lvl_key] = max(levels.get(lvl_key) or 0.0, abs(z))
 
     # One move, one message: when a move is already big enough for the
     # big-move signal (sent now or earlier today), it is not ALSO reported as
@@ -430,8 +456,6 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
     # and big move later is allowed, since that is an escalation. Trade-off,
     # deliberate: a user who mutes Feature 17 but keeps 7 hears nothing on
     # those days.
-    momo_ft = "ETF_MOMENTUM_UP" if up else "ETF_MOMENTUM_DOWN"
-    momo_key = dedup_key(ticker, momo_ft, session_iso)
     if (not big_now and big_key not in sent and momo_key not in sent
             and ratio is not None and ratio >= MOMO_VOL_RATIO
             and abs(z) >= MOMO_Z and abs(r) * 100 >= MOMO_MIN_MOVE_PCT
@@ -453,6 +477,8 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
                           else "Heavy Selling: Volume Surge, Price Down",
                           summary, momo_key, stats))
         sent.add(momo_key)
+        if levels is not None:
+            levels[lvl_key] = max(levels.get(lvl_key) or 0.0, abs(z))
 
     any_big = (big_now or dedup_key(ticker, "ETF_BIG_MOVE_UP", session_iso) in sent
                or dedup_key(ticker, "ETF_BIG_MOVE_DOWN", session_iso) in sent)
@@ -696,6 +722,39 @@ def load_sent(days=None):
 
 
 _MOMO_TYPES = ("ETF_MOMENTUM_UP", "ETF_MOMENTUM_DOWN")
+_MOVE_DIR = {"ETF_MOMENTUM_UP": "UP", "ETF_BIG_MOVE_UP": "UP",
+             "ETF_MOMENTUM_DOWN": "DOWN", "ETF_BIG_MOVE_DOWN": "DOWN"}
+
+
+def levels_from_rows(rows):
+    """{(ticker, "UP"/"DOWN"): largest move multiple} from alert rows, merged
+    signals included."""
+    out = {}
+    for r in rows:
+        ex = r.get("extra") or {}
+        t = (r.get("ticker") or ex.get("etf_ticker") or "").upper()
+        pairs = [(r.get("filing_type"), ex.get("move_multiple"))]
+        for ft, sig in zip(ex.get("merged_filing_types") or [], ex.get("merged_signals") or []):
+            pairs.append((ft, (sig or {}).get("move_multiple")))
+        for ft, mult in pairs:
+            d = _MOVE_DIR.get(ft)
+            if d and mult is not None:
+                out[(t, d)] = max(out.get((t, d)) or 0.0, float(mult))
+    return out
+
+
+def load_levels(session):
+    """Largest move already reported per ETF and direction this session. None
+    on failure (the caller then blocks repeats)."""
+    midnight = datetime(session.year, session.month, session.day, tzinfo=ET)
+    try:
+        rows = _paged(lambda: sb().table("alerts").select("id, ticker, filing_type, extra")
+                      .eq("source", SOURCE).gte("created_at", midnight.isoformat())
+                      .order("created_at").order("id"))
+    except Exception as e:
+        log_poller_error(POLLER, "load_levels", e)
+        return None
+    return levels_from_rows(rows)
 
 
 def technical_volume_tickers(session, tickers):
@@ -906,6 +965,9 @@ def intraday_pass(universe, now, sent, force=False, dry_run=False):
     if bm:
         bench = {"r": (bm["price"] + get_div_today(BENCHMARK, session)) / bm["prev_close"] - 1.0}
 
+    # Sizes already reported today; a repeat must beat them by ESCALATE_STEP.
+    # Unreadable -> {} so every repeat is blocked, never duplicated.
+    levels = None if dry_run else (load_levels(session) or {})
     alerts, priced, skipped = [], 0, []
     for t in sorted(universe):
         m = snapshot_metrics(by_ticker.get(t) or {}, session, force)
@@ -924,7 +986,7 @@ def intraday_pass(universe, now, sent, force=False, dry_run=False):
             continue
         priced += 1
         alerts += evaluate_intraday(t, universe[t], base, m, elapsed, session_iso, sent,
-                                    bench=bench, div=get_div_today(t, session))
+                                    bench=bench, div=get_div_today(t, session), levels=levels)
 
     alerts = drop_momentum_covered_by_technical(alerts, session)
     alerts = merge_alerts_by_ticker(alerts)

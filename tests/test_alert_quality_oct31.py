@@ -110,6 +110,39 @@ import datetime as _dt
 cov = ESP.technical_volume_tickers(_dt.date(2026, 10, 30), {"XLV", "VTV"})
 check("ETF engine sees a merged spike, not a plain 52W high", cov == {"XLV"}, cov)
 
+print("5. A repeat move alert must be clearly bigger than what was sent (QQQ, Oct 30)")
+import datetime as _d2
+_day = _d2.date(2026, 10, 30)
+def _ev(z, sent, levels, vol_ratio=2.2):
+    sigma = 0.0103
+    base = {"sigma": sigma, "adv": 3.67e7, "beta": None, "rets": [0.0] * 300,
+            "sessions": [{"date": _day}] * 301, "last_close": 715.0}
+    m = {"price": 715.0 * (1 - z * sigma), "prev_close": 715.0, "volume": 3.67e7 * 0.11 * vol_ratio}
+    return ESP.evaluate_intraday("QQQ", "QQQ", base, m, 0.11, _day.isoformat(), sent, levels=levels)
+kinds = lambda out: [a["filing_type"] for a in out]
+sent, lv = set(), {}
+check("first: momentum at 2.48x", kinds(_ev(2.48, sent, lv)) == ["ETF_MOMENTUM_DOWN"], lv)
+check("2.6x 15 min later: not sent (no bigger by 0.5)", _ev(2.60, sent, lv) == [])
+out = _ev(3.0, sent, lv)
+check("3.0x: sent as a bigger drop", kinds(out) == ["ETF_BIG_MOVE_DOWN"], kinds(out))
+check("says it is bigger", out and "bigger than the 2.5x move" in out[0]["summary"],
+      out and out[0]["summary"])
+check("3.2x after 3.0x: not sent", _ev(3.2, sent, lv) == [])
+out = _ev(3.55, sent, lv)
+check("3.55x after 3.0x: sent again, new key", kinds(out) == ["ETF_BIG_MOVE_DOWN"]
+      and out[0]["extra"]["dedup_key"].endswith(":x3.55"), out and out[0]["extra"]["dedup_key"])
+check("2.0x never re-alerts", _ev(2.0, sent, lv) == [])
+sent2, lv2 = set(), {}
+check("no prior alert: 2.6x big move goes out", kinds(_ev(2.6, sent2, lv2)) == ["ETF_BIG_MOVE_DOWN"])
+sent3 = {ESP.dedup_key("QQQ", "ETF_MOMENTUM_DOWN", _day.isoformat())}
+check("unknown earlier size blocks the repeat", _ev(3.5, sent3, {}) == [])
+check("legacy callers (levels=None) unchanged", kinds(_ev(3.5, set(sent3), None)) == ["ETF_BIG_MOVE_DOWN"])
+rows = [{"ticker": "QQQ", "filing_type": "ETF_BIG_MOVE_DOWN", "extra": {"move_multiple": 2.6,
+         "merged_filing_types": ["ETF_MOMENTUM_DOWN"], "merged_signals": [{"move_multiple": 2.48}]}},
+        {"ticker": "XLE", "filing_type": "ETF_MOMENTUM_UP", "extra": {"move_multiple": 1.51}}]
+check("levels read back from stored rows", ESP.levels_from_rows(rows) == {("QQQ", "DOWN"): 2.6, ("XLE", "UP"): 1.51},
+      ESP.levels_from_rows(rows))
+
 if failures:
     print("\nFAILURES:", failures); sys.exit(1)
 print("\nALL PASS")
