@@ -4,6 +4,7 @@ calls the ETF pollers, the AI pipeline and the bot make. Not a test itself
 (run_all.sh only runs tests/test_*.py).
 """
 import copy
+import datetime as _dt
 import itertools
 
 _ids = itertools.count(1)
@@ -121,7 +122,10 @@ class _Q:
             for r in new:
                 r = copy.deepcopy(r)
                 r.setdefault("id", next(_ids))
-                r.setdefault("created_at", "2026-10-02T12:00:00+00:00")
+                # The real clock, like Postgres now(). A fixed 2026-10-02 stamp
+                # fell outside the pollers' real-clock dedup windows (30 days for
+                # ETF expense) from Nov 2 on, and test_etf_alerts R7 began failing.
+                r.setdefault("created_at", _dt.datetime.now(_dt.timezone.utc).isoformat())
                 rows.append(r)
             return _Res(new)
         if self.op == "upsert":

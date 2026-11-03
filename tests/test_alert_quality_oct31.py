@@ -143,6 +143,19 @@ rows = [{"ticker": "QQQ", "filing_type": "ETF_BIG_MOVE_DOWN", "extra": {"move_mu
 check("levels read back from stored rows", ESP.levels_from_rows(rows) == {("QQQ", "DOWN"): 2.6, ("XLE", "UP"): 1.51},
       ESP.levels_from_rows(rows))
 
+print("6. Merged technical message states the price once (XLP, Nov 2)")
+hi = {"ticker": "XLP", "impact": "HIGH", "source": "TECHNICAL", "filing_type": "52W_HIGH",
+      "summary": "XLP hit a new 52-week high: $90.56 (up 0.2% from the previous high of $90.38 on Oct 30, 2026). "
+                 "Current price: $90.06, up 0.7% on the session.",
+      "extra": {"headline": "Breaks Out To New 52-Week High"}}
+vs = {"ticker": "XLP", "impact": "MEDIUM", "source": "TECHNICAL", "filing_type": "VOLUME_SPIKE",
+      "summary": "XLP trading surge: 6,612,982 shares traded today \u2014 2.6x the 2,582,645 expected by this "
+                 "time of day (average daily volume 15,023,144). Price: $90.06, up 0.7% on the session.",
+      "extra": {"headline": "Trading Volume Far Above Normal Pace"}}
+m = TP.merge_alerts_by_ticker([vs, hi])[0]["summary"]
+check("price said once", m.count("$90.06") == 1, m)
+check("volume detail kept", "2.6x the 2,582,645 expected" in m and m.endswith("15,023,144)."), m)
+
 if failures:
     print("\nFAILURES:", failures); sys.exit(1)
 print("\nALL PASS")

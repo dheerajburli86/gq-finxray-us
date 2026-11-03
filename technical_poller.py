@@ -43,6 +43,7 @@ Telegram — delivery.py fans each row out to the users watching that ticker.
 """
 
 import os
+import re
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -362,6 +363,7 @@ def _write_alerts(rows):
 
 
 _IMPACT_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+_PRICE_SENTENCE = re.compile(r"\s*(?:Current price|Price): \$[\d,]+\.\d{2}, (?:up|down) [\d.]+% on the session\.")
 
 
 def merge_alerts_by_ticker(alerts):
@@ -389,7 +391,11 @@ def merge_alerts_by_ticker(alerts):
         extra["merged_signals"] = [dict({k: v for k, v in r["extra"].items()
                                          if k not in ("headline", "company_name")},
                                         filing_type=r["filing_type"]) for r in rows[1:]]
-        lead["summary"] = " ".join(r["summary"] for r in rows)
+        # Each signal ends its own text with the price; say it once. On
+        # 2026-11-02 XLP's merged message read "Current price: $90.06, up 0.7%
+        # on the session" and then "Price: $90.06, up 0.7% on the session".
+        rest = [_PRICE_SENTENCE.sub("", r["summary"]).strip() for r in rows[1:]]
+        lead["summary"] = " ".join([rows[0]["summary"]] + [t for t in rest if t])
         lead["extra"] = extra
         out.append(lead)
     return out
