@@ -272,6 +272,20 @@ _EXCHANGES = r"NASDAQ|NYSE|NYSE American|NYSE Arca|AMEX|CBOE|OTC|OTCQB|OTCQX|BAT
 # tested against every article of every cycle, and re.compile is not free.
 _pattern_cache = {}
 
+# Canadian listings. A dot or hyphen is a word boundary, so "SHOP.TO", "ABC.CA"
+# and "(TSX: ABC)" all used to read as mentions of the US ticker -- and
+# "$ABC.CA" even as STRONG evidence ($ prefix). A Canadian-qualified symbol is
+# a different listing (often a different company sharing the letters), so it
+# is blanked out before matching; the same article's "NYSE: ABC" still counts.
+_CANADA_QUALIFIED = re.compile(
+    r"\b(?:TSX[- ]?V(?:enture)?|TSX|CSE|NEO|Cboe\s+Canada|TSE)\s*:\s*"
+    r"[A-Z][A-Z0-9]{0,5}(?:[.\-][A-Z]{1,3})?\b"
+    r"|\$?\b[A-Z][A-Z0-9]{0,5}(?:\.UN)?[.\-](?:CA|TO|V|CN|NE|TSX|TSXV)\b")
+
+
+def strip_canadian_listings(text):
+    return _CANADA_QUALIFIED.sub(" ", text or "")
+
 
 def _build_patterns(ticker):
     """(strong_patterns, plain_pattern) for one ticker, both case-sensitive."""
@@ -353,6 +367,7 @@ def extract_watched_tickers(text, watched):
 
     if not text or not watched:
         return []
+    text = strip_canadian_listings(text)
 
     strong_hits, plain_hits = [], []
     for raw in watched:

@@ -649,6 +649,13 @@ class FakeBot:
         SENT.append((str(chat_id), text))
 
 
+# The engine ran under a frozen clock (Oct 12), but delivery measures alert age
+# with the real clock and retires anything older than 90 minutes unsent. Stamp
+# the rows "just created" so this checks routing and rendering, not age. Before
+# this, the test passed only when the stale sweep happened to skip its first
+# pass (shortly after the machine started) and failed otherwise.
+for _a in DB["alerts"]:
+    _a["created_at"] = _dt.datetime.now(UTC).isoformat()
 delivery.Bot = FakeBot
 delivery.PER_CHAT_GAP_SECONDS = 0
 delivery.SEND_GAP_SECONDS = 0
