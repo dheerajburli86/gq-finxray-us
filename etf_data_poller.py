@@ -140,7 +140,12 @@ _NON_SECURITY = re.compile(
     # 2026-10-20: USO "Removed: TREASURY BILL 0 10/20/2026, previously 2.97%"
     # -- a bill maturing on its due date, not a sale. Notes and bonds stay
     # alertable (bond funds are skipped by asset class anyway).
-    r"|\b(U\.?S\.?\s+|UNITED\s+STATES\s+)?(TREASURY|TREAS)\s+BILLS?\b|\bT-?BILLS?\b|\bTBILLS?\b", re.I)
+    r"|\b(U\.?S\.?\s+|UNITED\s+STATES\s+)?(TREASURY|TREAS)\s+BILLS?\b|\bT-?BILLS?\b|\bTBILLS?\b"
+    # Index futures named by contract month, with no "FUT" in the name.
+    # 2026-11-03: VGK "Added: MSCI Europe Dec26 at 0.58%" -- Vanguard rolling
+    # its cash-equitisation future into the next quarter, not a position.
+    r"|\b(JAN|FEB|MAR|APR|MAY|JUNE?|JULY?|AUG|SEPT?|OCT|NOV|DEC)[ -]?(2[5-9]|3\d|20[2-3]\d)\b"
+    r"|\bE-?MINI\b", re.I)
 
 
 # ── Supabase (one client per worker thread) ───────────────────────────────────
@@ -561,6 +566,16 @@ def _alert_exists(dedup_key, within_days=None):
         raise AlertLedgerError(f"dedup lookup failed: {e}") from e
 
 
+_HEADLINES = {
+    "ETF_HOLDINGS_ADDED": "{fund}: new holdings",
+    "ETF_HOLDINGS_REMOVED": "{fund}: holdings sold out",
+    "ETF_HOLDINGS_CHANGE": "{fund}: portfolio holdings changed",
+    "ETF_WEIGHT_SHIFT": "{fund}: positions resized",
+    "ETF_EXPENSE_INCREASE": "{fund}: expense ratio raised",
+    "ETF_EXPENSE_DECREASE": "{fund}: expense ratio lowered",
+}
+
+
 def emit_alert(ticker, source, filing_type, impact, summary, extra, link=None, within_days=None):
     """Write one alert row. True if written, False if already sent.
     Raises AlertLedgerError if the ledger cannot be read or written."""
@@ -568,6 +583,11 @@ def emit_alert(ticker, source, filing_type, impact, summary, extra, link=None, w
     if _alert_exists(dedup_key, within_days):
         return False
     extra = dict(extra)
+    # These alerts carried no headline, so Telegram showed no bold title line
+    # (2026-11-03 VGK holdings alert) while every other feature has one.
+    if not extra.get("headline"):
+        extra["headline"] = _HEADLINES.get(filing_type, "").format(
+            fund=extra.get("company_name") or ticker) or None
     extra["summary_hash"] = hashlib.sha1(f"{ticker}|{summary}".encode()).hexdigest()[:20]
     extra.setdefault("filed_at", _now_iso())
     row = {

@@ -37,6 +37,27 @@ for text, want in [
     got = N.extract_watched_tickers(text, W)
     check(f"{text!r} -> {want}", sorted(got) == sorted(want), got)
 
+print("2. ETF holdings: index futures are not positions; alerts get a headline (VGK, Nov 3)")
+import etf_data_poller as EDP   # noqa: E402
+for n in ("MSCI Europe Dec26", "S&P500 EMINI FUT DEC26", "MSCI EAFE MAR27", "Euro Stoxx 50 Sep 26",
+          "MICRO E-MINI NASDAQ DEC26"):
+    check(f"not alertable: {n}", not EDP.is_alertable_line({"security_name": n}))
+for n in ("ASML HOLDING NV", "NOVO NORDISK A/S-B", "Decker's Outdoor Corp", "MARATHON PETROLEUM",
+          "SEPTERNA INC", "NOVARTIS AG-REG", "Mayville Engineering", "Juniper Networks",
+          "ADVANCED MICRO DEVICES", "MICRON TECHNOLOGY", "MINISO GROUP"):
+    check(f"still alertable: {n}", EDP.is_alertable_line({"security_name": n}))
+rows = []
+class _T:
+    def __init__(self, op=None): self.op = op
+    def __getattr__(self, _): return lambda *a, **k: self
+    def insert(self, row): rows.append(row); return self
+    def execute(self): return type("R", (), {"data": []})()
+EDP.sb = lambda: type("S", (), {"table": lambda self, _: _T()})()
+EDP.emit_alert("VGK", "ETF_PORTFOLIO", "ETF_HOLDINGS_ADDED", "MEDIUM", "x",
+               {"dedup_key": "k", "company_name": "Vanguard FTSE Europe ETF"})
+check("holdings alert has a headline", rows and rows[0]["extra"].get("headline")
+      == "Vanguard FTSE Europe ETF: new holdings", rows and rows[0]["extra"])
+
 if failures:
     print("\nFAILURES:", failures); sys.exit(1)
 print("\nALL PASS")
