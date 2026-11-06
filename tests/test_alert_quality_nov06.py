@@ -35,6 +35,31 @@ check("no placeholder removed -> nothing dropped",
 check("weight far apart -> real add kept",
       EDP.drop_named_placeholders([newco], [other, newco]) == [newco])
 
+print("Crash day: repeats need a widening step and stop after 2 (VTV, Nov 5)")
+import datetime as _d
+import etf_signals_poller as ESP   # noqa: E402
+_day = _d.date(2026, 11, 5)
+def _ev(z, sent, lv, ct):
+    sigma = 0.0085
+    base = {"sigma": sigma, "adv": 3.0e6, "beta": None, "rets": [0.0] * 300,
+            "sessions": [{"date": _day}] * 301, "last_close": 180.0}
+    m = {"price": 180.0 * (1 - z * sigma), "prev_close": 180.0, "volume": 3.0e6 * 0.5 * 2.0}
+    return ESP.evaluate_intraday("VTV", "VTV", base, m, 0.5, _day.isoformat(), sent,
+                                 levels=lv, counts=ct)
+kinds = lambda out: [a["filing_type"] for a in out]
+sent, lv, ct = set(), {}, {}
+check("2.6x: first big drop sent", kinds(_ev(2.6, sent, lv, ct)) == ["ETF_BIG_MOVE_DOWN"])
+check("3.15x: first repeat sent (+0.5)", kinds(_ev(3.15, sent, lv, ct)) == ["ETF_BIG_MOVE_DOWN"])
+check("3.9x: second repeat needs +1.0 -> not sent", _ev(3.9, sent, lv, ct) == [])
+check("4.2x: second repeat sent", kinds(_ev(4.2, sent, lv, ct)) == ["ETF_BIG_MOVE_DOWN"])
+check("6.0x: cap reached, nothing more today", _ev(6.0, sent, lv, ct) == [])
+check("count tracked", ct.get(("VTV", "DOWN")) == 3, ct)
+rows = [{"ticker": "VTV", "filing_type": "ETF_BIG_MOVE_DOWN", "extra": {}},
+        {"ticker": "VTV", "filing_type": "52W_LOW", "extra": {"merged_filing_types": ["ETF_BIG_MOVE_DOWN"]}},
+        {"ticker": "VB", "filing_type": "ETF_MOMENTUM_DOWN", "extra": {}}]
+check("counts read back from stored rows (merged included)",
+      ESP.counts_from_rows(rows) == {("VTV", "DOWN"): 2, ("VB", "DOWN"): 1}, ESP.counts_from_rows(rows))
+
 if failures:
     print("\nFAILURES:", failures); sys.exit(1)
 print("\nALL PASS")

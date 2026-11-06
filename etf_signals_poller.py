@@ -120,6 +120,12 @@ BIG_Z = _f("ETF_SIG_BIG_Z", 2.5)
 # at least this much bigger (in multiples of the typical move) than the
 # largest one already sent: 2.5x sent -> 3.0x goes out, 2.6x does not.
 ESCALATE_STEP = _f("ETF_SIG_ESCALATE_STEP", 0.5)
+# 2026-11-05 (S&P down all day): VTV, VB, SCHA and PRF each got 4+ "bigger
+# move" alerts because a market falling for hours keeps clearing a fixed step.
+# Each repeat now needs a wider step than the last (repeat k needs k x STEP:
+# 2.5x -> 3.0x -> 4.0x) and at most MAX_ESCALATIONS repeats go out per ETF,
+# per direction, per day. After that the holder already knows it is a big day.
+MAX_ESCALATIONS = int(_f("ETF_SIG_MAX_ESCALATIONS", 2))
 BIG_MIN_MOVE_PCT = _f("ETF_SIG_BIG_MIN_MOVE_PCT", 0.75)
 REL_Z = _f("ETF_SIG_REL_Z", 2.0)
 REL_MIN_GAP_PCT = _f("ETF_SIG_REL_MIN_GAP_PCT", 1.0)
@@ -380,7 +386,7 @@ def _r(x, n=4):
 
 # ── Intraday evaluation (pure: no I/O) ────────────────────────────────────────
 def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
-                      bench=None, div=0.0, levels=None):
+                      bench=None, div=0.0, levels=None, counts=None):
     """
     m       {"price", "prev_close", "volume"} from the live snapshot
     elapsed share of a normal session's volume expected by now (1.0 at close)
@@ -389,6 +395,8 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
     div     cash distribution going ex today, added back to the move
     levels  {(ticker, "UP"/"DOWN"): largest move multiple already sent today}
             (updated in place). None = legacy rule: momentum then one big move.
+    counts  {(ticker, "UP"/"DOWN"): move alerts already sent today} (updated in
+            place). None = no cap, fixed step (pre-2026-11-06 behaviour).
     -> list of alert rows
     """
     out = []
@@ -434,7 +442,13 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
         # at 2.6x 15 minutes later -- the same move twice. A repeat must be
         # clearly bigger than anything already sent. An unknown earlier size
         # (unreadable ledger) blocks the repeat rather than risking a duplicate.
-        send_big = big_now and prev is not None and abs(z) >= prev + ESCALATE_STEP
+        n_sent = None if counts is None else max(counts.get(lvl_key) or 0, 1)
+        if n_sent is None:
+            step, capped = ESCALATE_STEP, False
+        else:
+            step, capped = ESCALATE_STEP * n_sent, n_sent > MAX_ESCALATIONS
+        send_big = (big_now and not capped and prev is not None
+                    and abs(z) >= prev + step)
     if send_big:
         key = f"{big_key}:x{abs(z):.2f}" if big_key in sent else big_key
         vol_line = (f" Volume is running {ratio:.1f}x {pace}." if ratio else "")
@@ -449,6 +463,8 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
         sent.update({big_key, key})
         if levels is not None:
             levels[lvl_key] = max(levels.get(lvl_key) or 0.0, abs(z))
+        if counts is not None:
+            counts[lvl_key] = (counts.get(lvl_key) or 0) + 1
 
     # One move, one message: when a move is already big enough for the
     # big-move signal (sent now or earlier today), it is not ALSO reported as
@@ -479,6 +495,8 @@ def evaluate_intraday(ticker, name, base, m, elapsed, session_iso, sent,
         sent.add(momo_key)
         if levels is not None:
             levels[lvl_key] = max(levels.get(lvl_key) or 0.0, abs(z))
+        if counts is not None:
+            counts[lvl_key] = (counts.get(lvl_key) or 0) + 1
 
     any_big = (big_now or dedup_key(ticker, "ETF_BIG_MOVE_UP", session_iso) in sent
                or dedup_key(ticker, "ETF_BIG_MOVE_DOWN", session_iso) in sent)
@@ -743,6 +761,33 @@ def levels_from_rows(rows):
     return out
 
 
+def counts_from_rows(rows):
+    """{(ticker, "UP"/"DOWN"): number of move alerts} from alert rows, merged
+    signals included."""
+    out = {}
+    for r in rows:
+        ex = r.get("extra") or {}
+        t = (r.get("ticker") or ex.get("etf_ticker") or "").upper()
+        fts = [r.get("filing_type")] + list(ex.get("merged_filing_types") or [])
+        for ft in fts:
+            d = _MOVE_DIR.get(ft)
+            if d:
+                out[(t, d)] = (out.get((t, d)) or 0) + 1
+    return out
+
+
+def load_move_rows(session):
+    """This session's ETF_SIGNAL rows, or None on failure."""
+    midnight = datetime(session.year, session.month, session.day, tzinfo=ET)
+    try:
+        return _paged(lambda: sb().table("alerts").select("id, ticker, filing_type, extra")
+                      .eq("source", SOURCE).gte("created_at", midnight.isoformat())
+                      .order("created_at").order("id"))
+    except Exception as e:
+        log_poller_error(POLLER, "load_move_rows", e)
+        return None
+
+
 def load_levels(session):
     """Largest move already reported per ETF and direction this session. None
     on failure (the caller then blocks repeats)."""
@@ -967,7 +1012,12 @@ def intraday_pass(universe, now, sent, force=False, dry_run=False):
 
     # Sizes already reported today; a repeat must beat them by ESCALATE_STEP.
     # Unreadable -> {} so every repeat is blocked, never duplicated.
-    levels = None if dry_run else (load_levels(session) or {})
+    # Unreadable ledger -> levels {} blocks every repeat; counts {} adds nothing.
+    levels = counts = None
+    if not dry_run:
+        rows_today = load_move_rows(session)
+        levels = levels_from_rows(rows_today) if rows_today is not None else {}
+        counts = counts_from_rows(rows_today) if rows_today is not None else {}
     alerts, priced, skipped = [], 0, []
     for t in sorted(universe):
         m = snapshot_metrics(by_ticker.get(t) or {}, session, force)
@@ -986,7 +1036,8 @@ def intraday_pass(universe, now, sent, force=False, dry_run=False):
             continue
         priced += 1
         alerts += evaluate_intraday(t, universe[t], base, m, elapsed, session_iso, sent,
-                                    bench=bench, div=get_div_today(t, session), levels=levels)
+                                    bench=bench, div=get_div_today(t, session), levels=levels,
+                                    counts=counts)
 
     alerts = drop_momentum_covered_by_technical(alerts, session)
     alerts = merge_alerts_by_ticker(alerts)
