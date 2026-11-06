@@ -239,9 +239,40 @@ def diff_holdings(old, new_full, max_rows=MAX_ROWS):
     return added, removed, new_kept
 
 
+# A catch-all line the data feed uses for holdings it has not named yet.
+# 2026-11-05: GDX "Added: Torex Resources Inc (TXR.TO) at 0.55% of the fund.
+# Removed: Other, previously 0.55%." -- the feed naming a line, not a trade.
+_PLACEHOLDER = re.compile(
+    r"^\s*(OTHERS?|OTHER\s+(SECURITIES|HOLDINGS|EQUIT\w*|POSITIONS|ASSETS)|"
+    r"UNCLASSIFIED|UNIDENTIFIED|UNDISCLOSED|UNKNOWN|N/?A|-+)?\s*$", re.I)
+
+
+def is_placeholder(change):
+    return bool(_PLACEHOLDER.match(change.get("security_name") or ""))
+
+
 def is_alertable_line(change):
+    if is_placeholder(change):
+        return False
     name = f"{change.get('security_name') or ''} {change.get('security_key') or ''}"
     return not _NON_SECURITY.search(name)
+
+
+def drop_named_placeholders(added, changes):
+    """Drop added lines that are a removed placeholder ("Other") given a name:
+    same weight within the relabel drift. Each placeholder absorbs one line."""
+    pool = [c.get("weight_prev") or 0.0 for c in changes
+            if c.get("action") == "REMOVED" and is_placeholder(c)]
+    keep = []
+    for a in added:
+        wn = a.get("weight_new") or 0.0
+        hit = next((i for i, wp in enumerate(pool)
+                    if abs(wn - wp) <= max(RELABEL_MAX_WEIGHT_DRIFT, 0.25 * wp)), None)
+        if hit is None:
+            keep.append(a)
+        else:
+            pool.pop(hit)
+    return keep
 
 
 # ── Ticker relabels, which are not trades ─────────────────────────────────────
@@ -679,6 +710,7 @@ def handle_holdings(ctx, ticker, fund, asset_class, raw, state, website, res):
             # deciding there is anything to tell the holder: if the only
             # "changes" were relabels, nothing was bought or sold and the alert
             # is dropped entirely rather than reported as a reposition.
+            sig_add = drop_named_placeholders(sig_add, changes)
             sig_add, sig_rem, relabelled = pair_relabels(sig_add, sig_rem)
             if sig_add or sig_rem:
                 n_small = len(changes) - len(sig_add) - len(sig_rem) - 2 * len(relabelled)
