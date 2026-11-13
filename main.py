@@ -215,8 +215,19 @@ def sec_job(fn):
     return job(fn, pool=_SEC_POOL)
 
 
+# Kill switch for everything that reads live prices from Massive (Features 6,
+# 7, 17 and the ETF closure scan). Set MASSIVE_ENABLED=0 on Railway while the
+# Massive plan is lapsed: 2026-11-06 it began answering 403 NOT_AUTHORIZED, so
+# these jobs only logged errors every 15 minutes. Unset/1 = on.
+MASSIVE_ENABLED = os.getenv("MASSIVE_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
+MASSIVE_JOBS = (run_technical_poller, run_etf_flow_poller, run_etf_signals, run_etf_listing_poller)
+
+
 def run_scheduler():
     logger.info("[SCHEDULER] Starting (timezone=%s)", time.tzname[0])
+    if not MASSIVE_ENABLED:
+        logger.warning("[SCHEDULER] MASSIVE_ENABLED=0 -- technical, ETF flow, ETF signal and "
+                       "ETF closure jobs are OFF")
     load_cik_map()
 
     # Warm start in parallel — a serial block delayed the first scheduled tick
@@ -225,6 +236,8 @@ def run_scheduler():
         sec_job(warm)()
     for warm in (poll_all_news, poll_fmp_news, run_technical_poller,
                  run_etf_flow_poller, run_etf_signals, poll_analyst_ratings):
+        if warm in MASSIVE_JOBS and not MASSIVE_ENABLED:
+            continue
         job(warm)()
 
     # ── Features 1 & 5 — SEC EDGAR, the fast lane ─────────────────────────────
@@ -308,10 +321,12 @@ def run_scheduler():
     schedule.every(60).minutes.do(job(poll_earnings_for_tickers))
 
     # ── Feature 6 — Technical Alerts ──────────────────────────────────────────
-    schedule.every(45).minutes.do(job(run_technical_poller))
+    if MASSIVE_ENABLED:
+        schedule.every(45).minutes.do(job(run_technical_poller))
 
     # ── Feature 7 — ETF Flow ──────────────────────────────────────────────────
-    schedule.every(60).minutes.do(job(run_etf_flow_poller))
+    if MASSIVE_ENABLED:
+        schedule.every(60).minutes.do(job(run_etf_flow_poller))
 
     # ── Features 7 (v2) & 17 — ETF signal engine ──────────────────────────────
     # Momentum, unusual moves, out/under-performance vs SPY, streaks and
@@ -321,8 +336,9 @@ def run_scheduler():
     # live: one Massive snapshot per run plus one daily-bars call per watched
     # fund per session. The 16:03 run makes sure the closing print is judged
     # whatever minute the 15-minute ticks happen to land on.
-    schedule.every(15).minutes.do(job(run_etf_signals))
-    schedule.every().day.at("16:03").do(job(run_etf_signals))
+    if MASSIVE_ENABLED:
+        schedule.every(15).minutes.do(job(run_etf_signals))
+        schedule.every().day.at("16:03").do(job(run_etf_signals))
 
     # ── Feature 8 — IPO Deep Dive ─────────────────────────────────────────────
     schedule.every().day.at("08:00").do(job(run_ipo_poller))
@@ -402,7 +418,8 @@ def run_scheduler():
     # ── ETF scheme master upkeep (Features 14 / 16) ───────────────────────────
     # Launches join etf_master before the 07:00 Feature 14 pass baselines them;
     # closures of watched funds alert under Feature 16.
-    schedule.every().day.at("06:30").do(job(run_etf_listing_poller))
+    if MASSIVE_ENABLED:
+        schedule.every().day.at("06:30").do(job(run_etf_listing_poller))
     # Prospectus fee tables (management fee, waiver, gross/net) for ETFs that
     # have none yet; new prospectuses are read by the Feature 15 roster job.
     schedule.every().day.at("05:40").do(job(run_expense_backfill))
